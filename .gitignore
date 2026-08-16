@@ -1,0 +1,17 @@
+# 实际配置（含数据库账号密码），绝不入库
+/app/config/config.php
+/app/config/*.local.php
+
+# 运行时
+/var/
+*.log
+
+# 依赖
+/vendor/
+node_modules/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
