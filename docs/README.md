@@ -38,18 +38,43 @@
 
 | # | 事项 | 状态 | 影响文档 |
 |---|---|---|---|
-| 1 | 🔴 **`major_group` / `family_group` 两张表的数据** | **等待提供** | 03（免费餐兜底判据的白名单） |
-| 2 | 🔴 **AA 计次规则**：3 人 AA 一餐，每人各 +1 次，还是整单只算 1 次？ | **等待确认** | 03、04 |
-| 3 | 撤销操作的权限与时间窗（谁能撤销？限当班/24h内？） | 建议值已写入，待确认 | 03、04 |
-| 4 | 10送1 核销时收银员在 POS 端的具体动作（整单折扣 / 改价 0 / 删项） | 待确认 | 03（兜底校验能否成立） |
-| 5 | 只读账号能 `SELECT` 的表范围 | 待确认 | 02 |
-| 6 | 小票上是否印有可扫的条码/QR | 非阻塞，可选优化 | 03 |
+| 1 | 🔴 **AA 计次规则**：3 人 AA 一餐，每人各 +1 次，还是整单只算 1 次？ | **等待确认** | 03、04 |
+| 2 | 🟡 `major_group` / `family_group` 两张表的数据 | 等待提供，**不阻塞上线** | 01、03（兜底校验精度） |
+| 3 | 明细价格字段判据的大样本复验（近 30 天） | 建议上线前执行 | 01 §3.2、03 §3.C.1 |
+| 4 | 撤销操作的权限与时间窗（谁能撤销？限当班/24h内？） | 建议值已写入，待确认 | 03、04 |
+| 5 | 10送1 核销时收银员在 POS 端的具体动作（整单折扣 / 改价 0 / 删项） | 待确认 | 03（兜底校验精度） |
+| 6 | 只读账号能 `SELECT` 的表范围 | 待确认 | 02 |
+| 7 | 小票上是否印有可扫的条码/QR | 非阻塞，可选优化 | 03 |
 
-### 事项 1 的取数方式（两条 SQL，各几十行）
+### 事项 2 的取数方式（两条 SQL，各几十行）
 
 ```sql
 SELECT * FROM major_group;
 SELECT * FROM family_group;
 ```
 
-拿到后可直接确定"餐费项"白名单，`03-积分与防刷引擎.md` 的 §5.3 会相应补全。
+拿到后可确定"餐费项"白名单，`03-积分与防刷引擎.md` §5.3 会相应补全。
+
+> 此项**已降级为非阻塞**：`01-POS主库数据字典.md` §3.2 发现的价格字段判据
+> （三个价格字段全为 0/NULL = 套餐内菜品；`product_price` 或 `original_price` > 0
+> 但 `actual_price` = 0 = 被免的收费项）已能独立支撑 AA 点选菜品的显示过滤
+> 与免费餐的第一层兜底校验。白名单仅用于降低兜底校验的误报率。
+
+### 事项 3 的复验 SQL
+
+```sql
+-- 确认价格字段只有已知的 4 种组合，没有第五种
+SELECT
+  CASE WHEN product_price  > 0 THEN '>0' ELSE '=0'  END AS product_price,
+  CASE WHEN original_price IS NULL THEN 'NULL'
+       WHEN original_price > 0 THEN '>0' ELSE '=0'  END AS original_price,
+  CASE WHEN actual_price   > 0 THEN '>0' ELSE '=0'  END AS actual_price,
+  COUNT(*) AS cnt
+FROM history_order_detail
+WHERE order_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)   -- 走 idx_order_time
+  AND menu_item_id > 0
+  AND condiment_belong_item = 0
+GROUP BY 1,2,3;
+```
+
+> ⚠️ 这条查询会扫近 30 天明细（约 8 万行），**必须在 03:00–05:00 窗口执行**，且仅作为一次性复验，不进入常规任务。
