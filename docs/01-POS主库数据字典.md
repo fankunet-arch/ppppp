@@ -25,12 +25,15 @@
 | `should_amount` | `history_order_head` | **订单级** | 整单应收总额 | ❌ 否 |
 | `original_amount` | `history_order_head` | **订单级** | 整单原价 | ❌ 否 |
 | `discount_amount` | `history_order_head` | **订单级** | 整单折扣（负值） | ❌ 否 |
-| **`actual_price`** | **`history_order_detail`** | **明细行级** | 单行价格（如 MENÚ 23.90） | ✅ **是**（见 §3.3） |
-| **`product_price`** | **`history_order_detail`** | **明细行级** | 单行商品价 | ✅ 是 |
-| **`original_price`** | **`history_order_detail`** | **明细行级** | 单行原价 | ✅ 是 |
-| `quantity` | `history_order_detail` | 明细行级 | 该行份数（实测有 2、3） | — |
+| **`actual_price`** | **`history_order_detail`** | **明细行级** | **行小计（已含 `quantity`）** | ❌ **否** ⚠️ 见 §3.3 |
+| **`product_price`** | **`history_order_detail`** | **明细行级** | **单价** | （`× quantity` 即得 `actual_price`）|
+| **`original_price`** | **`history_order_detail`** | **明细行级** | 单行原价（仅部分折扣记法下填） | — |
+| `quantity` | `history_order_detail` | 明细行级 | 该行份数（实测有 2、3、4、5） | 计次用 `SUM(quantity)` |
 
-记忆规则：**`_amount` = 订单级总额（`*_head` 表）；`_price` = 明细行级单价（`*_detail` 表）。**
+> 🔴 **`actual_price` 已经是行小计，绝不可再乘 `quantity`** —— 那会让多份行的金额被平方级放大（3 份套餐 71.70 × 3 = 215.10）。见 §3.3 实测结论。
+
+记忆规则：**`_amount` = 订单级（`*_head` 表）；`_price` = 明细行级（`*_detail` 表）。
+明细里 `product_price` 是单价，`actual_price` 是行小计。**
 
 > 全库仅 3 张表有 `actual_price`：`history_order_detail`、`order_detail`（活动表，同结构）、`miti`（无关表，不读）。
 > 全库仅 4 张表有 `actual_amount`：`history_order_head`、`order_head`、`history_day_end`、`ecocash_order`（后两张不读）。
@@ -225,32 +228,64 @@ WHERE order_head_id = ? AND check_id = ?
 >
 > ⚠️ 样本量偏小（4 种组合分别 68/6/4/2 行）。**建议上线前用近 30 天明细复验，确认没有第五种组合。**
 
-### 3.3 🔴 `quantity` 与「单价 vs 行小计」（上线前必须验证）
+### 3.3 ✅ `quantity` 与「单价 vs 行小计」（已用 5,000 行明细证实）
 
-> 本节字段均属 **`history_order_detail`**（明细行级）。切勿与 `history_order_head.actual_amount`（订单级实收总额）混淆。
+> 本节字段均属 **`history_order_detail`**（明细行级）。切勿与 `history_order_head.actual_amount`（订单级**收款额**，含待找零）混淆。
 
-`quantity` 为 `float`，实测取值 1 / 2 / 3 —— 收银员会把多份相同菜品录成**一行**：
+`quantity` 为 `float`，实测取值 1~5 —— 收银员会把多份相同菜品录成**一行**。
+
+**结论（基于 5,000 行明细、160 个订单，2024-01-25 ~ 2024-01-27）：**
+
+| 字段 | 语义 |
+|---|---|
+| `product_price` | **单价** |
+| **`actual_price`** | **行小计 = `product_price × quantity`** |
+| `quantity` | 份数 |
+
+**证据一 —— 242 行 `quantity > 1` 且 `actual_price > 0` 的行，100% 满足 `actual_price = product_price × quantity`，0 行满足 `actual_price = product_price`：**
+
+| 菜品 | `product_price` | `actual_price` | `quantity` | `actual_price / quantity` |
+|---|---|---|---|---|
+| MENÚ INFINITY NOCHE | 23.90 | **71.70** | 3 | 23.90 |
+| MENÚ INFINITY NOCHE | 23.90 | **119.50** | 5 | 23.90 |
+| MENÚ INFINITY NOCHE | 23.90 | **95.60** | 4 | 23.90 |
+| MENÚ INFINITY MEDIODIA | 17.90 | **71.60** | 4 | 17.90 |
+| Cerveza | 3.30 | **13.20** | 4 | 3.30 |
+| Agua | 2.80 | **5.60** | 2 | 2.80 |
+
+**证据二 —— 订单级对账 153/153 = 100%：**
 
 ```
-'2-Takoyaki'  product_price=0.00  actual_price=0.00  quantity=2
-'Agua'        product_price=2.80  actual_price=0.00  quantity=3   ← 3 杯水，单价 2.80，全免
+SUM(history_order_detail.actual_price)  ==  history_order_head.original_amount
 ```
 
-**已确认：`history_order_detail.product_price` 是单价。** 3 杯 Agua 的 `product_price` 是 `2.80` 而不是 `8.40`。
+（过滤条件：`menu_item_id > 0` + `condiment_belong_item = 0` + `is_return_item + 0 = 0`；排除明细被截断的首尾两个订单）
 
-**推断：`history_order_detail.actual_price` 同为单价**，因此：
+**因此：**
 
 ```
-行金额   = history_order_detail.actual_price × history_order_detail.quantity
-计次份数 = SUM(history_order_detail.quantity)     ← 不是 COUNT(*)
+行金额   = history_order_detail.actual_price        ← 直接用，不要乘 quantity
+计次份数 = SUM(history_order_detail.quantity)        ← 仍用 quantity 累加
 ```
 
-> 🔴 **但 100 行样本中没有「`quantity > 1` 且 `actual_price > 0`」的行，无法直接证实。**
-> 同表的 `sales_amount`、`discount_price` 字段**全为 0/NULL（未启用）**，无法作为交叉参照。
+### 3.3.1 ⚠️ 明细合计对应的是 `original_amount`（折扣前），不是 `should_amount`
+
+对账实测：明细合计等于 **`original_amount`**（折扣前原价），**订单级折扣不体现在明细行上**，只记在 `history_order_head.discount_amount`。
+
+实例：
+
+| order_head_id | `original_amount` | `discount_amount` | `should_amount` | 明细 `SUM(actual_price)` |
+|---|---|---|---|---|
+| 9975 | 53.40 | -9.56 | 43.84 | **53.40** ← 等于 original |
+| 9982 | 27.40 | -4.78 | 22.62 | **27.40** |
+| 9977 | 114.10 | -14.34 | 99.76 | **114.10** |
+| 9967 | 131.50 | -19.12 | 112.38 | **131.50** |
+
+> 这正是「不计积分项的金额扣除必须按比例、不能直接相减」的原因 —— 见 `03-积分与防刷引擎.md` §2.3。
 >
-> **若判断错误，所有多份合并成一行的订单都会算错**：3 份套餐会被记成 1 份 23.90 而不是 3 份 71.70 —— 金额和计次同时出错。
->
-> 验证 SQL 见 `README.md` 事项 #1。**这是上线前的头号验证项。**
+> 💡 由于 `SUM(actual_price) == original_amount` 恒成立，按比例扣除时**分母可直接取订单头的 `original_amount`**，无需在 `/app` 侧再累加一遍明细，也更稳健（明细偶发不全时不会失真）。
+
+> ✅ 另一个副产品：过滤退菜行后仍 100% 匹配，说明 **`original_amount` 本身已是扣除退菜后的净额**，与 §3.4 的退菜结论一致。
 
 ### 3.4 退菜机制（关键）
 
@@ -520,3 +555,5 @@ ADD KEY `table_id` (`table_id`) USING BTREE
 | 12 | `history_payment` 无 `order_head_id` | 关联不到单笔订单 | 订单级支付在 `payment` 表；或读明细 `menu_item_id=-4` 行 |
 | 13 | **`actual_amount` 是收款额含待找零** | 直接当积分基数 → 把找零算成消费额，最坏多给一倍 | 用 `LEAST(should_amount, actual_amount)`（§2.2） |
 | 14 | 支付行 `-4` 的 `actual_price` 也是收款额 | 混入明细合计 → 金额重复且虚高 | 保持 `menu_item_id > 0` 过滤，取支付方式另起查询（§3.1） |
+| 15 | **`actual_price` 已是行小计** | 再乘 `quantity` → 多份行金额平方级放大 | 直接用 `actual_price`；份数另用 `SUM(quantity)`（§3.3） |
+| 16 | 明细合计 = `original_amount` 非 `should_amount` | 订单级折扣不在明细上，直接相减会算错 | 扣除按比例，分母用 `original_amount`（§3.3.1） |

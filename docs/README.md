@@ -30,6 +30,7 @@
 | `history_order_detail.sql` | `192.168.58.128`（旧侧系统） | 历史订单明细样本 | 100 行 |
 | `order_detail.sql` | `192.168.58.128`（旧侧系统） | 菜单 + 活动订单明细样本 | 667 个菜品 |
 | `coolroid.sql`（上传件） | `192.168.1.180`（现侧系统） | `major_group` / `family_group` / `history_major_group` | 4 + 9 + 1364 行 |
+| `history_order_detail.sql`（上传件 2） | `192.168.1.180`（现侧系统） | 历史订单明细，160 个订单 | **5,000 行** |
 
 **数据覆盖期：2024-01-22 ~ 2026-08-13，共 927 个营业日。单店。**
 
@@ -42,13 +43,14 @@
 
 | # | 事项 | 状态 | 影响文档 |
 |---|---|---|---|
-| 1 | 🔴 **`actual_price` 是单价还是行小计？** 判断错误会让所有多份合并行算错金额与份数 | **上线前必须验证**（SQL 见下） | 01 §3.3、03 §2.3 |
-| 2 | 明细价格字段判据的大样本复验（近 30 天，确认无第五种组合） | 建议上线前执行 | 01 §3.2、03 §3.C.1 |
-| 3 | 撤销操作的权限与时间窗（谁能撤销？限当班/24h内？） | 建议值已写入，待确认 | 03、04 |
-| 4 | 10送1 核销时收银员在 POS 端的具体动作（整单折扣 / 改价 0 / 删项） | 待确认 | 03（兜底校验精度） |
-| 5 | 只读账号能 `SELECT` 的表范围 | 待确认 | 02 |
-| 6 | 2024-08 的 6 天数据丢失原因（是否会复发） | 待了解，降级预案已就位 | 01 §5.3、03 §10 |
-| 7 | 小票上是否印有可扫的条码/QR | 非阻塞，可选优化 | 03 |
+| 1 | 明细价格字段判据的大样本复验（近 30 天，确认无第五种组合） | 建议上线前执行 | 01 §3.2、03 §3.C.1 |
+| 2 | 撤销操作的权限与时间窗（谁能撤销？限当班/24h内？） | 建议值已写入，待确认 | 03、04 |
+| 3 | 10送1 核销时收银员在 POS 端的具体动作（整单折扣 / 改价 0 / 删项） | 待确认 | 03（兜底校验精度） |
+| 4 | 只读账号能 `SELECT` 的表范围 | 待确认 | 02 |
+| 5 | 2024-08 的 6 天数据丢失原因（是否会复发） | 待了解，降级预案已就位 | 01 §5.3、03 §10 |
+| 6 | 小票上是否印有可扫的条码/QR | 非阻塞，可选优化 | 03 |
+
+> **当前无 🔴 阻塞项。** 全部剩余事项均不影响开发启动。
 
 ### ✅ 已关闭的事项
 
@@ -62,43 +64,11 @@
 | `192.168.1.180` 身份 | **侧系统**，已替换 `192.168.58.128`。单店，规则无需按店分化。IP 全部走配置文件 |
 | 免费餐判据 | 双保险：价格字段判据（`01` §3.2）+ 餐费项规则表（`03` §5.3） |
 | 营业日切点 | **已用 POS 自身数据验证** = 02:00，口径为 `original_amount`，324/332 天完全一致（`01` §5.2） |
+| **`actual_price` 单价 vs 行小计** | ✅ **已用 5,000 行明细证实是「行小计」**（242/242 行满足 `actual_price = product_price × quantity`），金额直接用 `actual_price` 不再乘 `quantity`；份数仍用 `SUM(quantity)`（`01` §3.3） |
+| 明细合计对应的头部字段 | ✅ **`SUM(actual_price) == original_amount`（折扣前），153/153 = 100%**。订单级折扣只在 `discount_amount`，故扣除须按比例，分母取 `original_amount`（`01` §3.3.1） |
+| `actual_amount` 语义 | ✅ **收款额，含待找零**（172 行差额呈钞票面额模式）。积分基数用 `LEAST(should_amount, actual_amount)`（`01` §2.2） |
 
-### 🔴 事项 1 的验证 SQL（头号验证项）
-
-明细表有 `quantity` 字段（实测有 2、3 的行），但 100 行样本中**没有「`quantity > 1` 且 `actual_price > 0`」的行**，无法确定 `actual_price` 是单价还是行小计。
-
-已知 `product_price` 是单价（3 杯 Agua 的 `product_price = 2.80` 而非 8.40），推断 `actual_price` 同为单价，但必须证实。
-
-```sql
--- 取一批含多份行的真实订单，两种口径分别与订单头金额比对
-SELECT h.serial_id,
-       h.should_amount                                   AS 订单应收,
-       SUM(d.actual_price * d.quantity)                  AS 按单价累乘,
-       SUM(d.actual_price)                               AS 按行小计,
-       SUM(d.quantity)                                   AS 总份数,
-       COUNT(*)                                          AS 明细行数
-FROM history_order_head h
-JOIN history_order_detail d
-  ON d.order_head_id = h.order_head_id AND d.check_id = h.check_id
-WHERE h.order_end_time >= DATE_SUB(NOW(), INTERVAL 7 DAY)   -- 走 idx_order_end_time
-  AND h.should_amount > 0
-  AND h.discount_amount = 0                                 -- 排除折扣干扰
-  AND d.menu_item_id > 0
-  AND d.condiment_belong_item = 0
-  AND d.is_return_item + 0 = 0
-GROUP BY h.serial_id, h.should_amount
-HAVING 明细行数 < 总份数                                     -- 只看含多份行的订单
-LIMIT 30;
-```
-
-**判读**：哪一列等于「订单应收」，就用哪种口径。
-
-- `按单价累乘` == 订单应收 → `actual_price` 是**单价**，行金额 = `actual_price × quantity`（预期结果）
-- `按行小计` == 订单应收 → `actual_price` 已是**行小计**，直接求和，但**计次仍用 `SUM(quantity)`**
-
-> 该查询限定 7 天且排除折扣单，扫描量小，可在营业时段外任意时间执行。
-
-### 事项 2 的复验 SQL
+### 事项 1 的复验 SQL
 ```sql
 -- 确认价格字段只有已知的 4 种组合，没有第五种
 SELECT
