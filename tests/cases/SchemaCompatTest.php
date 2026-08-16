@@ -222,3 +222,39 @@ T::true((bool)preg_match('/password_verify\s*\(/', $authSrc), '校验用 passwor
 T::true((bool)preg_match("/hash\('sha256',\s*\\\$token\)/", $authSrc),
     '会话令牌库中存 SHA-256，明文只在 Cookie');
 T::true((bool)preg_match('/MAX_FAILED/', $authSrc), '有连续失败锁定（防 4 位 PIN 被枚举）');
+
+T::group('CP 后台 —— 权限与只读边界');
+
+$cpSrc = file_get_contents(__DIR__ . '/../../app/cp/routes.php');
+
+T::true((bool)preg_match('/\$authRef\s*\?\?=/', $cpSrc),
+    'CP 的 AuthService 同样惰性构造');
+T::true((bool)preg_match('/is_manager.*Api::fail\(.forbidden/s', $cpSrc),
+    '非经理账号被拒（服务员不得进入后台）');
+T::true((bool)preg_match('/ROLE_ADMIN.*Api::fail\(.forbidden/s', $cpSrc),
+    '管理员专属操作有 role 校验');
+
+// 写操作必须要求管理员，不能只要求经理
+foreach (['/rules/save', '/config/save', '/members/erase', '/operators/create', '/operators/toggle'] as $route) {
+    $ok = (bool)preg_match(
+        '#\$api->on\(\'POST\', \'' . preg_quote($route, '#') . '\'.{0,200}?\$requireAdmin#s',
+        $cpSrc
+    );
+    T::true($ok, "写操作 {$route} 要求管理员权限");
+}
+
+$cpEntry = file_get_contents(__DIR__ . '/../../wwwroot/cp/api.php');
+T::true((bool)preg_match('/catch\s*\(\s*\\\\?PDOException/', $cpEntry),
+    'CP 入口捕获 PDOException');
+
+// CP 不得直接查 POS 主库 —— 后台的数据一律来自本地镜像
+T::false((bool)preg_match('/posReader\(\)|history_order_head|history_order_detail/', $cpSrc),
+    '★ CP 后台不直接查 POS 主库（数据一律来自本地镜像，避免后台操作拖垮 POS）');
+
+$initSrc = file_get_contents(__DIR__ . '/../../bin/init.php');
+T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $initSrc), 'init.php 拒绝从网络访问');
+T::true((bool)preg_match('/拒绝执行/', $initSrc), 'migrate 有数据安全闸门');
+
+$cronSrc = file_get_contents(__DIR__ . '/../../bin/cron.php');
+T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $cronSrc), 'cron.php 拒绝从网络访问');
+T::true((bool)preg_match('/flock\(/', $cronSrc), 'cron 有并发锁');

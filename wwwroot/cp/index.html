@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="same-origin">
+<title>会员积分 · 管理后台</title>
+<link rel="stylesheet" href="/cp/cp.css">
+</head>
+<body>
+
+<section id="view-login" class="view active">
+  <div class="login-box">
+    <h1>管理后台</h1>
+    <p class="muted small">仅经理及以上账号可登录</p>
+    <label>工号<input id="login-name" type="text" autocomplete="username" autocapitalize="off"></label>
+    <label>PIN<input id="login-pin" type="password" autocomplete="current-password"></label>
+    <button id="btn-login" class="primary big">登录</button>
+    <p id="login-err" class="err" hidden></p>
+  </div>
+</section>
+
+<section id="view-main" class="view">
+  <header class="topbar">
+    <b>会员积分管理后台</b>
+    <nav class="tabs">
+      <button class="tab on" data-tab="dashboard">概览</button>
+      <button class="tab" data-tab="alerts">告警<span id="badge-alerts" class="badge" hidden></span></button>
+      <button class="tab" data-tab="reviews">待复核<span id="badge-reviews" class="badge" hidden></span></button>
+      <button class="tab" data-tab="rules">套餐规则</button>
+      <button class="tab" data-tab="members">会员</button>
+      <button class="tab" data-tab="report">报表</button>
+      <button class="tab" data-tab="config">配置</button>
+      <button class="tab" data-tab="operators">操作员</button>
+      <button class="tab" data-tab="audit">审计</button>
+    </nav>
+    <span id="op-name" class="muted"></span>
+    <button id="btn-logout" class="link">退出</button>
+  </header>
+
+  <!-- 概览 -->
+  <div id="tab-dashboard" class="panel active">
+    <div id="stats" class="stats"></div>
+    <h3>同步水位线</h3>
+    <div id="cursors"></div>
+  </div>
+
+  <!-- 告警 -->
+  <div id="tab-alerts" class="panel">
+    <h3>未处理告警</h3>
+    <div id="alerts-list"></div>
+  </div>
+
+  <!-- 待复核 -->
+  <div id="tab-reviews" class="panel">
+    <h3>手工录入待复核</h3>
+    <p class="muted small">主库数据缺失或不可达时收银员手工录入的记账，需与纸质小票核对后裁决。
+      驳回会追加反向冲正流水，原流水保留。</p>
+    <div id="reviews-list"></div>
+  </div>
+
+  <!-- 套餐规则 -->
+  <div id="tab-rules" class="panel">
+    <h3>套餐规则表</h3>
+    <p class="muted small">三个开关互相独立。<b>未被本表覆盖的菜品</b>按
+      「不算餐费 / 不计次 / 金额正常积分」处理 —— 漏配的后果仅是少计次，不会算错金额。</p>
+    <div id="rules-list"></div>
+    <details class="add-box">
+      <summary>手工添加菜品规则</summary>
+      <div class="row">
+        <label>菜品 ID<input id="new-rule-id" type="number"></label>
+        <label>名称<input id="new-rule-name" type="text"></label>
+        <label>参考价<input id="new-rule-price" type="text" placeholder="0.00"></label>
+      </div>
+      <button id="btn-add-rule" class="primary">添加</button>
+    </details>
+  </div>
+
+  <!-- 会员 -->
+  <div id="tab-members" class="panel">
+    <h3>会员查询</h3>
+    <div class="row">
+      <select id="m-type"><option value="card">卡号</option><option value="phone">手机号</option><option value="email">邮箱</option></select>
+      <input id="m-value" type="text" placeholder="输入后回车">
+      <button id="btn-m-search" class="primary">查找</button>
+    </div>
+    <div id="member-detail"></div>
+  </div>
+
+  <!-- 报表 -->
+  <div id="tab-report" class="panel">
+    <h3>营业日报表</h3>
+    <div class="row">
+      <label>最近<input id="rep-days" type="number" value="14" min="1" max="90" style="width:80px"></label>
+      <button id="btn-report" class="primary">查询</button>
+    </div>
+    <div id="report-table"></div>
+  </div>
+
+  <!-- 配置 -->
+  <div id="tab-config" class="panel">
+    <h3>系统配置</h3>
+    <p class="muted small">修改立即生效。改动会记入审计日志。</p>
+    <div id="config-list"></div>
+  </div>
+
+  <!-- 操作员 -->
+  <div id="tab-operators" class="panel">
+    <h3>操作员</h3>
+    <div id="operators-list"></div>
+    <details class="add-box">
+      <summary>新建操作员</summary>
+      <div class="row">
+        <label>工号<input id="op-login" type="text"></label>
+        <label>显示名<input id="op-name-new" type="text"></label>
+        <label>PIN<input id="op-pin" type="password"></label>
+        <label>角色<select id="op-role">
+          <option value="1">服务员</option><option value="2">经理</option><option value="3">管理员</option>
+        </select></label>
+      </div>
+      <button id="btn-add-op" class="primary">创建</button>
+    </details>
+  </div>
+
+  <!-- 审计 -->
+  <div id="tab-audit" class="panel">
+    <h3>审计日志</h3>
+    <div class="row">
+      <select id="audit-action">
+        <option value="">全部</option>
+        <option value="point_grant">发放积分</option>
+        <option value="point_reverse">撤销/冲正</option>
+        <option value="member_create">新建会员</option>
+        <option value="data_erase">数据删除/假名化</option>
+        <option value="coupon_redeem">卡券核销</option>
+        <option value="config_save">配置修改</option>
+        <option value="rule_save">规则修改</option>
+        <option value="operator_login">登录</option>
+      </select>
+      <button id="btn-audit" class="primary">查询</button>
+    </div>
+    <div id="audit-list"></div>
+  </div>
+</section>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/cp/cp.js"></script>
+</body>
+</html>
