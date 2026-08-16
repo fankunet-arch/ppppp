@@ -8,7 +8,7 @@ use Vip\LocalDb;
 use Vip\MealRules;
 use Vip\Money;
 use Vip\PointsEngine as PE;
-use Vip\PosReader;
+use Vip\PosSource;
 use Vip\PosUnavailable;
 use Vip\Repo\AlertRepo;
 use Vip\Repo\AuditRepo;
@@ -31,7 +31,7 @@ final class PointsService
 {
     public function __construct(
         private LocalDb    $db,
-        private PosReader  $pos,
+        private PosSource  $pos,
         private ConfigRepo $cfg,
         private OrderRepo  $orders,
         private MemberRepo $members,

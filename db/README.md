@@ -132,3 +132,64 @@ db/
 mysql -u<user> -p <db> < db/migrations/001_init.sql
 for f in db/seeds/*.sql; do mysql -u<user> -p <db> < "$f"; done
 ```
+
+---
+
+## 5. 真库冒烟测试
+
+`tests/run.php` 是纯逻辑测试，不连数据库。DDL 与事务必须在真实数据库上验证，
+用 `tests/smoke.php`，**MySQL 与 MariaDB 各跑一遍**。
+
+```bash
+# 首次：建表 + 跑完整业务流程
+SMOKE_DB_HOST=127.0.0.1 SMOKE_DB_PORT=3306 \
+SMOKE_DB_NAME=vip_smoke SMOKE_DB_USER=root SMOKE_DB_PASS=xxx \
+php tests/smoke.php --fresh
+
+# 之后：复用已有表，只跑流程
+php tests/smoke.php
+
+# 跑完保留数据供人工查看（store_code = SMOKE）
+php tests/smoke.php --fresh --keep
+```
+
+未设置环境变量时，回落到 `app/config/config.php` 的 `local_db`。
+
+### 安全设计
+
+| 措施 | 说明 |
+|---|---|
+| 独立门店码 `SMOKE` | 全程只写 `store_code = 'SMOKE'` 的行，绝不触碰生产数据 |
+| `--fresh` 前置闸门 | `001_init.sql` 含 `DROP TABLE`。脚本先扫描各表，若存在 `store_code <> 'SMOKE'` 的任何一行就**拒绝执行并退出** |
+| 自动清理 | 开始与结束各清一次 SMOKE 数据；`--keep` 可保留 |
+| 不依赖 POS | 注入 `FakePosSource`，无需门店内网可达即可跑通全流程 |
+
+### 覆盖的流程
+
+1. 连接并识别 MySQL / MariaDB，打印版本
+2. 执行 `001_init.sql`（DDL 能否在该数据库上建成）
+3. 写入配置与套餐规则
+4. **订单定位** —— 桌号 42（3 份套餐）与桌号 32（含 BOX 且有找零）
+5. 幂等 —— 重复定位不产生重复订单
+6. **建会员** —— 三选一检索、double opt-in 令牌
+7. **整单记账** —— 积分、计次、订单状态
+8. **超额拒绝** —— 已全额分配后再提交
+9. **撤销** —— 反向冲正、原流水保留、会员与订单回退
+10. **AA 分摊** —— 撤销后改记三人，含现场新建会员
+11. **降级路径** —— 手工录入、待复核队列、单笔限额
+12. **不变量总校验**：
+    - 没有订单的 `allocated_amount > total_amount`
+    - 每张订单的 `allocated_amount` 与其账本流水合计一致
+    - 每名会员的 `points_balance` 与其流水合计一致
+13. 清理
+
+### 关键断言示例
+
+```
+✓ 可积分总额 26.85 ＝ LEAST(79.85,80.00) 排除找零，再按比例扣掉 BOX 的 53.00
+✓ 计次份数 3（SUM(quantity)，不是行数 1）
+✓ 展示列表仅 1 项（0 元菜品/伪行/配料/退菜均已过滤）
+✓ 账本共 2 行（原始 + 冲正），只增不删
+✓ 金额守恒：已分配回到 71.70，分毫不差
+✓ 每名会员的积分余额与其流水合计一致
+```

@@ -50,9 +50,38 @@ final class App
         return $this->once('posDb', fn() => new PosDb($this->config['pos_db']));
     }
 
-    public function posReader(): PosReader
+    public function posReader(): PosSource
     {
         return $this->once('posReader', fn() => new PosReader($this->posDb()));
+    }
+
+    /**
+     * 注入替代的 POS 读取实现。
+     * 仅供冒烟测试使用 —— 让完整业务流程能在没有门店内网的环境下跑通。
+     */
+    public function setPosSource(PosSource $src): void
+    {
+        $this->singletons['posReader'] = $src;
+        unset($this->singletons['points']);   // 让 PointsService 重新装配
+    }
+
+    /**
+     * 注入已建好的本地库连接。
+     * 仅供冒烟测试使用 —— 让测试脚本与业务代码共用同一条连接。
+     */
+    public function setLocalDb(LocalDb $db): void
+    {
+        $this->singletons['localDb'] = $db;
+    }
+
+    /** 覆盖门店码（冒烟测试用独立 store_code，绝不碰生产数据） */
+    public function setStoreCode(string $code): void
+    {
+        $this->config['store_code'] = $code;
+        foreach (['cfg', 'orders', 'members', 'ledger', 'alerts', 'audit',
+                  'cursors', 'mealRuleRepo', 'mealRules', 'bizDay', 'points'] as $k) {
+            unset($this->singletons[$k]);
+        }
     }
 
     public function cfg(): ConfigRepo

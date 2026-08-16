@@ -14,7 +14,7 @@ namespace Vip;
  *   【没有任何时间索引】，按时间查必然全表扫。
  *   且已确认归档为「结账即写」，无需读活动表。
  */
-final class PosReader
+final class PosReader implements PosSource
 {
     public function __construct(private PosDb $db)
     {
