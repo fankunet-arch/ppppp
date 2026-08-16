@@ -286,6 +286,69 @@ final class PointsEngine
     }
 
     /**
+     * 分配校验 —— 金额守恒的判定逻辑，抽成纯函数便于测试。
+     *
+     * 恒定成立：SUM(已分配 + 本次) ≤ total_amount
+     * 不信任客户端传来的金额，一律以本地镜像的 total_amount 为准。
+     *
+     * @param array $allocations [['member_id'=>int,'amount_cents'=>int,'portions'=>int], ...]
+     * @return array{ok:bool,error:string,sum_amount:int,sum_portions:int}
+     */
+    public static function validateAllocations(
+        array $allocations,
+        int $totalCents,
+        int $allocatedCents,
+        int $totalPortions,
+        int $allocatedPortions
+    ): array {
+        $fail = static fn(string $e, int $a = 0, int $p = 0) =>
+            ['ok' => false, 'error' => $e, 'sum_amount' => $a, 'sum_portions' => $p];
+
+        if (!$allocations) {
+            return $fail('empty_allocation');
+        }
+        if ($totalCents <= 0) {
+            return $fail('zero_amount');
+        }
+
+        $sumAmount = 0;
+        $sumPort   = 0;
+        $seen      = [];
+        foreach ($allocations as $a) {
+            $mid = (int)($a['member_id'] ?? 0);
+            $amt = (int)($a['amount_cents'] ?? 0);
+            $prt = (int)($a['portions'] ?? 0);
+
+            if ($mid <= 0) {
+                return $fail('invalid_member');
+            }
+            if (isset($seen[$mid])) {
+                // 同一会员在一次提交里出现两次 → 多半是前端重复提交
+                return $fail('duplicate_member');
+            }
+            $seen[$mid] = true;
+
+            if ($amt < 0 || $prt < 0) {
+                return $fail('negative_allocation');
+            }
+            $sumAmount += $amt;
+            $sumPort   += $prt;
+        }
+
+        if ($sumAmount === 0 && $sumPort === 0) {
+            return $fail('empty_allocation');
+        }
+        if ($allocatedCents + $sumAmount > $totalCents) {
+            return $fail('exceeds_total', $sumAmount, $sumPort);
+        }
+        if ($allocatedPortions + $sumPort > $totalPortions) {
+            return $fail('exceeds_portions', $sumAmount, $sumPort);
+        }
+
+        return ['ok' => true, 'error' => '', 'sum_amount' => $sumAmount, 'sum_portions' => $sumPort];
+    }
+
+    /**
      * 均摊 AA：把金额与份数分给 n 人，余数都给第一位。
      * 保证分毫不差、份数不丢。
      *

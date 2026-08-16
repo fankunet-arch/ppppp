@@ -68,5 +68,7 @@ final class T
 require __DIR__ . '/cases/MoneyTest.php';
 require __DIR__ . '/cases/PointsEngineTest.php';
 require __DIR__ . '/cases/BusinessDayTest.php';
+require __DIR__ . '/cases/AllocationTest.php';
+require __DIR__ . '/cases/SchemaCompatTest.php';
 
 exit(T::summary());
