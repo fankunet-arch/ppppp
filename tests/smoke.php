@@ -123,13 +123,21 @@ if ($fresh) {
     ok(true, '库中无非 SMOKE 数据，可以安全建表');
 
     step('执行 migrations 与 seeds');
-    foreach (['migrations/001_init.sql'] as $f) {
-        $sql = file_get_contents(__DIR__ . '/../db/' . $f);
+    // ★ 必须扫目录而不是写死文件名 —— 早先这里硬编码了 001_init.sql，
+    //   于是每加一个迁移（002、003…）冒烟测试都会因为缺列而崩，
+    //   且报错指向业务代码，看不出真正原因是建表少跑了迁移。
+    $migrations = glob(__DIR__ . '/../db/migrations/*.sql') ?: [];
+    sort($migrations);
+    if (!$migrations) {
+        die_('db/migrations/ 下没有找到任何迁移文件');
+    }
+    foreach ($migrations as $path) {
+        $name = 'migrations/' . basename($path);
         try {
-            $db->pdo()->exec($sql);
-            ok(true, "执行 db/{$f}");
+            $db->pdo()->exec((string)file_get_contents($path));
+            ok(true, "执行 db/{$name}");
         } catch (\Throwable $e) {
-            die_("db/{$f} 执行失败（这正是本脚本要发现的问题）：\n      " . $e->getMessage());
+            die_("db/{$name} 执行失败（这正是本脚本要发现的问题）：\n      " . $e->getMessage());
         }
     }
     // 种子里的 store_code 是 S001，冒烟用 SMOKE，因此下面自行灌

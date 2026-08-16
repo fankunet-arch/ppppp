@@ -35,8 +35,9 @@ final class OrderRepo
                 customer_num, order_end_time, business_date,
                 original_amount, should_amount, actual_amount, total_amount,
                 excluded_amount, portions_counted, portions_uncounted,
+                is_redeemed, redeem_amount,
                 created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON DUPLICATE KEY UPDATE
                order_head_id      = VALUES(order_head_id),
                check_ids          = VALUES(check_ids),
@@ -52,6 +53,8 @@ final class OrderRepo
                excluded_amount    = VALUES(excluded_amount),
                portions_counted   = VALUES(portions_counted),
                portions_uncounted = VALUES(portions_uncounted),
+               is_redeemed        = VALUES(is_redeemed),
+               redeem_amount      = VALUES(redeem_amount),
                updated_at         = VALUES(updated_at)',
             [
                 $this->storeCode,
@@ -70,6 +73,8 @@ final class OrderRepo
                 Money::toStr($o['excluded_cents'] ?? 0),
                 $o['portions_counted'] ?? 0,
                 $o['portions_uncounted'] ?? 0,
+                !empty($o['is_redeemed']) ? 1 : 0,
+                Money::toStr($o['redeem_cents'] ?? 0),
                 $now, $now,
             ]
         );

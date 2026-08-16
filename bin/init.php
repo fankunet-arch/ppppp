@@ -115,9 +115,25 @@ function doCheck(App $app, array $config): void
 }
 
 // ════════════════════════════════════════════════════════════
+/**
+ * 建表 / 升级。
+ *
+ * ★ 必须支持【增量升级】：系统上线后仍会有 schema 变更
+ *   （例如 003 为十送一核销加列）。早先的实现是把 migrations 全量重跑，
+ *   而 001 里有 DROP TABLE，于是安全闸门一拦，
+ *   线上库就再也没有任何办法应用新迁移了。
+ *
+ * 现在的规则：
+ *   · 用 schema_migration 表记录已应用的文件，只跑没跑过的
+ *   · 含 DROP TABLE 的迁移属破坏性，库里有业务数据时一律拒绝
+ *   · 纯 ALTER 类迁移随时可应用
+ *   · 老库首次引入本机制时做一次基线登记：已经建好的表说明
+ *     对应的破坏性迁移早已执行过，直接标记为已应用，不重跑
+ */
 function doMigrate(App $app): void
 {
     $db = $app->localDb();
+
     head('安全检查');
     $tables = [];
     foreach ($db->all('SHOW TABLES') as $r) {
@@ -129,16 +145,59 @@ function doMigrate(App $app): void
             $rows += (int)$db->value("SELECT COUNT(*) FROM `{$t}`");
         }
     }
-    if ($rows > 0) {
-        echo "\n\033[31m拒绝执行：库中已有 {$rows} 行业务数据，migrate 会 DROP TABLE 全部销毁。\033[0m\n";
+
+    // 迁移登记表本身用 IF NOT EXISTS，双兼容且可重复执行
+    $db->pdo()->exec(
+        "CREATE TABLE IF NOT EXISTS `schema_migration` (
+           `filename`   VARCHAR(120) NOT NULL,
+           `applied_at` DATETIME     NOT NULL,
+           PRIMARY KEY (`filename`)
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC"
+    );
+
+    $applied = [];
+    foreach ($db->all('SELECT filename FROM schema_migration') as $r) {
+        $applied[(string)$r['filename']] = true;
+    }
+
+    $files = glob(__DIR__ . '/../db/migrations/*.sql') ?: [];
+    sort($files);
+
+    // 基线登记：库里已有业务表却没有登记记录 → 破坏性迁移显然早已跑过
+    if (!$applied && $rows > 0) {
+        foreach ($files as $f) {
+            if (stripos((string)file_get_contents($f), 'DROP TABLE') !== false) {
+                $db->exec('INSERT INTO schema_migration (filename, applied_at) VALUES (?,?)',
+                    [basename($f), $db->now()]);
+                $applied[basename($f)] = true;
+                warn('基线登记（判定为早已执行，不重跑）：' . basename($f));
+            }
+        }
+    }
+
+    $pending = array_values(array_filter($files, fn($f) => !isset($applied[basename($f)])));
+    if (!$pending) {
+        ok('没有待应用的迁移，schema 已是最新');
+        return;
+    }
+
+    // 破坏性迁移 + 有数据 = 拒绝
+    $destructive = array_filter($pending,
+        fn($f) => stripos((string)file_get_contents($f), 'DROP TABLE') !== false);
+    if ($destructive && $rows > 0) {
+        echo "\n\033[31m拒绝执行：库中已有 {$rows} 行业务数据，而待应用的 "
+           . implode(', ', array_map('basename', $destructive))
+           . " 含 DROP TABLE，会全部销毁。\033[0m\n";
         echo "若确实要重建，请先手工备份并清空，或换一个空库。\n";
         exit(1);
     }
-    ok('库中无业务数据，可以安全建表');
+    ok($rows > 0 ? "库中 {$rows} 行业务数据，待应用的迁移均为非破坏性" : '库中无业务数据，可以安全建表');
 
     head('执行 migrations');
-    foreach (glob(__DIR__ . '/../db/migrations/*.sql') ?: [] as $f) {
-        $db->pdo()->exec(file_get_contents($f));
+    foreach ($pending as $f) {
+        $db->pdo()->exec((string)file_get_contents($f));
+        $db->exec('INSERT INTO schema_migration (filename, applied_at) VALUES (?,?)',
+            [basename($f), $db->now()]);
         ok(basename($f));
     }
 }

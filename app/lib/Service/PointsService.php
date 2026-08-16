@@ -82,6 +82,24 @@ final class PointsService
     }
 
     /**
+     * 十送一核销行的名称模式。
+     *
+     * 店家在 POS 里改了名称时，改后台 sys_config.redeem_line_patterns 即可
+     * （逗号分隔），不必改代码。留空则回落到内置默认。
+     *
+     * @return array<int,string>
+     */
+    private function redeemPatterns(): array
+    {
+        $raw = trim($this->cfg->get('redeem_line_patterns', ''));
+        if ($raw === '') {
+            return PE::REDEEM_PATTERNS;
+        }
+        $out = array_values(array_filter(array_map('trim', explode(',', $raw)), fn($s) => $s !== ''));
+        return $out ?: PE::REDEEM_PATTERNS;
+    }
+
+    /**
      * 读明细并算出该订单的完整上下文，同时落本地镜像。
      *
      * ★ 每次积分都必须读明细 —— 计次份数与不计分项扣除都靠它，
@@ -90,7 +108,7 @@ final class PointsService
     private function buildContext(array $o): array
     {
         $detail   = $this->pos->fetchDetailForChecks($o['order_head_id'], $o['check_ids']);
-        $analysis = PE::analyzeDetail($detail, $this->rules);
+        $analysis = PE::analyzeDetail($detail, $this->rules, $this->redeemPatterns());
 
         $baseCents = PE::pointsBaseCents(
             $o['should_cents'],
@@ -101,7 +119,18 @@ final class PointsService
 
         $existing  = $this->orders->findBySerial($o['serial_id']);
         $isFree    = (bool)(int)($existing['is_free_meal'] ?? 0);
-        $eligible  = PE::checkEligible($o['eat_type'], $o['should_cents'], $o['actual_cents'], $isFree);
+
+        // ★ 十送一核销：POS 侧的动作是在明细里加一条 `-2 / TARJETA 10+1 / 负金额`
+        //   折扣行（实测订单 92293）。这一餐是客人在【兑换奖励】，
+        //   按业务规则不计次也不计分，否则等于「拿奖励的同时又攒一次」。
+        //   与服务员手工标记的 is_free_meal 分开存，审计时能区分判定来源。
+        $isRedeemed = (bool)$analysis['is_redeemed'];
+        $eligible   = PE::checkEligible(
+            $o['eat_type'], $o['should_cents'], $o['actual_cents'], $isFree || $isRedeemed
+        );
+        if ($isRedeemed && $eligible['reason'] === 'free_meal') {
+            $eligible['reason'] = 'redeemed';   // 与人工标记的免费餐区分开
+        }
 
         $bizDate = $this->bizDay->of($o['order_end_time']);
 
@@ -122,6 +151,8 @@ final class PointsService
             'excluded_cents'     => $analysis['excluded_cents'],
             'portions_counted'   => $analysis['portions_counted'],
             'portions_uncounted' => $analysis['portions_uncounted'],
+            'is_redeemed'        => $isRedeemed,
+            'redeem_cents'       => $analysis['redeem_cents'],
         ]);
 
         // 免费餐兜底：点了套餐但餐费为 0 且订单仍有金额 → 疑似漏点核销
@@ -148,6 +179,9 @@ final class PointsService
             'eligible'           => $eligible['ok'],
             'ineligible_reason'  => $eligible['reason'],
             'is_free_meal'       => $isFree,
+            'is_redeemed'        => $isRedeemed,
+            'redeem_amount'      => Money::toStr($analysis['redeem_cents']),
+            'redeem_lines'       => $analysis['redeem_lines'],
             'total_cents'        => $baseCents,
             'total'              => Money::toStr($baseCents),
             'allocated_cents'    => $allocated,
@@ -192,6 +226,10 @@ final class PointsService
             }
             if ((int)$order['is_free_meal'] === 1) {
                 return ['ok' => false, 'error' => 'free_meal'];
+            }
+            // 十送一核销单：兑换奖励的那一餐不计次不计分
+            if ((int)($order['is_redeemed'] ?? 0) === 1) {
+                return ['ok' => false, 'error' => 'redeemed'];
             }
 
             $total     = Money::toCents($order['total_amount']);

@@ -96,6 +96,38 @@ SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'
 - **不使用** `ONLY_FULL_GROUP_BY`：MySQL 5.7+ 默认开启而 MariaDB 默认关闭，
   显式统一可避免同一条 `GROUP BY` 一边通过一边报错
 
+### 2.4 连接排序规则必须钉死 🔴
+
+```sql
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci
+```
+
+DSN 里的 `charset=utf8mb4` **只设字符集，不设排序规则**，
+排序规则会回落到服务器默认，而三家默认互不相同：
+
+| 服务器 | utf8mb4 默认排序规则 |
+|---|---|
+| MariaDB（全系） | `utf8mb4_general_ci` |
+| MySQL 5.7 | `utf8mb4_general_ci` |
+| MySQL 8 | `utf8mb4_0900_ai_ci` |
+
+建表用的是 `utf8mb4_unicode_ci`，**一个都对不上**。
+
+平时不出事，是因为绑定参数的强制性等级是 `COERCIBLE`，比列低，会自动向列靠拢。
+但 **用户变量（`@var`）的强制性等级是 `IMPLICIT`，与列相同** ——
+于是 `WHERE store_code = @store` 两侧同为 `IMPLICIT` 却排序规则不同，
+直接报 `1267 Illegal mix of collations` 而整条语句失败。
+
+实测：`db/seeds/002_meal_period.sql` 里的
+`DELETE FROM meal_period WHERE store_code = @store`
+在 MariaDB 10.11 上必然失败，**即 `php bin/init.php seed` 在任何原厂服务器上都跑不通**。
+
+因此两处都要钉死：
+- 五个 SQL 文件（`migrations/*.sql`、`seeds/*.sql`）开头统一写
+  `SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;`
+- `LocalDb` 连接后显式执行同一条语句，
+  排序规则可用 `config.local_db.collation` 覆盖（默认 `utf8mb4_unicode_ci`）
+
 ---
 
 ## 3. 与 POS 主库的区别

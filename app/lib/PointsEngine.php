@@ -12,8 +12,23 @@ namespace Vip;
 final class PointsEngine
 {
     // ── POS 明细中的伪行标记（docs/01 §3.1）──────────────
+    public const PSEUDO_DISCOUNT = -2;  // 折扣行，actual_price 恒为负；十送一核销也走这里
     public const PSEUDO_REMARK  = -3;   // 操作留痕行 '**999 Enviado 19:16**'
     public const PSEUDO_PAYMENT = -4;   // 支付行 'EFECTIVO'，actual_price 是收款额含找零
+
+    /**
+     * 「十送一核销」折扣行的名称模式（子串匹配，忽略大小写）。
+     *
+     * 实测 63 行 `-2` 折扣行共 4 种名称：
+     *   Dto. -20%（54）、CUPON DE 5 EUROS（4）、Dto%（4）、TARJETA 10+1（1）
+     * 只有最后一种是十送一核销，前三种是普通折扣，【绝不能误判】——
+     * 误判会让正常打折的客人拿不到积分。
+     * 因此按名称模式匹配，而不是「只要有折扣就算核销」。
+     *
+     * 店家若改了 POS 里的名称，在后台 sys_config 的 redeem_line_patterns
+     * 改这份清单即可，无需改代码。
+     */
+    public const REDEEM_PATTERNS = ['TARJETA 10+1', '10+1'];
 
     // ── 记账方式 ──────────────────────────────────────────
     public const MODE_WHOLE  = 1;   // 整单记给一人
@@ -59,13 +74,58 @@ final class PointsEngine
             if ((string)$r['order_end_time'] > $a['order_end_time']) {
                 $a['order_end_time'] = (string)$r['order_end_time'];
             }
+            // ★ serial_id 恒取【最小值】，不能用「第一行」。
+            // 实测 88,616 行中有 1 单（order_head_id=25379）的两张 check
+            // 各自带了一个 serial（2409020040 / 2409020041）。
+            // 而两条读取路径的排序方向相反 ——
+            //   Pad   findRecentByTable  ORDER BY order_end_time DESC
+            //   Cron  fetchSince         ORDER BY order_end_time ASC
+            // 取「第一行」会让两边各存一个幂等键，pos_order 里查不到对方，
+            // 同一单就会被发两次分。取最小值则两条路径必然一致。
+            // serial_id 是 int 列，按数值比而非字符串比（宽度并不恒定，实测有 0）。
+            if (self::serialLess((string)$r['serial_id'], $a['serial_id'])) {
+                $a['serial_id'] = (string)$r['serial_id'];
+            }
             unset($a);
         }
         foreach ($out as &$a) {
             sort($a['check_ids']);
+            $a['serial_id'] = self::idempotencyKey($a['serial_id'], $a['order_head_id']);
         }
         unset($a);
         return $out;
+    }
+
+    /** serial_id 数值比较。两边都是纯数字时按数值比，否则退回字符串比。 */
+    private static function serialLess(string $candidate, string $current): bool
+    {
+        if (ctype_digit($candidate) && ctype_digit($current)) {
+            // 用字符串补齐再比，避免超出 PHP int 范围时的精度问题
+            $len = max(strlen($candidate), strlen($current));
+            return strcmp(str_pad($candidate, $len, '0', STR_PAD_LEFT),
+                          str_pad($current,   $len, '0', STR_PAD_LEFT)) < 0;
+        }
+        return strcmp($candidate, $current) < 0;
+    }
+
+    /**
+     * 幂等键：正常情况就是 serial_id 本身。
+     *
+     * ★ 但 POS 会吐出 serial_id = 0 的单 —— 实测 order_head_id=70762
+     *   （2025-12-29，桌 15，两张 check）两行 serial 都是 0。
+     *   此处只有一单尚不冲突，可一旦另一天再出一单 serial=0，
+     *   幂等键 (store_code, 0) 就会撞上，后一单会被静默并进前一单 ——
+     *   订单不见了、积分也没发，且不报错。
+     *   故退化时改用 order_head_id 造键：它在 88,616 行里始终有值，
+     *   且 (order_head_id, check_id) 唯一。加 H 前缀，与纯数字的真实
+     *   serial 天然不会相撞。
+     */
+    public static function idempotencyKey(string $serialId, int $orderHeadId): string
+    {
+        $s = trim($serialId);
+        return ($s === '' || $s === '0' || (ctype_digit($s) && (int)$s === 0))
+            ? 'H' . $orderHeadId
+            : $s;
     }
 
     /**
@@ -119,7 +179,7 @@ final class PointsEngine
      *
      * @param array<int,array> $detailRows history_order_detail 的行
      */
-    public static function analyzeDetail(array $detailRows, MealRules $rules): array
+    public static function analyzeDetail(array $detailRows, MealRules $rules, array $redeemPatterns = self::REDEEM_PATTERNS): array
     {
         $lineTotalCents    = 0;   // 全部有效行金额合计（应等于 original_amount）
         $excludedCents     = 0;   // earns_points=0 的项
@@ -129,8 +189,21 @@ final class PointsEngine
         $portionsUncounted = 0;   // counts_visit=0 但属餐费项的份数
         $waivedCents       = 0;   // 「被免金额」：原价 - 实收
         $display           = [];
+        $redeemCents       = 0;   // 十送一核销折扣额（正数）
+        $redeemLines       = [];  // 命中的核销行名称
 
         foreach ($detailRows as $row) {
+            // ── 折扣伪行（menu_item_id = -2）────────────────────
+            // 不参与任何金额累加（isValidItemRow 已排除），但要在这里
+            // 认出「十送一核销」。见 self::REDEEM_PATTERNS 的说明。
+            if ((int)$row['menu_item_id'] === self::PSEUDO_DISCOUNT) {
+                $name = (string)($row['menu_item_name'] ?? '');
+                if (self::isRedeemLine($name, $redeemPatterns)) {
+                    $redeemCents  += abs(Money::toCents($row['actual_price'] ?? '0'));
+                    $redeemLines[] = $name;
+                }
+                continue;
+            }
             if (!self::isValidItemRow($row)) {
                 continue;
             }
@@ -186,7 +259,28 @@ final class PointsEngine
             'portions_uncounted'  => $portionsUncounted,
             'waived_cents'        => $waivedCents,
             'display'             => $display,
+            'redeem_cents'        => $redeemCents,
+            'redeem_lines'        => $redeemLines,
+            'is_redeemed'         => $redeemCents > 0,
         ];
+    }
+
+    /**
+     * 该折扣行是否为「十送一核销」。
+     *
+     * 名称由店家在 POS 里自定义，故用【可配置的模式】而非硬编码全名。
+     * 大小写与两侧空白都不敏感。
+     */
+    public static function isRedeemLine(string $name, array $patterns = self::REDEEM_PATTERNS): bool
+    {
+        $n = mb_strtoupper(trim($name));
+        foreach ($patterns as $p) {
+            $p = mb_strtoupper(trim((string)$p));
+            if ($p !== '' && str_contains($n, $p)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

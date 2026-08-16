@@ -99,6 +99,12 @@ final class PosReader implements PosSource
     public function fetchDetail(int $orderHeadId, int $checkId, int $limit = 100): array
     {
         $limit = max(1, min($limit, PosDb::MAX_LIMIT));
+        // ★ 除菜品行外，还要取回 menu_item_id = -2 的【折扣伪行】：
+        //   十送一核销在 POS 里就是加一条 `-2 / TARJETA 10+1 / 负金额` 的折扣行
+        //   （实测订单 92293），不认它就会给核销餐重复发分计次。
+        //   -2 行不参与任何金额累加，PointsEngine 只读它的名称做判定。
+        //   过滤条件仍只作用于非索引列，索引命中不变（ref idx_detailcheck）。
+        $pseudoDiscount = PointsEngine::PSEUDO_DISCOUNT;
         $sql = "SELECT menu_item_id, menu_item_name, quantity,
                        product_price, original_price, actual_price,
                        is_discount + 0    AS is_discount,
@@ -106,7 +112,7 @@ final class PosReader implements PosSource
                        condiment_belong_item
                 FROM history_order_detail
                 WHERE order_head_id = ? AND check_id = ?
-                  AND menu_item_id > 0
+                  AND (menu_item_id > 0 OR menu_item_id = {$pseudoDiscount})
                   AND condiment_belong_item = 0
                 LIMIT {$limit}";
         return $this->db->select($sql, [$orderHeadId, $checkId], 'ii');

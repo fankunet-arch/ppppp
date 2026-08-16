@@ -17,7 +17,7 @@
 --   最低版本：MySQL 5.7+ / MariaDB 10.2+
 -- ============================================================
 
-SET NAMES utf8mb4;
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 SET FOREIGN_KEY_CHECKS = 0;
 
 -- ── 订单镜像 ──────────────────────────────────────────────

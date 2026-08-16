@@ -3,7 +3,7 @@
 -- 门店码 S001，多店部署时按店复制
 -- ============================================================
 
-SET NAMES utf8mb4;
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 SET @store := 'S001';
 SET @now   := NOW();
 
@@ -65,8 +65,15 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
 -- ── 合规 ──────────────────────────────────────────────────
 (@store,'consent_expire_days','30',@now),
   -- 未同意的会员：积分冻结 + PII 假名化的期限
-(@store,'pii_retention_years','3',@now)
+(@store,'pii_retention_years','3',@now),
   -- 末次消费后保留年限
+
+-- ── 十送一核销识别 ────────────────────────────────────────
+(@store,'redeem_line_patterns','TARJETA 10+1,10+1',@now)
+  -- 明细里 menu_item_id = -2 的折扣行，名称命中这些子串（忽略大小写）
+  -- 即判定为「十送一核销」，该单不计次不积分。逗号分隔，留空用内置默认。
+  -- 实测 -2 折扣行共 4 种名称，只有 TARJETA 10+1 是核销；
+  -- Dto. -20% / CUPON DE 5 EUROS / Dto% 是普通折扣，绝不能误判。
 
 ON DUPLICATE KEY UPDATE
   `config_value` = VALUES(`config_value`),

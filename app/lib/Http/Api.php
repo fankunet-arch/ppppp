@@ -30,6 +30,7 @@ final class Api
         'order_not_found'        => '未找到该订单',
         'not_dine_in'            => '外带订单不参与积分',
         'free_meal'              => '该订单已标记为免费餐，不积分',
+        'redeemed'               => '该订单已使用十送一核销，本餐不计次不积分',
         'zero_amount'            => '该订单金额为 0，不积分',
         'exceeds_total'          => '分配金额超过订单可积分总额',
         'exceeds_portions'       => '分配份数超过订单套餐份数',

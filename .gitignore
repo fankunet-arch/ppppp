@@ -6,6 +6,9 @@
 /var/
 *.log
 
+# 模拟环境的生成物（每次注入活单都会重写）
+/tests/sim/live_orders.json
+
 # 依赖
 /vendor/
 node_modules/

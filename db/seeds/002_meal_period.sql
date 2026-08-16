@@ -11,7 +11,7 @@
 -- 订单归属于【餐期起始日】。
 -- ============================================================
 
-SET NAMES utf8mb4;
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 SET @store := 'S001';
 
 DELETE FROM `meal_period` WHERE `store_code` = @store;

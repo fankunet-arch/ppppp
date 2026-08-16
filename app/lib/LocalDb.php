@@ -16,9 +16,18 @@ final class LocalDb
 
     public function __construct(private array $cfg)
     {
+        $charset   = (string)($cfg['charset']   ?? 'utf8mb4');
+        $collation = (string)($cfg['collation'] ?? 'utf8mb4_unicode_ci');
+        // 只允许标识符字符，防止配置值被拼进 SET NAMES
+        foreach (['charset' => $charset, 'collation' => $collation] as $k => $v) {
+            if (!preg_match('/^[A-Za-z0-9_]+$/', $v)) {
+                throw new \InvalidArgumentException("local_db.{$k} 含非法字符：{$v}");
+            }
+        }
+
         $dsn = sprintf(
             'mysql:host=%s;port=%d;dbname=%s;charset=%s',
-            $cfg['host'], (int)$cfg['port'], $cfg['database'], $cfg['charset'] ?? 'utf8mb4'
+            $cfg['host'], (int)$cfg['port'], $cfg['database'], $charset
         );
         $this->pdo = new \PDO($dsn, $cfg['user'], $cfg['password'], [
             \PDO::ATTR_ERRMODE            => \PDO::ERRMODE_EXCEPTION,
@@ -32,6 +41,15 @@ final class LocalDb
         //   NO_ENGINE_SUBSTITUTION 请求 InnoDB 时不被静默换引擎
         //   不含 ONLY_FULL_GROUP_BY：MySQL 5.7+ 默认开、MariaDB 默认关，显式统一
         $this->pdo->exec("SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'");
+
+        // ★ 钉死连接排序规则 —— 不可省略。
+        // DSN 的 charset 只设字符集，排序规则会回落到服务器默认，而三家默认各不相同：
+        //   MariaDB / MySQL 5.7 → utf8mb4_general_ci，MySQL 8 → utf8mb4_0900_ai_ci
+        // 建表用的是 utf8mb4_unicode_ci，一个都对不上。
+        // 【用户变量的强制性等级是 IMPLICIT，与列相同】，故 `WHERE col = @var`
+        // 两侧同为 IMPLICIT 却排序规则不同 → 报 1267 非法混用而直接失败。
+        // （绑定参数是 COERCIBLE，不受影响，所以这个坑只在写 @变量 的 SQL 脚本里显形。）
+        $this->pdo->exec("SET NAMES {$charset} COLLATE {$collation}");
     }
 
     public function pdo(): \PDO

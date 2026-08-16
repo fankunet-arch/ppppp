@@ -15,7 +15,7 @@
 --    业务逻辑只认 menu_item_id。
 -- ============================================================
 
-SET NAMES utf8mb4;
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 SET @store := 'S001';
 SET @now   := NOW();
 

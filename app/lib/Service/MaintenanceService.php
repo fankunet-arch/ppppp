@@ -31,10 +31,14 @@ final class MaintenanceService
     /**
      * 套餐规则表巡检。
      *
-     * ★ 必须按【价格阈值扫全表】，不能按 major_group 过滤。
+     * ★ 必须按【价格阈值扫全表】，不能只扫 major_group = 3 (Menú)。
      *   实测 BOX 1~18 与 COMBO S/M/L/XL 共 22 项（10.00~65.00 欧）位于
      *   major_group = 1 (Comida) / family_group = 7 (Sushis)，
      *   而不是 major_group = 3 (Menú)。只扫 major_group=3 会全部漏掉。
+     *
+     * ★ 唯一排除的是酒水组（major_group = 2 Bebida）：实测 32 瓶红酒
+     *   （10.95~49.95 欧）全部高于阈值，但酒水永远不是餐费项也不计次，
+     *   不排除就会在上线第一天推 32 条无须处理的告警，把告警变成噪音。
      *
      * 阈值默认 8.00 而非 10.00：BOX 1 在 2024 年售价 9.00（现 10.00），
      * 阈值定高会漏掉涨价前的新项。
@@ -48,9 +52,13 @@ final class MaintenanceService
 
         $threshold = Money::toCents($this->cfg->get('meal_item_alert_price', '8.00'));
         $known     = array_flip($this->mealRules->load()->knownItemIds());
+        // 排除「酒水组」。实测该店 1=Comida 2=Bebida 3=Menú 4=Postres。
+        // 只排除 Bebida，【不能】反过来只扫 Menú —— 见下方 BOX/COMBO 的说明。
+        $drinkGroup = (int)$this->cfg->get('drink_major_group', '2');
 
         $offset = 0;
         $found  = [];
+        $noted  = [];   // 非套餐组的高价新品，只记录不告警
         $scanned = 0;
 
         while (true) {
@@ -69,13 +77,25 @@ final class MaintenanceService
                 if ($price < $threshold || isset($known[$id])) {
                     continue;
                 }
-                $found[] = [
+                $rec = [
                     'menu_item_id' => $id,
                     'name'         => (string)($it['item_name1'] ?? ''),
                     'price'        => Money::toStr($price),
                     'major_group'  => (int)($it['major_group'] ?? 0),
                     'family_group' => (int)($it['family_group'] ?? 0),
                 ];
+                // ★ 酒水组只记录不告警。
+                //   实测整瓶红酒有 32 项在 10.95~49.95 欧区间，全部高于阈值，
+                //   而酒水永远不是餐费项、也不计次，安全默认本来就是对的。
+                //   若不排除，上线第一天就会推 32 条无须处理的告警 ——
+                //   告警一旦变成噪音，真出事时也没人看了。
+                //   但【不能】反过来只扫套餐组：BOX/COMBO 那 22 项在
+                //   major_group=1(Comida) 而非 3(Menú)，只扫 3 会把它们全漏掉。
+                if ($rec['major_group'] === $drinkGroup) {
+                    $noted[] = $rec;
+                } else {
+                    $found[] = $rec;
+                }
             }
             $offset += 100;
             usleep(200_000);        // 每页停 0.2 秒，菜单只有数千行
@@ -83,13 +103,15 @@ final class MaintenanceService
 
         foreach ($found as $f) {
             $this->alerts->raiseOnce('new_menu_item', 'menu_item', (string)$f['menu_item_id'],
-                sprintf('菜单出现未归类的高价项：#%d %s（€ %s，major=%d/family=%d），请确认三个开关',
+                sprintf('菜单出现未归类的高价项：#%d %s（€ %s，major=%d/family=%d），'
+                      . '请到「套餐规则」页确认三个开关，否则计次与积分会走安全默认',
                     $f['menu_item_id'], $f['name'], $f['price'], $f['major_group'], $f['family_group']),
-                ['severity' => 1, 'detail' => $f]);
+                ['severity' => 2, 'detail' => $f]);
         }
-        $log(sprintf('巡检 %d 个菜品，发现 %d 个未归类高价项', $scanned, count($found)));
+        $log(sprintf('巡检 %d 个菜品：未归类高价项 %d 个（已告警），酒水类 %d 个（仅记录不告警）',
+            $scanned, count($found), count($noted)));
 
-        return ['ok' => true, 'scanned' => $scanned, 'new_items' => $found];
+        return ['ok' => true, 'scanned' => $scanned, 'new_items' => $found, 'other_items' => $noted];
     }
 
     /**

@@ -11,7 +11,7 @@
 -- ★ 兼容性同 001_init.sql，见 db/README.md
 -- ============================================================
 
-SET NAMES utf8mb4;
+SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 DROP TABLE IF EXISTS `operator`;
 CREATE TABLE `operator` (

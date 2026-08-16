@@ -213,6 +213,91 @@ T::eq('2026-08-13 23:11:50', $agg['92319']['order_end_time'], '取最晚的结�
 T::eq('2608130080', $agg['92319']['serial_id'], 'serial_id 作为业务主键');
 T::eq(8665, $agg['92322']['should_cents'], '92322 独立一单');
 
+// ── 回归：聚合出的 serial_id 必须与行序无关（模拟环境实测缺陷）──────
+// 实测 order_head_id=25379 的两张 check 各带一个 serial
+// （2409020040 / 2409020041）。Pad 走 order_end_time DESC、
+// Cron 走 ASC，若取「第一行」的 serial，两条路径会各存一个幂等键，
+// pos_order 里互相查不到，同一单被发两次分。
+$dualSerial = [
+    ['order_head_id' => 25379, 'check_id' => 1, 'serial_id' => '2409020040', 'table_name' => '80',
+     'eat_type' => 0, 'customer_num' => 10, 'original_amount' => '238.75', 'should_amount' => '218.75',
+     'actual_amount' => '218.75', 'order_end_time' => '2024-09-02 16:35:23'],
+    ['order_head_id' => 25379, 'check_id' => 2, 'serial_id' => '2409020041', 'table_name' => '80',
+     'eat_type' => 0, 'customer_num' => 10, 'original_amount' => '0.00', 'should_amount' => '0.00',
+     'actual_amount' => '0.00', 'order_end_time' => '2024-09-02 16:35:46'],
+];
+$aggAsc  = PE::aggregateCandidates($dualSerial);
+$aggDesc = PE::aggregateCandidates(array_reverse($dualSerial));
+T::eq('2409020040', $aggAsc['25379']['serial_id'],  '一单双 serial：正序取到最小的');
+T::eq('2409020040', $aggDesc['25379']['serial_id'], '一单双 serial：逆序仍取到最小的（两条读取路径必须一致）');
+T::eq(21875, $aggAsc['25379']['should_cents'], '两张 check 的金额仍完整累加');
+
+// ── 回归：serial_id = 0 的退化单不得共用幂等键 ────────────────────
+// 实测 order_head_id=70762 两张 check 的 serial 都是 0。
+// 若直接拿 0 当幂等键，另一天再出一单 serial=0 就会静默并单：
+// 订单消失、积分不发、且不报错。
+T::eq('H70762', PE::idempotencyKey('0', 70762), 'serial=0 → 退化为 order_head_id 造键');
+T::eq('H70762', PE::idempotencyKey('',  70762), 'serial 为空 → 同样退化');
+T::eq('2608130080', PE::idempotencyKey('2608130080', 92319), '正常 serial 原样返回');
+T::true(PE::idempotencyKey('0', 70762) !== PE::idempotencyKey('0', 70999),
+    '两个不同的 serial=0 订单必须得到不同的幂等键');
+
+$zero = PE::aggregateCandidates([
+    ['order_head_id' => 70762, 'check_id' => 1, 'serial_id' => '0', 'table_name' => '15',
+     'eat_type' => 0, 'customer_num' => 8, 'original_amount' => '71.70', 'should_amount' => '71.70',
+     'actual_amount' => '71.70', 'order_end_time' => '2025-12-29 23:27:40'],
+    ['order_head_id' => 70762, 'check_id' => 2, 'serial_id' => '0', 'table_name' => '15',
+     'eat_type' => 0, 'customer_num' => 8, 'original_amount' => '101.50', 'should_amount' => '101.50',
+     'actual_amount' => '101.50', 'order_end_time' => '2025-12-29 23:26:10'],
+]);
+T::eq('H70762', $zero['70762']['serial_id'], 'serial=0 的单经聚合后拿到造出来的键');
+T::eq(17320, $zero['70762']['should_cents'], '金额照常累加 71.70 + 101.50');
+
+// ════════════════════════════════════════════════════════════
+T::group('十送一核销识别 —— menu_item_id = -2 折扣行');
+
+// 实测 -2 折扣行共 4 种名称，只有 TARJETA 10+1 是核销
+T::true(PE::isRedeemLine('TARJETA 10+1'),      'TARJETA 10+1 → 核销');
+T::true(PE::isRedeemLine('tarjeta 10+1'),      '大小写不敏感');
+T::true(PE::isRedeemLine('  TARJETA 10+1  '),  '两侧空白不敏感');
+T::false(PE::isRedeemLine('Dto. -20%'),        'Dto. -20% 是普通折扣，不得误判');
+T::false(PE::isRedeemLine('CUPON DE 5 EUROS'), 'CUPON 是普通折扣，不得误判');
+T::false(PE::isRedeemLine('Dto%'),             'Dto% 是普通折扣，不得误判');
+T::true(PE::isRedeemLine('PROMO CANJE', ['CANJE']), '模式可配置');
+
+// 含核销行的订单：金额不受污染，但标记为已核销
+$rulesRedeem = new MealRules([
+    ['menu_item_id' => 2390, 'is_meal_fee' => 1, 'counts_visit' => 1, 'earns_points' => 1],
+]);
+$redeemDetail = [
+    ['menu_item_id' => 2390, 'menu_item_name' => 'MENÚ INFINITY', 'quantity' => 5,
+     'product_price' => '23.90', 'original_price' => null, 'actual_price' => '119.50',
+     'is_return_item' => 0, 'condiment_belong_item' => 0],
+    // 核销折扣行：负金额，绝不能混进任何合计
+    ['menu_item_id' => -2, 'menu_item_name' => 'TARJETA 10+1', 'quantity' => 0,
+     'product_price' => '0.00', 'original_price' => null, 'actual_price' => '-95.60',
+     'is_return_item' => 0, 'condiment_belong_item' => 0],
+];
+$ra = PE::analyzeDetail($redeemDetail, $rulesRedeem);
+T::true($ra['is_redeemed'],           '识别出核销行');
+T::eq(9560, $ra['redeem_cents'],      '核销额取绝对值 95.60');
+T::eq(11950, $ra['line_total_cents'], '★ 负金额的折扣行没有混进行合计');
+T::eq(5, $ra['portions_counted'],     '份数只数菜品行');
+T::eq(0, count(array_filter($ra['display'], fn($d) => $d['menu_item_id'] < 0)),
+    '折扣伪行不出现在 Pad 展示列表里');
+
+// 普通折扣不得被当成核销
+$plainDiscount = $redeemDetail;
+$plainDiscount[1]['menu_item_name'] = 'Dto. -20%';
+$pd = PE::analyzeDetail($plainDiscount, $rulesRedeem);
+T::false($pd['is_redeemed'],      '普通折扣行不算核销');
+T::eq(0, $pd['redeem_cents'],     '普通折扣不计入核销额');
+T::eq(11950, $pd['line_total_cents'], '普通折扣行同样不污染行合计');
+
+// 核销单必须失去积分资格
+T::false(PE::checkEligible(0, 2980, 2980, true)['ok'], '核销单不可积分');
+T::true(PE::checkEligible(0, 2980, 2980, false)['ok'], '非核销单正常可积分');
+
 // ════════════════════════════════════════════════════════════
 T::group('splitEvenly —— AA 金额与份数同时分摊');
 

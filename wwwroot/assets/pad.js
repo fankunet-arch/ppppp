@@ -157,7 +157,13 @@ function renderOrders(list) {
     const b = document.createElement('button');
     b.className = 'card' + (o.eligible ? '' : ' disabled');
     const time = o.order_end_time.slice(11, 16);
-    const reason = { not_dine_in: '外带订单不积分', zero_amount: '金额为 0，不积分', free_meal: '已标记免费餐' }[o.ineligible_reason] || '';
+    const reason = {
+      not_dine_in: '外带订单不积分',
+      zero_amount: '金额为 0，不积分',
+      free_meal:   '已标记免费餐',
+      // 明细里有 TARJETA 10+1 折扣行 —— 客人正在兑换奖励，这一餐不计次不积分
+      redeemed:    `已用十送一核销 € ${o.redeem_amount || ''}，本餐不计次不积分`,
+    }[o.ineligible_reason] || '';
     b.innerHTML = `
       <div class="amount">€ ${o.total}</div>
       <div class="meta">${o.table_name} 桌 · ${o.customer_num || '?'} 人 · ${time} 结账 · 套餐 ${o.portions_counted} 份</div>

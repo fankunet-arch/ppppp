@@ -255,6 +255,56 @@ $initSrc = file_get_contents(__DIR__ . '/../../bin/init.php');
 T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $initSrc), 'init.php 拒绝从网络访问');
 T::true((bool)preg_match('/拒绝执行/', $initSrc), 'migrate 有数据安全闸门');
 
+// ── 回归：排序规则必须钉死（db/README.md §2.4）────────────────────
+// DSN 的 charset 只设字符集；排序规则回落到服务器默认时，
+// 「列 = @用户变量」两侧同为 IMPLICIT 却规则不同 → 1267 非法混用，
+// 实测会让 seed 在任何原厂服务器上都跑不通。
+T::group('排序规则钉死 —— 防止 1267 非法混用');
+foreach (array_merge(
+    glob(__DIR__ . '/../../db/migrations/*.sql') ?: [],
+    glob(__DIR__ . '/../../db/seeds/*.sql') ?: []
+) as $f) {
+    $sql  = (string)file_get_contents($f);
+    $name = basename($f);
+    if (!preg_match('/^SET\s+NAMES\s+/mi', $sql)) {
+        continue;   // 没写 SET NAMES 的文件不做要求
+    }
+    T::true((bool)preg_match('/SET\s+NAMES\s+utf8mb4\s+COLLATE\s+utf8mb4_unicode_ci/i', $sql),
+        "{$name} 的 SET NAMES 带 COLLATE utf8mb4_unicode_ci");
+}
+$localDbSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/LocalDb.php');
+T::true((bool)preg_match('/SET\s+NAMES\s+\{?\$charset/i', $localDbSrc),
+    'LocalDb 连接后显式执行 SET NAMES ... COLLATE');
+T::true(str_contains($localDbSrc, 'utf8mb4_unicode_ci'),
+    'LocalDb 的默认排序规则是 utf8mb4_unicode_ci');
+
 $cronSrc = file_get_contents(__DIR__ . '/../../bin/cron.php');
 T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $cronSrc), 'cron.php 拒绝从网络访问');
 T::true((bool)preg_match('/flock\(/', $cronSrc), 'cron 有并发锁');
+
+// ── 回归：数值参数不能直接取 $argv[2] ────────────────────────────
+// 用法是 `cron.php <任务> [天数] [-v]`，直接取 $argv[2] 会把 "-v"
+// 当天数，(int)"-v" = 0 → 完整性监控一天都不查却报成功（静默失效）。
+T::false((bool)preg_match('/checkIntegrity\(\(int\)\(\$argv\[2\]/', $cronSrc),
+    'cron 不把 $argv[2] 直接当天数（-v 会被当成 0）');
+T::true((bool)preg_match('/\$a\[0\]\s*!==\s*.-./', $cronSrc),
+    'cron 解析位置参数时先剔除 - 开头的选项');
+
+// 实跑：-v 绝不能改变检查天数
+$cronBin = __DIR__ . '/../../bin/cron.php';
+if (is_file(__DIR__ . '/../../app/config/config.php')) {
+    $run = static function (string $args) use ($cronBin): int {
+        $out = (string)shell_exec('php ' . escapeshellarg($cronBin) . ' ' . $args . ' 2>&1');
+        // findings 里每条都带一个 "kind"，数它就知道到底查了没有
+        return substr_count($out, '"kind"');
+    };
+    $plain    = $run('integrity');
+    $verbose_ = $run('integrity -v');
+    T::eq($plain, $verbose_, '★ 加 -v 与不加 -v 的检查结果必须一致（-v 不得被当成天数）');
+
+    $d3  = $run('integrity 3');
+    $d3v = $run('integrity 3 -v');
+    $d3r = $run('integrity -v 3');
+    T::eq($d3, $d3v,  '天数在 -v 之前可用');
+    T::eq($d3, $d3r,  '天数在 -v 之后同样可用');
+}

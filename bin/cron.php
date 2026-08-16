@@ -29,13 +29,32 @@ if (PHP_SAPI !== 'cli') {
 $task    = $argv[1] ?? '';
 $verbose = in_array('-v', $argv, true) || in_array('--verbose', $argv, true);
 
+/**
+ * 位置参数（剔除脚本名、任务名与所有 -开头的选项）。
+ *
+ * ★ 不能直接拿 $argv[2] 当数值参数 —— 用法里写的是
+ *   `php bin/cron.php <任务> [-v]`，于是 `integrity -v` 会把 "-v"
+ *   当成天数，`(int)"-v"` = 0，循环一次都不跑，
+ *   结果是「完整性监控报成功、却什么都没查」，
+ *   这种静默失效比直接报错危险得多。
+ */
+$positional = array_values(array_filter(
+    array_slice($argv, 2),
+    static fn(string $a): bool => $a === '' || $a[0] !== '-'
+));
+/** 取第 n 个位置参数并转成正整数，缺省或非法时用默认值 */
+$argInt = static function (int $n, int $default) use ($positional): int {
+    $v = $positional[$n] ?? null;
+    return ($v !== null && ctype_digit($v) && (int)$v > 0) ? (int)$v : $default;
+};
+
 $USAGE = <<<TXT
-用法：php bin/cron.php <任务> [-v]
+用法：php bin/cron.php <任务> [天数] [-v]
 
   incremental   增量补抓（营业时段，每 15–30 分钟）
   nightly       夜间全套（03:00–05:00）
   verify        仅值比对冲正
-  integrity     仅完整性监控
+  integrity     仅完整性监控（可选天数，默认 7）
   menu-audit    仅套餐规则表巡检
   compliance    仅合规到期处理
   status        打印水位线与未处理告警
@@ -122,7 +141,7 @@ try {
             break;
 
         case 'integrity':
-            out('完整性监控', $app->sync()->checkIntegrity((int)($argv[2] ?? 7)));
+            out('完整性监控', $app->sync()->checkIntegrity($argInt(0, 7)));
             break;
 
         case 'menu-audit':

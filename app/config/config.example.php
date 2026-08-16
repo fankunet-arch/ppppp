@@ -40,6 +40,11 @@ return [
         'user'     => '',
         'password' => '',
         'charset'  => 'utf8mb4',   // 本地不受主库 3 字节限制
+
+        // 必须与建表排序规则一致。三家服务器默认值互不相同
+        // （MariaDB / MySQL 5.7 是 utf8mb4_general_ci，MySQL 8 是 utf8mb4_0900_ai_ci），
+        // 不钉死会在「列 = @用户变量」处报 1267 非法混用。见 db/README.md §2.4
+        'collation' => 'utf8mb4_unicode_ci',
     ],
 
     // ── 外部服务（仅出站）──────────────────────────────────
