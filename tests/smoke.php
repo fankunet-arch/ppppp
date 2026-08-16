@@ -380,8 +380,105 @@ $over = $svc->manualGrant((int)$mB['id'], 50000, 'other', ['id' => 2, 'name' => 
 ok(!$over['ok'], '超过单笔限额被拒绝');
 eq('exceeds_manual_limit', $over['error'], '错误码 exceeds_manual_limit');
 
-// ── 12. 不变量总校验 ─────────────────────────────────────────
-step('⑨ 不变量总校验');
+// ── 12. Cron 流程 ────────────────────────────────────────────
+step('⑨ 增量补抓（Cron）');
+
+$app->cfg()->set('sync_batch_sleep_ms', '0');   // 冒烟测试不停顿
+$app->cfg()->set('sync_window_hours', '48');
+$sync = $app->sync();
+$rs = $sync->incremental();
+ok($rs['ok'], '增量补抓执行成功');
+ok($rs['rows'] >= 2, "补抓 {$rs['rows']} 单（含桌号 42 与 32 两张）");
+$cur = $db->one('SELECT * FROM sync_cursor WHERE store_code=? AND cursor_name=?',
+                [SMOKE_STORE, 'incremental']);
+ok($cur !== null, '水位线已建立');
+eq(1, (int)$cur['last_status'], '水位线状态=成功');
+ok($cur['watermark'] >= '2026-08-13', '水位线已推进到夹具时间之后');
+
+// 幂等：再跑一次不应产生重复订单
+$before = (int)$db->value('SELECT COUNT(*) FROM pos_order WHERE store_code=?', [SMOKE_STORE]);
+$sync->incremental();
+eq($before, (int)$db->value('SELECT COUNT(*) FROM pos_order WHERE store_code=?', [SMOKE_STORE]),
+    '重复执行不产生重复订单（幂等）');
+
+step('⑩ 值比对冲正 —— 金额缩水');
+
+// 当前订单 A 已 AA 分给 3 人各 23.90，合计 71.70
+$oBefore = $app->orders()->findBySerial('2608130080');
+eq('71.70', $oBefore['allocated_amount'], '前提：订单 A 已全额分配 71.70');
+
+// 模拟 POS 侧退掉一份套餐：71.70 → 47.80
+foreach ($pos->heads as $i => $h) {
+    if ($h['serial_id'] === '2608130080') {
+        $pos->heads[$i]['original_amount'] = '47.80';
+        $pos->heads[$i]['should_amount']   = '47.80';
+        $pos->heads[$i]['actual_amount']   = '47.80';
+    }
+}
+$pos->addDetail(92319, 1, [
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2),
+]);
+
+$rv = $app->reconcile()->verifyAmounts();
+ok($rv['ok'], '值比对执行成功');
+ok($rv['checked'] >= 1, "回读了 {$rv['checked']} 张订单");
+eq(1, $rv['changed'], '发现 1 张订单金额变化');
+
+$oAfter = $app->orders()->findBySerial('2608130080');
+eq('47.80', $oAfter['total_amount'], '订单可积分总额更新为 47.80');
+eq('47.80', $oAfter['allocated_amount'], '★ 已分配额同步降到 47.80，分毫不差');
+eq(2, (int)$oAfter['verify_status'], '订单标记为已冲正');
+
+$refunds = $db->all(
+    'SELECT * FROM point_ledger WHERE store_code=? AND serial_id=? AND entry_type=3 ORDER BY id',
+    [SMOKE_STORE, '2608130080']);
+eq(3, count($refunds), '产生 3 条退单冲正流水（对应 3 位 AA 会员）');
+$sumBack = 0;
+foreach ($refunds as $r) { $sumBack += (int)round((float)$r['amount'] * -100); }
+eq(2390, $sumBack, '★ 冲正合计恰好 23.90 —— 舍入残差由最后一条吸收，不多退也不少退');
+foreach ($refunds as $r) {
+    eq(0, (int)$r['counted_visit'], '金额缩水不改变计次（客人确实吃了那一份）');
+}
+
+step('⑪ 部分分配时不应过度冲正');
+
+// 订单 B：总额 26.85，只记 10.00 给一位会员，然后缩水到 20.00
+$svc->locate('32');
+$g4 = $svc->grant('2608130081',
+    [['member_id' => (int)$mA['id'], 'amount_cents' => 1000, 'portions' => 0]],
+    PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
+ok($g4['ok'], '订单 B 部分分配 10.00');
+
+foreach ($pos->heads as $i => $h) {
+    if ($h['serial_id'] === '2608130081') {
+        $pos->heads[$i]['original_amount'] = '46.85';
+        $pos->heads[$i]['should_amount']   = '46.85';
+        $pos->heads[$i]['actual_amount']   = '46.85';
+    }
+}
+$pos->addDetail(92322, 1, [
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '23.90', 1),
+    FakePosSource::line(1017, 'BOX 17', '26.50', '20.00', 1),
+    FakePosSource::line(431,  'Agua',   '2.95',  '2.95',  1),
+]);
+$app->orders()->markVerified('2608130081', 0);   // 重置以便再次比对
+$app->reconcile()->verifyAmounts();
+
+$oB = $app->orders()->findBySerial('2608130081');
+eq('10.00', $oB['allocated_amount'],
+    '★ 新总额仍高于已分配额 → 一分都不退（若按缩水额去退就退多了）');
+eq(0, count($db->all(
+    'SELECT 1 FROM point_ledger WHERE store_code=? AND serial_id=? AND entry_type=3',
+    [SMOKE_STORE, '2608130081'])), '未产生任何冲正流水');
+
+step('⑫ 数据完整性监控');
+
+$ci = $app->sync()->checkIntegrity(3);
+ok($ci['ok'], '完整性监控执行成功');
+ok(is_array($ci['findings']), '返回检查结果列表');
+
+// ── 13. 不变量总校验 ─────────────────────────────────────────
+step('⑬ 不变量总校验');
 
 $bad = $db->all(
     'SELECT o.serial_id, o.total_amount, o.allocated_amount

@@ -11,7 +11,11 @@ use Vip\Repo\LedgerRepo;
 use Vip\Repo\MealRuleRepo;
 use Vip\Repo\MemberRepo;
 use Vip\Repo\OrderRepo;
+use Vip\Service\AuthService;
+use Vip\Service\MaintenanceService;
 use Vip\Service\PointsService;
+use Vip\Service\ReconcileService;
+use Vip\Service\SyncService;
 
 /**
  * 简易容器 —— 惰性装配各层依赖。
@@ -62,7 +66,10 @@ final class App
     public function setPosSource(PosSource $src): void
     {
         $this->singletons['posReader'] = $src;
-        unset($this->singletons['points']);   // 让 PointsService 重新装配
+        // 让依赖 PosSource 的服务重新装配
+        foreach (['points', 'sync', 'reconcile', 'maintenance'] as $k) {
+            unset($this->singletons[$k]);
+        }
     }
 
     /**
@@ -78,8 +85,9 @@ final class App
     public function setStoreCode(string $code): void
     {
         $this->config['store_code'] = $code;
-        foreach (['cfg', 'orders', 'members', 'ledger', 'alerts', 'audit',
-                  'cursors', 'mealRuleRepo', 'mealRules', 'bizDay', 'points'] as $k) {
+        foreach (['cfg', 'orders', 'members', 'ledger', 'alerts', 'audit', 'cursors',
+                  'mealRuleRepo', 'mealRules', 'bizDay', 'points', 'auth',
+                  'sync', 'reconcile', 'maintenance'] as $k) {
             unset($this->singletons[$k]);
         }
     }
@@ -132,6 +140,37 @@ final class App
     public function businessDay(): BusinessDay
     {
         return $this->once('bizDay', fn() => new BusinessDay($this->cfg()->get('business_day_cutoff', '02:00')));
+    }
+
+    public function auth(): AuthService
+    {
+        return $this->once('auth', fn() => new AuthService(
+            $this->localDb(), $this->storeCode(), $this->audit()
+        ));
+    }
+
+    public function sync(): SyncService
+    {
+        return $this->once('sync', fn() => new SyncService(
+            $this->posReader(), $this->cfg(), $this->orders(), $this->cursors(),
+            $this->alerts(), $this->mealRules(), $this->businessDay(),
+        ));
+    }
+
+    public function reconcile(): ReconcileService
+    {
+        return $this->once('reconcile', fn() => new ReconcileService(
+            $this->localDb(), $this->posReader(), $this->cfg(), $this->orders(),
+            $this->members(), $this->ledger(), $this->alerts(), $this->audit(), $this->mealRules(),
+        ));
+    }
+
+    public function maintenance(): MaintenanceService
+    {
+        return $this->once('maintenance', fn() => new MaintenanceService(
+            $this->posReader(), $this->cfg(), $this->mealRuleRepo(), $this->members(),
+            $this->alerts(), $this->audit(), $this->auth(),
+        ));
     }
 
     public function points(): PointsService
