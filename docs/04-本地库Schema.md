@@ -126,6 +126,12 @@ CREATE TABLE `point_ledger` (
   `reverses_id`     BIGINT UNSIGNED DEFAULT NULL     COMMENT '本条冲正的是哪条流水',
   `reversed_by_id`  BIGINT UNSIGNED DEFAULT NULL     COMMENT '本条被哪条流水冲正',
 
+  -- 数据来源与降级（见 03 §10）
+  `source`          TINYINT NOT NULL DEFAULT 1       COMMENT '1=POS订单匹配 2=手工录入（降级）',
+  `manual_reason`   VARCHAR(40) DEFAULT NULL         COMMENT 'source=2 时必填：system_not_found / network_error / other',
+  `review_status`   TINYINT NOT NULL DEFAULT 0       COMMENT '0=无需复核 1=待复核 2=已复核通过 3=已复核驳回',
+  `approved_by`     INT DEFAULT NULL                 COMMENT '超限时的审批人',
+
   -- 审计
   `operator_id`     INT DEFAULT NULL                 COMMENT '操作员工',
   `operator_name`   VARCHAR(40) DEFAULT NULL,
@@ -136,9 +142,22 @@ CREATE TABLE `point_ledger` (
   PRIMARY KEY (`id`),
   KEY `idx_member`  (`store_code`,`member_id`,`created_at`),
   KEY `idx_order`   (`store_code`,`serial_id`),
-  KEY `idx_reverse` (`reverses_id`)
+  KEY `idx_reverse` (`reverses_id`),
+  KEY `idx_review`  (`store_code`,`review_status`,`created_at`)   -- 待复核队列
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
+
+### 4.0 手工录入流水（降级路径）
+
+`history_order_head` 曾发生真实数据丢失（2024-08，6 天、478 单、29,233 欧，见 `01` §5.3）。缺失期间收银员查不到订单，必须允许手工录入。
+
+此类流水的特征：
+
+- `source = 2`，`manual_reason` 必填
+- `serial_id` 为 `NULL`（没有对应的 POS 订单）
+- **不写入 `pos_order`**（无业务号可作主键）
+- `review_status = 1`，自动进入后台待复核队列
+- 金额超过 `sys_config.manual_entry_limit` 时需 `approved_by`
 
 ### 4.1 撤销示例
 
@@ -214,7 +233,13 @@ CREATE TABLE `sys_config` (
 | `verify_protect_days` | `30` | 值比对保护期 |
 | `sync_window_hours` | `48` | 滚动校准窗口 |
 | `consent_expire_days` | `30` | 未同意的会员积分冻结期限 |
-| `meal_item_whitelist` | 🔴 待补 | 「餐费项」`menu_item_id` 列表 |
+| `meal_item_whitelist` | `2590,25900,2390,1890,1590,1490,1290` | 「餐费项」`menu_item_id` 列表（见 `01` §4.2） |
+| `meal_item_alert_price` | `5.00` | 白名单巡检阈值：`major_group=3` 且超过此价的新项 → 提醒 |
+| `business_day_cutoff` | `02:00` | 营业日切点（已用 POS 数据验证，见 `01` §5.2） |
+| `manual_entry_enabled` | `1` | 是否允许降级手工录入 |
+| `manual_entry_limit` | `200.00` | 手工录入单笔金额上限，超出需审批 |
+| `manual_entry_daily_alert` | `5` | 同一员工单日手工录入超过此数 → 告警 |
+| `lookup_fallback_window_min` | `60` | 首次查不到时的放宽时间窗 |
 
 ### 6.2 餐期配置 `meal_period`
 
