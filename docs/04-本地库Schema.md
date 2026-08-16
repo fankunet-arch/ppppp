@@ -246,7 +246,7 @@ CREATE TABLE `sys_config` (
 | `verify_protect_days` | `30` | 值比对保护期 |
 | `sync_window_hours` | `48` | 滚动校准窗口 |
 | `consent_expire_days` | `30` | 未同意的会员积分冻结期限 |
-| `meal_item_alert_price` | `5.00` | 规则表巡检阈值：`major_group=3` 且超过此价的新项 → 提醒（见 `03` §5.4） |
+| `meal_item_alert_price` | `10.00` | 规则表巡检阈值：**全表**扫 `price_1 ≥ 此值` 且未被规则表覆盖的项 → 提醒。**不可按 `major_group` 过滤**（BOX/COMBO 在 `major_group=1`）。见 `03` §5.4 |
 | `business_day_cutoff` | `02:00` | 营业日切点（已用 POS 数据验证，见 `01` §5.2） |
 | `manual_entry_enabled` | `1` | 是否允许降级手工录入 |
 | `manual_entry_limit` | `200.00` | 手工录入单笔金额上限，超出需审批 |
@@ -314,6 +314,10 @@ INSERT INTO meal_item_rule
 | `earns_points` | 积分基数扣除：`earns_points = 0` 的项，其金额按比例从基数中扣除（`03` §2.3） |
 
 > 该表**取代**了原先的 `/app/config/meal_items.php` 硬编码数组、`sys_config.meal_item_whitelist` 与 `sys_config.menu_del_dia_earns_points`。
+
+**未被本表覆盖的菜品，按安全默认值处理**：`is_meal_fee = 0`、`counts_visit = 0`、`earns_points = 1`（正常积分、不计次、不参与免费餐判据）。漏配的后果仅是少计次，不会算错金额。
+
+> 🟡 **待归类**：`BOX 1`~`BOX 18`、`COMBO S/M/L/XL` 共 22 项（寿司拼盘，10.00~65.00 欧，`major_group = 1 Comida` / `family_group = 7 Sushis`）。实测仅见于外带订单，堂食是否可点待确认。见 `README.md` 事项 #1。
 
 ### 6.3 餐期配置 `meal_period`
 

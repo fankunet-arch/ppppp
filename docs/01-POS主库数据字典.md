@@ -2,7 +2,8 @@
 
 > 主库：`192.168.2.40:3308` · MySQL **5.5.47** · 库名 `coolroid` · 190 张表 · 字符集 `utf8`（3 字节，非 utf8mb4）
 >
-> 本文档所有"实测"结论基于 `history_order_head` 全量 **88,616 行**（2024-01-22 ~ 2026-08-13，927 个营业日）。
+> 本文档所有"实测"结论基于 `history_order_head` 全量 **88,616 行**（2024-01-22 ~ 2026-08-13，927 个营业日），
+> 明细结论基于 **6,694 行** `history_order_detail`（2024-01 与 2026-08 两个时间窗，已交叉复核一致）。
 
 ## 1. 我们只关心的表
 
@@ -226,7 +227,7 @@ WHERE order_head_id = ? AND check_id = ?
 
 > 💡 这条判据**不依赖 `major_group` / `family_group` 白名单**，可直接用于 AA 点选菜品的显示过滤与免费餐的第一层兜底校验。见 `03-积分与防刷引擎.md` §3.C.1 与 §5.2。
 >
-> ⚠️ 样本量偏小（4 种组合分别 68/6/4/2 行）。**建议上线前用近 30 天明细复验，确认没有第五种组合。**
+> ✅ **已用 2026-08-13 的 1,694 行明细复核**：仅出现 3 种组合（`product=0/original=NULL/actual=0` 1,127 行、`product>0/original=NULL/actual>0` 184 行、`product>0/original=NULL/actual=0` 4 行），**无第五种组合**，判据成立。
 
 ### 3.3 ✅ `quantity` 与「单价 vs 行小计」（已用 5,000 行明细证实）
 
@@ -557,3 +558,5 @@ ADD KEY `table_id` (`table_id`) USING BTREE
 | 14 | 支付行 `-4` 的 `actual_price` 也是收款额 | 混入明细合计 → 金额重复且虚高 | 保持 `menu_item_id > 0` 过滤，取支付方式另起查询（§3.1） |
 | 15 | **`actual_price` 已是行小计** | 再乘 `quantity` → 多份行金额平方级放大 | 直接用 `actual_price`；份数另用 `SUM(quantity)`（§3.3） |
 | 16 | 明细合计 = `original_amount` 非 `should_amount` | 订单级折扣不在明细上，直接相减会算错 | 扣除按比例，分母用 `original_amount`（§3.3.1） |
+| 17 | **BOX/COMBO 套餐在 `major_group=1` 不在 `3`** | 白名单巡检若按 `major_group=3` 过滤 → 漏掉 22 项 | 巡检按**价格阈值扫全表**（`03` §5.4） |
+| 18 | 菜单会涨价 | 白名单里的参考价会过期 | 参考价仅供后台显示，逻辑只认 `item_id`（§4.2） |
