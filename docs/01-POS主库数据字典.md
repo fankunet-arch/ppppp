@@ -188,7 +188,32 @@ WHERE order_head_id = ? AND check_id = ?
 >
 > ⚠️ 样本量偏小（4 种组合分别 68/6/4/2 行）。**建议上线前用近 30 天明细复验，确认没有第五种组合。**
 
-### 3.3 退菜机制（关键）
+### 3.3 🔴 `quantity` 与「单价 vs 行小计」（上线前必须验证）
+
+`quantity` 为 `float`，实测取值 1 / 2 / 3 —— 收银员会把多份相同菜品录成**一行**：
+
+```
+'2-Takoyaki'  product_price=0.00  actual_price=0.00  quantity=2
+'Agua'        product_price=2.80  actual_price=0.00  quantity=3   ← 3 杯水，单价 2.80，全免
+```
+
+**已确认：`product_price` 是单价。** 3 杯 Agua 的 `product_price` 是 `2.80` 而不是 `8.40`。
+
+**推断：`actual_price` 同为单价**，因此：
+
+```
+行金额 = actual_price × quantity
+计次份数 = SUM(quantity)     ← 不是 COUNT(*)
+```
+
+> 🔴 **但 100 行样本中没有「`quantity > 1` 且 `actual_price > 0`」的行，无法直接证实。**
+> 同表的 `sales_amount`、`discount_price` 字段**全为 0/NULL（未启用）**，无法作为交叉参照。
+>
+> **若判断错误，所有多份合并成一行的订单都会算错**：3 份套餐会被记成 1 份 23.90 而不是 3 份 71.70 —— 金额和计次同时出错。
+>
+> 验证 SQL 见 `README.md` 事项 #1。**这是上线前的头号验证项。**
+
+### 3.4 退菜机制（关键）
 
 | 字段 | 说明 |
 |---|---|
@@ -262,9 +287,9 @@ END
 
 `major_group = 3 (Menú)` 共 19 项，但**不能整组当餐费** —— 组内混有餐具、调料、外送费。逐项拆分如下：
 
-**✅ 计入餐费（7 项），按是否参与「十送一」分为两档：**
+**✅ 计入餐费（7 项）。三个开关（`is_meal_fee` / `counts_visit` / `earns_points`）存于后台可维护的 `meal_item_rule` 表，见 `04-本地库Schema.md` §6.2：**
 
-**A 档 —— 餐费 + 参与十送一（计次）**
+**参与十送一（`counts_visit = 1`）**
 
 | item_id | 价格 | 名称 |
 |---|---|---|
@@ -275,18 +300,20 @@ END
 | `1490` | 14.90 | MENU INFANTIL NOCHE FINDE SEMANA |
 | `1290` | 12.90 | MENÚ INFINITY - INFANTIL MEDIODIA |
 
-**B 档 —— 餐费但【不参与】十送一**
+> ⚙️ **儿童套餐 `1490` / `1290`**：`counts_visit` 默认为 `1`（参与），**后台可自由关闭**。
+
+**不参与十送一（`counts_visit = 0`）**
 
 | item_id | 价格 | 名称 | 说明 |
 |---|---|---|---|
-| `1590` | 15.90 | MENÚ DEL DIA (Lunes - Jueves) | **不计次**；金额是否计入积分由后台开关 `menu_del_dia_earns_points` 控制 |
+| `1590` | 15.90 | MENÚ DEL DIA (Lunes - Jueves) | **不计次**（`counts_visit = 0`）；金额是否计入积分由 `earns_points` 开关控制，默认计入 |
 
 **实测分布佐证**（按订单金额反推，仅供参考）：`15.90` 的整数倍金额在午市匹配到 1,776 单、晚市仅 17 单，符合 `MENÚ DEL DIA` 作为工作日午市套餐的定位。
 
 > ⚠️ **占比无法从订单头精确量化** —— 午市最常见金额为 41.70（4,586 单）= 2×20.85，而 20.85 ≈ 18.90 套餐 + 1.95 饮料，绝大多数订单都含酒水，金额反推不可靠。**如需精确占比，须取明细样本**：
 >
 > ```sql
-> SELECT menu_item_id, menu_item_name, COUNT(*) AS 份数, SUM(actual_price) AS 金额
+> SELECT menu_item_id, menu_item_name, SUM(quantity) AS 份数, COUNT(*) AS 行数
 > FROM history_order_detail
 > WHERE order_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)   -- 走 idx_order_time
 >   AND menu_item_id IN (2590,25900,2390,1890,1590,1490,1290)

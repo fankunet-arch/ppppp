@@ -115,10 +115,10 @@ CREATE TABLE `point_ledger` (
   `entry_type`      TINYINT NOT NULL                 COMMENT '1=消费积分 2=撤销冲正 3=退单冲正 4=兑换扣减 5=过期清零 6=手工调整',
   `amount`          DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '本次计入的消费金额（冲正为负）',
   `points`          INT NOT NULL DEFAULT 0           COMMENT '本次积分变动（冲正为负）',
-  `counted_visit`   SMALLINT NOT NULL DEFAULT 0      COMMENT '本条计入的次数 = A档套餐份数（冲正为负值）',
-  `portions_a`      SMALLINT NOT NULL DEFAULT 0      COMMENT 'A档套餐份数快照（参与十送一）',
-  `portions_b`      SMALLINT NOT NULL DEFAULT 0      COMMENT 'B档套餐份数快照（MENÚ DEL DIA，不计次）',
-  `excluded_amount` DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '因开关关闭而从积分基数扣除的金额',
+  `counted_visit`   SMALLINT NOT NULL DEFAULT 0      COMMENT '本条计入的次数（冲正为负值）',
+  `portions_counted`   SMALLINT NOT NULL DEFAULT 0   COMMENT '份数快照：counts_visit=1 菜品的 SUM(quantity)',
+  `portions_uncounted` SMALLINT NOT NULL DEFAULT 0   COMMENT '份数快照：counts_visit=0 的套餐份数（DEL DIA / 儿童套餐等）',
+  `excluded_amount` DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT 'earns_points=0 的项被扣除的金额',
 
   -- AA 记账方式
   `alloc_mode`      TINYINT DEFAULT NULL             COMMENT '1=整单 2=均摊AA 3=点选菜品',
@@ -179,18 +179,19 @@ id=102  member=A  serial_id=2608130080  entry_type=2  amount=-53.70  points=-53 
 
 `member.visit_count = SUM(point_ledger.counted_visit WHERE status=1)`
 
-**默认口径 `by_portion`**：`counted_visit` = 该会员认领的 **A 档套餐份数**（见 `03` §3.2）。
+**默认口径 `by_portion`**：`counted_visit` = 该会员认领的、`meal_item_rule.counts_visit = 1` 的菜品的 **`SUM(quantity)`**（见 `03` §3.2）。
 
-| 场景 | `portions_a` | `portions_b` | `counted_visit` |
+| 场景 | `portions_counted` | `portions_uncounted` | `counted_visit` |
 |---|---|---|---|
 | 整单记一人，3 份 INFINITY | 3 | 0 | **3** |
 | AA 3 人，各 1 份 INFINITY | 1（每人） | 0 | **1**（每人） |
 | AA 3 人，2 份 INFINITY + 1 份 DEL DIA | 1/1/0 | 0/0/1 | **1 / 1 / 0** |
+| 儿童同行（后台关闭儿童计次） | 2 份成人 | 1 份儿童 | **2** |
 | 只点单品无套餐 | 0 | 0 | **0**（金额照常积分） |
 
-`portions_a` / `portions_b` 为快照字段，用于事后审计与口径切换时的重算。
+`portions_counted` / `portions_uncounted` 为快照字段，用于事后审计与口径切换时的重算。
 
-> 🟡 **商业确认项**：整单记一人时 3 份套餐 = +3 次，3 人同行来 4 次即可换 1 份免费餐。若不接受，把 `visit_count_mode` 改为 `by_ledger`（每笔流水最多 1 次）。见 `README.md` 事项 #1。
+> 📌 **已确认采用 `by_portion`**：整单记一人时 3 份套餐 = +3 次，3 人同行来 4 次即可换 1 份免费餐，此商业影响已知悉并接受。备用口径 `by_ledger`（每笔流水最多 1 次）保留在配置中，`portions_counted` 快照支持切换后重算历史数据。
 
 ## 5. 卡券表 `coupon`
 
@@ -240,21 +241,81 @@ CREATE TABLE `sys_config` (
 | `points_multiplier` | `1.0` | 积分倍率（1.0 = 不启用） |
 | `points_include_tax` | `1` | 积分按含税价（已确认为 1） |
 | `free_meal_extra_earns` | `0` | 免费餐当次的额外消费（饮料甜品）是否计金额积分 |
-| `visit_count_mode` | `by_portion` | 计次口径：`by_portion`=按 A 档套餐份数（默认）／`by_ledger`=每笔流水最多 1 次 |
-| `menu_del_dia_earns_points` | `1` | `MENÚ DEL DIA`(1590) 的金额是否计入积分（**计次永远为否**，不可配置） |
+| `visit_count_mode` | `by_portion` | 计次口径：**`by_portion`=按套餐份数（已确认采用）**／`by_ledger`=每笔流水最多 1 次 |
 | `reversal_window_hours` | `24` | 自由撤销时间窗，超出需经理权限 |
 | `verify_protect_days` | `30` | 值比对保护期 |
 | `sync_window_hours` | `48` | 滚动校准窗口 |
 | `consent_expire_days` | `30` | 未同意的会员积分冻结期限 |
-| `meal_item_whitelist` | `2590,25900,2390,1890,1590,1490,1290` | 「餐费项」`menu_item_id` 列表（见 `01` §4.2） |
-| `meal_item_alert_price` | `5.00` | 白名单巡检阈值：`major_group=3` 且超过此价的新项 → 提醒 |
+| `meal_item_alert_price` | `5.00` | 规则表巡检阈值：`major_group=3` 且超过此价的新项 → 提醒（见 `03` §5.4） |
 | `business_day_cutoff` | `02:00` | 营业日切点（已用 POS 数据验证，见 `01` §5.2） |
 | `manual_entry_enabled` | `1` | 是否允许降级手工录入 |
 | `manual_entry_limit` | `200.00` | 手工录入单笔金额上限，超出需审批 |
 | `manual_entry_daily_alert` | `5` | 同一员工单日手工录入超过此数 → 告警 |
 | `lookup_fallback_window_min` | `60` | 首次查不到时的放宽时间窗 |
 
-### 6.2 餐期配置 `meal_period`
+### 6.2 套餐规则表 `meal_item_rule`（后台可维护）
+
+「哪些菜品算餐费 / 参与十送一 / 计入积分」是三个**互相独立**的开关，且需要按菜品逐项配置（`MENÚ DEL DIA` 不计次、儿童套餐是否计次可调）。因此不用硬编码数组，改为后台可维护的规则表。
+
+```sql
+CREATE TABLE `meal_item_rule` (
+  `id`            INT NOT NULL AUTO_INCREMENT,
+  `store_code`    VARCHAR(20) NOT NULL,
+  `menu_item_id`  INT NOT NULL                COMMENT 'POS 的 menu_item.item_id',
+  `item_name`     VARCHAR(60)  DEFAULT NULL   COMMENT '名称快照，仅供后台显示',
+  `ref_price`     DECIMAL(11,2) DEFAULT NULL  COMMENT '参考价快照，仅供后台显示',
+
+  `is_meal_fee`   TINYINT NOT NULL DEFAULT 1  COMMENT '是否算「餐费项」→ 免费餐判据用',
+  `counts_visit`  TINYINT NOT NULL DEFAULT 1  COMMENT '是否参与十送一计次',
+  `earns_points`  TINYINT NOT NULL DEFAULT 1  COMMENT '金额是否计入积分基数',
+
+  `enabled`       TINYINT NOT NULL DEFAULT 1,
+  `updated_at`    DATETIME NOT NULL,
+  `updated_by`    INT DEFAULT NULL,
+
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_item` (`store_code`,`menu_item_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+**初始数据**（来自 `01-POS主库数据字典.md` §4.2）：
+
+| menu_item_id | 名称 | 参考价 | `is_meal_fee` | `counts_visit` | `earns_points` |
+|---|---|---|---|---|---|
+| `2590` | MENÚ INFINITY VIERNES NOCHE-FIN DE SEMANA | 25.90 | 1 | 1 | 1 |
+| `25900` | TAKE WAY | 25.90 | 1 | 1 | 1 |
+| `2390` | MENÚ INFINITY NOCHE LUNES A JUEVES | 23.90 | 1 | 1 | 1 |
+| `1890` | MENÚ INFINITY MEDIODIA - ADULTOS | 18.90 | 1 | 1 | 1 |
+| `1590` | **MENÚ DEL DIA** (Lunes - Jueves) | 15.90 | 1 | **0** | 1 |
+| `1490` | MENU INFANTIL NOCHE FINDE SEMANA | 14.90 | 1 | **1** ⚙️ | 1 |
+| `1290` | MENÚ INFINITY - INFANTIL MEDIODIA | 12.90 | 1 | **1** ⚙️ | 1 |
+
+- `1590` **MENÚ DEL DIA**：`counts_visit = 0`（不参与十送一），金额积分默认计入
+- `1490` / `1290` **儿童套餐**：⚙️ 后台可自由切换是否参与十送一，默认参与
+
+```sql
+INSERT INTO meal_item_rule
+  (store_code, menu_item_id, item_name, ref_price, is_meal_fee, counts_visit, earns_points, enabled, updated_at) VALUES
+('S001', 2590,  'MENÚ INFINITY VIERNES NOCHE-FIN DE SEMANA-FESTIVOS', 25.90, 1, 1, 1, 1, NOW()),
+('S001', 25900, 'TAKE WAY',                                          25.90, 1, 1, 1, 1, NOW()),
+('S001', 2390,  'MENÚ INFINITY NOCHE LUNES A JUEVES-ADULTOS',        23.90, 1, 1, 1, 1, NOW()),
+('S001', 1890,  'MENÚ INFINITY MEDIODIA - ADULTOS',                  18.90, 1, 1, 1, 1, NOW()),
+('S001', 1590,  'MENÚ DEL DIA (Lunes - Jueves)',                     15.90, 1, 0, 1, 1, NOW()),
+('S001', 1490,  'MENU INFANTIL NOCHE FINDE SEMANA',                  14.90, 1, 1, 1, 1, NOW()),
+('S001', 1290,  'MENÚ INFINITY - INFANTIL MEDIODIA',                 12.90, 1, 1, 1, 1, NOW());
+```
+
+**三个开关的用途**：
+
+| 开关 | 用途 |
+|---|---|
+| `is_meal_fee` | 免费餐兜底判据（`03` §5.2 第二层）：该订单的餐费项金额合计是否为 0 |
+| `counts_visit` | 计次：`SUM(quantity)` where `counts_visit = 1`（`03` §3.2） |
+| `earns_points` | 积分基数扣除：`earns_points = 0` 的项，其金额按比例从基数中扣除（`03` §2.3） |
+
+> 该表**取代**了原先的 `/app/config/meal_items.php` 硬编码数组、`sys_config.meal_item_whitelist` 与 `sys_config.menu_del_dia_earns_points`。
+
+### 6.3 餐期配置 `meal_period`
 
 ```sql
 CREATE TABLE `meal_period` (
