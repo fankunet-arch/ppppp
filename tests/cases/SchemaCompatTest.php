@@ -189,3 +189,36 @@ T::true((bool)preg_match('/MYSQLI_OPT_READ_TIMEOUT/', $posDbSrc),
     '设置了查询读取超时（MySQL 5.5 无 MAX_EXECUTION_TIME，服务端无法掐断慢查询）');
 T::true((bool)preg_match('/MAX_LIMIT\s*=\s*100/', $posDbSrc),
     'LIMIT 上限固化为 100');
+
+T::group('API 层 —— 启动期不得急切连库');
+
+$routesSrc = file_get_contents(__DIR__ . '/../../app/api/routes.php');
+
+/**
+ * 回归防护：曾经在 routes.php 顶层直接
+ *   $auth = new AuthService($app->localDb(), ...)
+ * 导致本地库一旦不可达，路由注册阶段就抛 PDOException，
+ * 连 /health 都到不了，且响应体为空 —— 完全无法排障。
+ * 一切依赖数据库的对象必须惰性构造。
+ */
+T::false((bool)preg_match('/^\$\w+\s*=\s*new\s+\w+\(\s*\$app->(localDb|cfg|orders|members|ledger|points)\(/m', $routesSrc),
+    '顶层没有用 $app->localDb() 等急切构造对象（必须惰性）');
+T::true((bool)preg_match('/\$authRef\s*\?\?=/', $routesSrc),
+    'AuthService 惰性构造');
+
+$entrySrc = file_get_contents(__DIR__ . '/../../wwwroot/api.php');
+T::true((bool)preg_match('/catch\s*\(\s*\\\\?PDOException/', $entrySrc),
+    '入口顶层捕获 PDOException → 返回 db_unavailable 而非空响应体');
+T::true((bool)preg_match('/catch\s*\(\s*\\\\?Throwable/', $entrySrc),
+    '入口顶层捕获 Throwable → 任何异常都产出 JSON');
+
+$apiSrc = file_get_contents(__DIR__ . '/../../app/lib/Http/Api.php');
+T::true((bool)preg_match("/'httponly'\s*=>\s*true/", $apiSrc), '会话 Cookie 设为 httpOnly');
+T::true((bool)preg_match("/'samesite'\s*=>\s*'Strict'/", $apiSrc), '会话 Cookie 设为 SameSite=Strict');
+
+$authSrc = file_get_contents(__DIR__ . '/../../app/lib/Service/AuthService.php');
+T::true((bool)preg_match('/password_hash\s*\(/', $authSrc), 'PIN 用 password_hash 存储');
+T::true((bool)preg_match('/password_verify\s*\(/', $authSrc), '校验用 password_verify');
+T::true((bool)preg_match("/hash\('sha256',\s*\\\$token\)/", $authSrc),
+    '会话令牌库中存 SHA-256，明文只在 Cookie');
+T::true((bool)preg_match('/MAX_FAILED/', $authSrc), '有连续失败锁定（防 4 位 PIN 被枚举）');

@@ -1,0 +1,339 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Pad 端 API 路由。
+ *
+ * 由 /wwwroot/api.php 引导后 require 本文件。
+ * 业务代码全部在 /app（网络不可见），入口只在 /wwwroot。
+ *
+ * @var \Vip\App $app
+ */
+
+use Vip\Http\Api;
+use Vip\Money;
+use Vip\PointsEngine as PE;
+use Vip\Service\AuthService;
+
+$api = new Api();
+
+/**
+ * ★ 惰性构造 AuthService。
+ * 若在此处直接 new（需要 localDb()），本地库一旦不可达，
+ * 连 /health 都会在路由注册阶段就崩掉，且响应体为空 —— 无法排障。
+ */
+$authRef = null;
+$auth = static function () use ($app, &$authRef): AuthService {
+    return $authRef ??= new AuthService($app->localDb(), $app->storeCode(), $app->audit());
+};
+
+/** 需要登录的路由统一走这里 */
+$requireOperator = static function () use ($auth): array {
+    $op = $auth()->resolve(Api::readToken());
+    if ($op === null) {
+        Api::fail('unauthorized', 401);
+    }
+    return $op;
+};
+
+$requireManager = static function () use ($requireOperator): array {
+    $op = $requireOperator();
+    if (!$op['is_manager']) {
+        Api::fail('forbidden', 403);
+    }
+    return $op;
+};
+
+// ════════════════════════════════════════════════════════════
+// 健康检查
+// ════════════════════════════════════════════════════════════
+
+$api->on('GET', '/health', static function () use ($app): void {
+    $localOk = true;
+    try {
+        $app->localDb()->value('SELECT 1');
+    } catch (\Throwable) {
+        $localOk = false;
+    }
+    // POS 不可达不算系统故障 —— 降级路径仍可用
+    $posOk = true;
+    $posMsg = null;
+    try {
+        $app->posReader()->now();
+    } catch (\Throwable $e) {
+        $posOk  = false;
+        $posMsg = 'POS 主库暂时无法访问，收银流程可继续（手工录入）';
+    }
+    Api::ok(['local_db' => $localOk, 'pos_db' => $posOk, 'pos_note' => $posMsg]);
+});
+
+// ════════════════════════════════════════════════════════════
+// 身份
+// ════════════════════════════════════════════════════════════
+
+$api->on('POST', '/auth/login', static function () use ($auth): void {
+    $b     = Api::body();
+    $login = Api::str($b, 'login_name', '');
+    $pin   = Api::str($b, 'pin', '');
+    $dev   = Api::str($b, 'device');
+
+    if ($login === '' || $pin === '') {
+        Api::fail('bad_request');
+    }
+    $r = $auth()->login($login, $pin, $dev, Api::clientIp());
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], $r['error'] === 'locked' ? 423 : 401, $r['detail'] ?? []);
+    }
+    Api::setToken((string)$r['token'], 12 * 3600);
+    Api::ok(['operator' => $r['operator']]);
+});
+
+$api->on('POST', '/auth/logout', static function () use ($auth): void {
+    $auth()->logout(Api::readToken());
+    Api::clearToken();
+    Api::ok();
+});
+
+$api->on('GET', '/auth/me', static function () use ($requireOperator): void {
+    Api::ok(['operator' => $requireOperator()]);
+});
+
+// ════════════════════════════════════════════════════════════
+// 订单
+// ════════════════════════════════════════════════════════════
+
+/**
+ * 按桌号定位近 N 分钟的已结账订单。
+ * POS 不可达时返回 503 + pos_unavailable，前端据此提示改用手工录入。
+ */
+$api->on('POST', '/order/locate', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $b     = Api::body();
+    $table = Api::str($b, 'table_name', '');
+    if ($table === '') {
+        Api::fail('bad_request');
+    }
+    $win = Api::int($b, 'window_minutes', 0);
+    $r   = $app->points()->locate($table, $win > 0 ? $win : null);
+
+    if (!$r['ok'] && ($r['reason'] ?? '') === 'pos_unavailable') {
+        Api::fail('pos_unavailable', 503);
+    }
+    Api::ok([
+        'window'     => $r['window'],
+        'candidates' => $r['candidates'],
+        'fallback_window' => $app->cfg()->int('lookup_fallback_window_min', 60),
+    ]);
+});
+
+/** 标记/取消标记免费餐（10送1 核销） */
+$api->on('POST', '/order/free-meal', static function () use ($app, $requireOperator): void {
+    $op     = $requireOperator();
+    $b      = Api::body();
+    $serial = Api::str($b, 'serial_id', '');
+    $isFree = (bool)($b['is_free_meal'] ?? true);
+    if ($serial === '') {
+        Api::fail('bad_request');
+    }
+    if ($app->orders()->findBySerial($serial) === null) {
+        Api::fail('order_not_found', 404);
+    }
+    $app->orders()->markFreeMeal($serial, $isFree);
+    $app->audit()->log('coupon_redeem', [
+        'target_type' => 'order', 'target_id' => $serial,
+        'operator_id' => $op['id'], 'operator_name' => $op['name'], 'device' => $op['device'],
+        'detail' => ['is_free_meal' => $isFree],
+    ]);
+    Api::ok(['serial_id' => $serial, 'is_free_meal' => $isFree]);
+});
+
+// ════════════════════════════════════════════════════════════
+// 会员
+// ════════════════════════════════════════════════════════════
+
+/** 三选一检索：卡号 / 手机号 / 邮箱。不做跨字段模糊搜索。 */
+$api->on('POST', '/member/search', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $b    = Api::body();
+    $type = Api::str($b, 'type', '');
+    $val  = Api::str($b, 'value', '');
+    if (!in_array($type, ['card', 'phone', 'email'], true) || $val === '') {
+        Api::fail('bad_request');
+    }
+    $m = $app->members()->findBy($type, $val);
+    if ($m === null) {
+        Api::ok(['found' => false]);
+    }
+    Api::ok(['found' => true, 'member' => [
+        'id'             => (int)$m['id'],
+        'card_no'        => $m['card_no'],
+        'phone'          => $m['phone'],
+        'email'          => $m['email'],
+        'points_balance' => (int)$m['points_balance'],
+        'visit_count'    => (int)$m['visit_count'],
+        'total_spent'    => $m['total_spent'],
+        'consent_status' => (int)$m['consent_status'],
+        // 未同意前积分冻结、不可兑换、不可营销推送
+        'points_frozen'  => (int)$m['consent_status'] !== 1,
+    ]]);
+});
+
+/**
+ * 内联新建会员（客人现场没卡）。
+ * 积分当场入账但冻结，同时发 double opt-in。
+ */
+$api->on('POST', '/member/create', static function () use ($app, $requireOperator): void {
+    $op    = $requireOperator();
+    $b     = Api::body();
+    $phone = Api::str($b, 'phone');
+    $email = Api::str($b, 'email');
+    $bday  = Api::str($b, 'birthday');
+
+    if (($phone === null || $phone === '') && ($email === null || $email === '')) {
+        Api::fail('bad_request', 400, ['hint' => '手机号与邮箱至少填一项，否则无法发送双重确认']);
+    }
+    try {
+        $m = $app->members()->create($phone ?: null, $email ?: null, $bday ?: null);
+    } catch (\InvalidArgumentException $e) {
+        Api::fail('bad_request', 400, ['hint' => $e->getMessage()]);
+    }
+
+    $app->audit()->log('member_create', [
+        'target_type' => 'member', 'target_id' => (string)$m['id'],
+        'operator_id' => $op['id'], 'operator_name' => $op['name'], 'device' => $op['device'],
+        'detail' => ['has_phone' => (bool)$phone, 'has_email' => (bool)$email],
+    ]);
+
+    // TODO(下一批)：出站调用短信/邮件服务商发送 double opt-in
+    Api::ok(['member' => [
+        'id' => (int)$m['id'], 'card_no' => $m['card_no'],
+        'points_balance' => 0, 'visit_count' => 0,
+        'consent_status' => 0, 'points_frozen' => true,
+    ], 'consent_pending' => true]);
+});
+
+// ════════════════════════════════════════════════════════════
+// 积分
+// ════════════════════════════════════════════════════════════
+
+/**
+ * 发放积分。三种记账方式共用此接口，差别只在 allocations 的构造：
+ *   1 整单   —— 一个会员拿全额与全部份数
+ *   2 均摊AA —— 由前端调 /points/split 得到分摊结果后提交
+ *   3 点选菜品 —— 前端按认领的菜品汇总金额与份数
+ */
+$api->on('POST', '/points/grant', static function () use ($app, $requireOperator): void {
+    $op     = $requireOperator();
+    $b      = Api::body();
+    $serial = Api::str($b, 'serial_id', '');
+    $mode   = Api::int($b, 'mode', PE::MODE_WHOLE);
+    $allocs = $b['allocations'] ?? [];
+
+    if ($serial === '' || !is_array($allocs) || !$allocs) {
+        Api::fail('bad_request');
+    }
+    if (!in_array($mode, [PE::MODE_WHOLE, PE::MODE_SPLIT, PE::MODE_PICK], true)) {
+        Api::fail('bad_request');
+    }
+
+    $clean = [];
+    foreach ($allocs as $a) {
+        $clean[] = [
+            'member_id'    => (int)($a['member_id'] ?? 0),
+            'amount_cents' => Money::toCents((string)($a['amount'] ?? '0')),
+            'portions'     => (int)($a['portions'] ?? 0),
+            'detail'       => $a['detail'] ?? null,
+        ];
+    }
+
+    $r = $app->points()->grant($serial, $clean, $mode, [
+        'id' => $op['id'], 'name' => $op['name'], 'device' => $op['device'],
+    ]);
+    Api::fromResult($r, ['entries' => $r['entries'] ?? []]);
+});
+
+/** 均摊计算 —— 放服务端算，保证与落库口径完全一致（余数给第一位） */
+$api->on('POST', '/points/split', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $b      = Api::body();
+    $serial = Api::str($b, 'serial_id', '');
+    $n      = Api::int($b, 'people', 0);
+    if ($serial === '' || $n < 1 || $n > 50) {
+        Api::fail('bad_request');
+    }
+    $o = $app->orders()->findBySerial($serial);
+    if ($o === null) {
+        Api::fail('order_not_found', 404);
+    }
+    $remainCents = Money::toCents($o['total_amount']) - Money::toCents($o['allocated_amount']);
+    $remainPort  = (int)$o['portions_counted'] - (int)$o['allocated_portions'];
+
+    $parts = PE::splitEvenly(max(0, $remainCents), max(0, $remainPort), $n);
+    Api::ok(['shares' => array_map(static fn($p) => [
+        'amount'   => Money::toStr($p['amount_cents']),
+        'portions' => $p['portions'],
+    ], $parts)]);
+});
+
+/** 撤销 —— 追加反向冲正，不物理删除 */
+$api->on('POST', '/points/reverse', static function () use ($app, $requireOperator): void {
+    $op       = $requireOperator();
+    $b        = Api::body();
+    $ledgerId = Api::int($b, 'ledger_id', 0);
+    $reason   = Api::str($b, 'reason', '') ?: '';
+    if ($ledgerId <= 0) {
+        Api::fail('bad_request');
+    }
+    $r = $app->points()->reverse($ledgerId, $reason, [
+        'id' => $op['id'], 'name' => $op['name'], 'device' => $op['device'],
+        'is_manager' => $op['is_manager'],
+    ]);
+    Api::fromResult($r);
+});
+
+/** 手工录入 —— 主库数据缺失或不可达时的降级路径 */
+$api->on('POST', '/points/manual', static function () use ($app, $requireOperator): void {
+    $op       = $requireOperator();
+    $b        = Api::body();
+    $memberId = Api::int($b, 'member_id', 0);
+    $amount   = Money::toCents((string)($b['amount'] ?? '0'));
+    $reason   = Api::str($b, 'reason_code', 'other') ?: 'other';
+
+    if ($memberId <= 0 || $amount <= 0) {
+        Api::fail('bad_request');
+    }
+    if (!in_array($reason, ['system_not_found', 'network_error', 'other'], true)) {
+        Api::fail('bad_request');
+    }
+
+    $r = $app->points()->manualGrant($memberId, $amount, $reason, [
+        'id' => $op['id'], 'name' => $op['name'], 'device' => $op['device'],
+        // 超限时经理身份即视为已审批
+        'approved_by' => $op['is_manager'] ? $op['id'] : null,
+    ]);
+    Api::fromResult($r);
+});
+
+/** 某会员近期流水（Pad 上查「刚才记给谁了」用） */
+$api->on('POST', '/points/recent', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $b  = Api::body();
+    $id = Api::int($b, 'member_id', 0);
+    if ($id <= 0) {
+        Api::fail('bad_request');
+    }
+    $rows = $app->ledger()->recentByMember($id, 20);
+    Api::ok(['entries' => array_map(static fn($r) => [
+        'id'         => (int)$r['id'],
+        'serial_id'  => $r['serial_id'],
+        'entry_type' => (int)$r['entry_type'],
+        'amount'     => $r['amount'],
+        'points'     => (int)$r['points'],
+        'visits'     => (int)$r['counted_visit'],
+        'status'     => (int)$r['status'],
+        'created_at' => $r['created_at'],
+        'operator'   => $r['operator_name'],
+    ], $rows)]);
+});
+
+return $api;
