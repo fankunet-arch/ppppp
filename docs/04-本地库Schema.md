@@ -246,7 +246,7 @@ CREATE TABLE `sys_config` (
 | `verify_protect_days` | `30` | 值比对保护期 |
 | `sync_window_hours` | `48` | 滚动校准窗口 |
 | `consent_expire_days` | `30` | 未同意的会员积分冻结期限 |
-| `meal_item_alert_price` | `10.00` | 规则表巡检阈值：**全表**扫 `price_1 ≥ 此值` 且未被规则表覆盖的项 → 提醒。**不可按 `major_group` 过滤**（BOX/COMBO 在 `major_group=1`）。见 `03` §5.4 |
+| `meal_item_alert_price` | `8.00` | 规则表巡检阈值：**全表**扫 `price_1 ≥ 此值` 且未被规则表覆盖的项 → 提醒。**不可按 `major_group` 过滤**（BOX/COMBO 在 `major_group=1`）。阈值取 8.00 是因为 `BOX 1` 2024 年售价 9.00，取 10.00 会漏。当前 `menu_item` 中 ≥8.00 的共 61 项，初始化时一次性归类即可。见 `03` §5.4 |
 | `business_day_cutoff` | `02:00` | 营业日切点（已用 POS 数据验证，见 `01` §5.2） |
 | `manual_entry_enabled` | `1` | 是否允许降级手工录入 |
 | `manual_entry_limit` | `200.00` | 手工录入单笔金额上限，超出需审批 |
@@ -294,6 +294,7 @@ CREATE TABLE `meal_item_rule` (
 - `1490` / `1290` **儿童套餐**：⚙️ 后台可自由切换是否参与十送一，默认参与
 
 ```sql
+-- ① 堂食套餐（参与积分体系）
 INSERT INTO meal_item_rule
   (store_code, menu_item_id, item_name, ref_price, is_meal_fee, counts_visit, earns_points, enabled, updated_at) VALUES
 ('S001', 2590,  'MENÚ INFINITY VIERNES NOCHE-FIN DE SEMANA-FESTIVOS', 25.90, 1, 1, 1, 1, NOW()),
@@ -303,7 +304,50 @@ INSERT INTO meal_item_rule
 ('S001', 1590,  'MENÚ DEL DIA (Lunes - Jueves)',                     15.90, 1, 0, 1, 1, NOW()),
 ('S001', 1490,  'MENU INFANTIL NOCHE FINDE SEMANA',                  14.90, 1, 1, 1, 1, NOW()),
 ('S001', 1290,  'MENÚ INFINITY - INFANTIL MEDIODIA',                 12.90, 1, 1, 1, 1, NOW());
+
+-- ② 外卖产品线 BOX / COMBO（22 项）：三个开关全 0，金额也不计入积分
+--    业务规则：BOX 属外卖产品，堂食客人不可点；若堂食单中出现，仍按外卖处理，一律不计入
+INSERT INTO meal_item_rule
+  (store_code, menu_item_id, item_name, ref_price, is_meal_fee, counts_visit, earns_points, enabled, updated_at) VALUES
+('S001', 6049, 'COMBO XL', 65.00, 0, 0, 0, 1, NOW()),
+('S001', 1018, 'BOX 18',   46.50, 0, 0, 0, 1, NOW()),
+('S001', 6047, 'COMBO L',  45.00, 0, 0, 0, 1, NOW()),
+('S001', 1014, 'BOX 14',   39.50, 0, 0, 0, 1, NOW()),
+('S001', 6053, 'COMBO M',  35.00, 0, 0, 0, 1, NOW()),
+('S001', 1017, 'BOX 17',   26.50, 0, 0, 0, 1, NOW()),
+('S001', 1013, 'BOX 13',   25.50, 0, 0, 0, 1, NOW()),
+('S001', 1016, 'BOX 16',   23.50, 0, 0, 0, 1, NOW()),
+('S001', 1009, 'BOX 9',    20.50, 0, 0, 0, 1, NOW()),
+('S001', 6052, 'COMBO S',  20.00, 0, 0, 0, 1, NOW()),
+('S001', 1005, 'BOX 5',    19.50, 0, 0, 0, 1, NOW()),
+('S001', 1006, 'BOX 6',    19.50, 0, 0, 0, 1, NOW()),
+('S001', 1007, 'BOX 7',    19.50, 0, 0, 0, 1, NOW()),
+('S001', 1008, 'BOX 8',    19.50, 0, 0, 0, 1, NOW()),
+('S001', 1011, 'BOX 11',   19.50, 0, 0, 0, 1, NOW()),
+('S001', 1012, 'BOX 12',   19.50, 0, 0, 0, 1, NOW()),
+('S001', 1010, 'BOX 10',   16.50, 0, 0, 0, 1, NOW()),
+('S001', 1015, 'BOX 15',   16.50, 0, 0, 0, 1, NOW()),
+('S001', 1003, 'BOX 3',    13.50, 0, 0, 0, 1, NOW()),
+('S001', 1004, 'BOX 4',    13.50, 0, 0, 0, 1, NOW()),
+('S001', 1002, 'BOX 2',    12.50, 0, 0, 0, 1, NOW()),
+('S001', 1001, 'BOX 1',    10.00, 0, 0, 0, 1, NOW());
 ```
+
+### 6.2.1 外卖产品线 BOX / COMBO
+
+**业务规则：BOX 属外卖产品，堂食客人不可点。若堂食订单中出现 BOX，仍按外卖处理，一律不计入。**
+
+三个开关全部为 `0`，其中 **`earns_points = 0` 是关键** —— 它会让该行金额通过 §2.3 的按比例扣除机制从积分基数中剔除。
+
+| 场景 | 处理 |
+|---|---|
+| 外带订单（`eat_type = 3`）含 BOX | 整单本就不积分 |
+| **堂食订单（`eat_type = 0`）含 BOX** | **该 BOX 行金额从积分基数扣除，不计次** |
+| 堂食订单**全部**是 BOX | 排除金额 = 全额 → 积分基数 = 0 → **不积分** ✅ |
+
+**实测佐证**：跨 2024-01 与 2026-08 两个时间窗、220 个订单，**20 行 BOX/COMBO 全部出现在 `eat_type = 3`（`table_name = 'Llevar'`）订单中，堂食 0 行**，与业务规则一致。
+
+> 📌 `COMBO S/M/L/XL` 按与 BOX 同一产品线处理（同属 `major_group = 1` / `family_group = 7`、同价位区间，实测唯一一行 `COMBO XL` 也出现在外带单）。
 
 **三个开关的用途**：
 
@@ -317,7 +361,7 @@ INSERT INTO meal_item_rule
 
 **未被本表覆盖的菜品，按安全默认值处理**：`is_meal_fee = 0`、`counts_visit = 0`、`earns_points = 1`（正常积分、不计次、不参与免费餐判据）。漏配的后果仅是少计次，不会算错金额。
 
-> 🟡 **待归类**：`BOX 1`~`BOX 18`、`COMBO S/M/L/XL` 共 22 项（寿司拼盘，10.00~65.00 欧，`major_group = 1 Comida` / `family_group = 7 Sushis`）。实测仅见于外带订单，堂食是否可点待确认。见 `README.md` 事项 #1。
+> ✅ **`BOX` / `COMBO` 共 22 项已归类**：外卖产品线，三个开关全 `0`，见 §6.2.1。
 
 ### 6.3 餐期配置 `meal_period`
 
