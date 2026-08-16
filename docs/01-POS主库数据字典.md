@@ -262,7 +262,9 @@ END
 
 `major_group = 3 (Menú)` 共 19 项，但**不能整组当餐费** —— 组内混有餐具、调料、外送费。逐项拆分如下：
 
-**✅ 计入餐费（7 项）：**
+**✅ 计入餐费（7 项），按是否参与「十送一」分为两档：**
+
+**A 档 —— 餐费 + 参与十送一（计次）**
 
 | item_id | 价格 | 名称 |
 |---|---|---|
@@ -270,9 +272,27 @@ END
 | `25900` | 25.90 | TAKE WAY |
 | `2390` | 23.90 | MENÚ INFINITY NOCHE LUNES A JUEVES-ADULTOS |
 | `1890` | 18.90 | MENÚ INFINITY MEDIODIA - ADULTOS |
-| `1590` | 15.90 | MENÚ DEL DIA (Lunes - Jueves) |
 | `1490` | 14.90 | MENU INFANTIL NOCHE FINDE SEMANA |
 | `1290` | 12.90 | MENÚ INFINITY - INFANTIL MEDIODIA |
+
+**B 档 —— 餐费但【不参与】十送一**
+
+| item_id | 价格 | 名称 | 说明 |
+|---|---|---|---|
+| `1590` | 15.90 | MENÚ DEL DIA (Lunes - Jueves) | **不计次**；金额是否计入积分由后台开关 `menu_del_dia_earns_points` 控制 |
+
+**实测分布佐证**（按订单金额反推，仅供参考）：`15.90` 的整数倍金额在午市匹配到 1,776 单、晚市仅 17 单，符合 `MENÚ DEL DIA` 作为工作日午市套餐的定位。
+
+> ⚠️ **占比无法从订单头精确量化** —— 午市最常见金额为 41.70（4,586 单）= 2×20.85，而 20.85 ≈ 18.90 套餐 + 1.95 饮料，绝大多数订单都含酒水，金额反推不可靠。**如需精确占比，须取明细样本**：
+>
+> ```sql
+> SELECT menu_item_id, menu_item_name, COUNT(*) AS 份数, SUM(actual_price) AS 金额
+> FROM history_order_detail
+> WHERE order_time >= DATE_SUB(NOW(), INTERVAL 30 DAY)   -- 走 idx_order_time
+>   AND menu_item_id IN (2590,25900,2390,1890,1590,1490,1290)
+> GROUP BY menu_item_id, menu_item_name;
+> ```
+> 该查询会扫近 30 天明细，**必须在 03:00–05:00 执行**。
 
 **❌ 不计入餐费（12 项，同在 `major_group=3`）：**
 

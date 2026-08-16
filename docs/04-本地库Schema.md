@@ -115,7 +115,10 @@ CREATE TABLE `point_ledger` (
   `entry_type`      TINYINT NOT NULL                 COMMENT '1=消费积分 2=撤销冲正 3=退单冲正 4=兑换扣减 5=过期清零 6=手工调整',
   `amount`          DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '本次计入的消费金额（冲正为负）',
   `points`          INT NOT NULL DEFAULT 0           COMMENT '本次积分变动（冲正为负）',
-  `counted_visit`   TINYINT NOT NULL DEFAULT 0       COMMENT '本条是否计入 visit_count（冲正为 -1）',
+  `counted_visit`   SMALLINT NOT NULL DEFAULT 0      COMMENT '本条计入的次数 = A档套餐份数（冲正为负值）',
+  `portions_a`      SMALLINT NOT NULL DEFAULT 0      COMMENT 'A档套餐份数快照（参与十送一）',
+  `portions_b`      SMALLINT NOT NULL DEFAULT 0      COMMENT 'B档套餐份数快照（MENÚ DEL DIA，不计次）',
+  `excluded_amount` DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '因开关关闭而从积分基数扣除的金额',
 
   -- AA 记账方式
   `alloc_mode`      TINYINT DEFAULT NULL             COMMENT '1=整单 2=均摊AA 3=点选菜品',
@@ -176,9 +179,18 @@ id=102  member=A  serial_id=2608130080  entry_type=2  amount=-53.70  points=-53 
 
 `member.visit_count = SUM(point_ledger.counted_visit WHERE status=1)`
 
-> 🔴 **待确认**（`README.md` 事项 #2）：AA 时每人各 `counted_visit=1`，还是整单只有一条 `counted_visit=1`？
->
-> 字段设计已同时支持两种策略，后台开关切换，确认后设默认值即可。
+**默认口径 `by_portion`**：`counted_visit` = 该会员认领的 **A 档套餐份数**（见 `03` §3.2）。
+
+| 场景 | `portions_a` | `portions_b` | `counted_visit` |
+|---|---|---|---|
+| 整单记一人，3 份 INFINITY | 3 | 0 | **3** |
+| AA 3 人，各 1 份 INFINITY | 1（每人） | 0 | **1**（每人） |
+| AA 3 人，2 份 INFINITY + 1 份 DEL DIA | 1/1/0 | 0/0/1 | **1 / 1 / 0** |
+| 只点单品无套餐 | 0 | 0 | **0**（金额照常积分） |
+
+`portions_a` / `portions_b` 为快照字段，用于事后审计与口径切换时的重算。
+
+> 🟡 **商业确认项**：整单记一人时 3 份套餐 = +3 次，3 人同行来 4 次即可换 1 份免费餐。若不接受，把 `visit_count_mode` 改为 `by_ledger`（每笔流水最多 1 次）。见 `README.md` 事项 #1。
 
 ## 5. 卡券表 `coupon`
 
@@ -228,7 +240,8 @@ CREATE TABLE `sys_config` (
 | `points_multiplier` | `1.0` | 积分倍率（1.0 = 不启用） |
 | `points_include_tax` | `1` | 积分按含税价（已确认为 1） |
 | `free_meal_extra_earns` | `0` | 免费餐当次的额外消费（饮料甜品）是否计金额积分 |
-| `aa_count_visit_per_person` | 🔴 待确认 | AA 时每人各计 1 次 / 整单只计 1 次 |
+| `visit_count_mode` | `by_portion` | 计次口径：`by_portion`=按 A 档套餐份数（默认）／`by_ledger`=每笔流水最多 1 次 |
+| `menu_del_dia_earns_points` | `1` | `MENÚ DEL DIA`(1590) 的金额是否计入积分（**计次永远为否**，不可配置） |
 | `reversal_window_hours` | `24` | 自由撤销时间窗，超出需经理权限 |
 | `verify_protect_days` | `30` | 值比对保护期 |
 | `sync_window_hours` | `48` | 滚动校准窗口 |
