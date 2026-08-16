@@ -15,6 +15,26 @@
 
 **其余 186 张表一律不读。**
 
+### 1.1 ⚠️ 易混字段对照（写代码前先看这张表）
+
+订单头（`*_head`）与订单明细（`*_detail`）的金额字段命名相似但**层级完全不同**，混用会直接算错钱：
+
+| 字段 | 所在表 | 层级 | 含义 | 是否需乘 `quantity` |
+|---|---|---|---|---|
+| `actual_amount` | `history_order_head` | **订单级** | 整单实收总额（如 53.70） | ❌ 否 |
+| `should_amount` | `history_order_head` | **订单级** | 整单应收总额 | ❌ 否 |
+| `original_amount` | `history_order_head` | **订单级** | 整单原价 | ❌ 否 |
+| `discount_amount` | `history_order_head` | **订单级** | 整单折扣（负值） | ❌ 否 |
+| **`actual_price`** | **`history_order_detail`** | **明细行级** | 单行价格（如 MENÚ 23.90） | ✅ **是**（见 §3.3） |
+| **`product_price`** | **`history_order_detail`** | **明细行级** | 单行商品价 | ✅ 是 |
+| **`original_price`** | **`history_order_detail`** | **明细行级** | 单行原价 | ✅ 是 |
+| `quantity` | `history_order_detail` | 明细行级 | 该行份数（实测有 2、3） | — |
+
+记忆规则：**`_amount` = 订单级总额（`*_head` 表）；`_price` = 明细行级单价（`*_detail` 表）。**
+
+> 全库仅 3 张表有 `actual_price`：`history_order_detail`、`order_detail`（活动表，同结构）、`miti`（无关表，不读）。
+> 全库仅 4 张表有 `actual_amount`：`history_order_head`、`order_head`、`history_day_end`、`ecocash_order`（后两张不读）。
+
 ## 2. `history_order_head` 字段字典
 
 ### 2.1 定位与识别
@@ -190,6 +210,8 @@ WHERE order_head_id = ? AND check_id = ?
 
 ### 3.3 🔴 `quantity` 与「单价 vs 行小计」（上线前必须验证）
 
+> 本节字段均属 **`history_order_detail`**（明细行级）。切勿与 `history_order_head.actual_amount`（订单级实收总额）混淆。
+
 `quantity` 为 `float`，实测取值 1 / 2 / 3 —— 收银员会把多份相同菜品录成**一行**：
 
 ```
@@ -197,13 +219,13 @@ WHERE order_head_id = ? AND check_id = ?
 'Agua'        product_price=2.80  actual_price=0.00  quantity=3   ← 3 杯水，单价 2.80，全免
 ```
 
-**已确认：`product_price` 是单价。** 3 杯 Agua 的 `product_price` 是 `2.80` 而不是 `8.40`。
+**已确认：`history_order_detail.product_price` 是单价。** 3 杯 Agua 的 `product_price` 是 `2.80` 而不是 `8.40`。
 
-**推断：`actual_price` 同为单价**，因此：
+**推断：`history_order_detail.actual_price` 同为单价**，因此：
 
 ```
-行金额 = actual_price × quantity
-计次份数 = SUM(quantity)     ← 不是 COUNT(*)
+行金额   = history_order_detail.actual_price × history_order_detail.quantity
+计次份数 = SUM(history_order_detail.quantity)     ← 不是 COUNT(*)
 ```
 
 > 🔴 **但 100 行样本中没有「`quantity > 1` 且 `actual_price > 0`」的行，无法直接证实。**
