@@ -288,6 +288,73 @@ T::true(str_contains($cpSrcPin,  "'/auth/change-pin'"), 'CP 有自助改 PIN 接
 T::true(str_contains($padSrcPin, "'/auth/change-pin'"), 'Pad 有自助改 PIN 接口（收银员也能改）');
 T::true((bool)preg_match('/change-pin.*?requireOperator\\(\\)/s', $padSrcPin), '自助改 PIN 要求已登录');
 
+T::group('后台配置 —— 每个配置项都必须在后台露出来');
+
+/**
+ * 之前后台把 sys_config 当平铺 key-value 列出来，店家找不到
+ * 「几送一」「免费餐额外消费算不算」这些开关在哪；而且有三个配置项
+ * （free_meal_extra_earns / points_include_tax / pii_retention_years）
+ * 建了却从没被代码读过，是死配置 —— 界面上能改，改了没有任何效果。
+ * 这两类问题都靠下面的断言守住。
+ */
+require_once __DIR__ . '/../../app/lib/ConfigSchema.php';
+
+$seedSql = (string)file_get_contents(__DIR__ . '/../../db/seeds/001_sys_config.sql');
+preg_match_all("/\(@store,'([a-z0-9_]+)'/", $seedSql, $sm);
+$seeded = array_unique($sm[1]);
+T::true(count($seeded) > 20, '种子里有 ' . count($seeded) . ' 个配置项');
+
+$schema = array_keys(\Vip\ConfigSchema::ITEMS);
+
+// ① 种子里的每一项都要在 schema 里登记，否则后台没有标签与说明
+foreach ($seeded as $k) {
+    T::true(in_array($k, $schema, true), "配置项 {$k} 已在 ConfigSchema 登记（否则后台显示为未归类）");
+}
+
+// ② schema 里的每一项都要真的被代码读取，不能是死配置
+$appSrc = '';
+foreach ([__DIR__ . '/../../app', __DIR__ . '/../../bin'] as $dir) {
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS));
+    foreach ($it as $fi) {
+        if ($fi->isFile() && $fi->getExtension() === 'php'
+            && $fi->getFilename() !== 'ConfigSchema.php') {
+            $appSrc .= (string)file_get_contents($fi->getPathname());
+        }
+    }
+}
+foreach ($schema as $k) {
+    T::true(str_contains($appSrc, "'{$k}'"),
+        "★ 配置项 {$k} 确实被代码读取（不是改了没效果的死配置）");
+}
+
+// ③ 每项都要有分组、标签、说明
+foreach (\Vip\ConfigSchema::ITEMS as $k => $meta) {
+    T::true(isset(\Vip\ConfigSchema::GROUPS[$meta['group']]), "{$k} 的分组有效");
+    T::true(($meta['label'] ?? '') !== '' && ($meta['desc'] ?? '') !== '',
+        "{$k} 有中文标签与说明");
+    if ($meta['type'] === 'select') {
+        T::true(!empty($meta['options']), "{$k} 是下拉框，选项不为空");
+    }
+}
+
+// ④ 类型校验真的管用
+T::eq(null, \Vip\ConfigSchema::validate('reward_threshold_visits', '10'), '合法整数通过');
+T::true(\Vip\ConfigSchema::validate('reward_threshold_visits', '-1') !== null, '负数被拒');
+T::true(\Vip\ConfigSchema::validate('reward_threshold_visits', '很多') !== null, '文字被拒');
+T::true(\Vip\ConfigSchema::validate('reward_enabled', '2') !== null, '开关只能 0/1');
+T::true(\Vip\ConfigSchema::validate('reward_mode', 'whatever') !== null, '下拉框只能选已有项');
+T::eq(null, \Vip\ConfigSchema::validate('reward_mode', 'amount'), '合法选项通过');
+T::eq(null, \Vip\ConfigSchema::validate('business_day_cutoff', '02:00'), '时间格式通过');
+T::true(\Vip\ConfigSchema::validate('business_day_cutoff', '25:00') !== null, '非法时间被拒');
+
+// ⑤ 用户点名要的三项必须在
+foreach (['reward_mode' => '按次还是按金额',
+          'reward_threshold_visits' => '几送一',
+          'free_meal_extra_earns' => '免费餐额外消费是否计入'] as $k => $what) {
+    T::true(in_array($k, $schema, true), "★ 「{$what}」在后台可设（{$k}）");
+}
+
 T::group('跨平台 —— Windows 与 Linux 都要能跑');
 
 /**

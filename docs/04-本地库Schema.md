@@ -37,6 +37,7 @@ CREATE TABLE `pos_order` (
   -- 金额快照（发分时刻）
   `should_amount`     DECIMAL(11,2) NOT NULL DEFAULT 0,
   `actual_amount`     DECIMAL(11,2) NOT NULL DEFAULT 0,
+  `tax_amount`        DECIMAL(11,2) NOT NULL DEFAULT 0    COMMENT 'POS 税额快照；points_include_tax=0 时据此折算不含税价',
   `total_amount`      DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '可积分总额 = LEAST(should, actual)',
   `allocated_amount`  DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '已分配金额',
 
@@ -83,6 +84,7 @@ CREATE TABLE `member` (
   `points_balance` INT NOT NULL DEFAULT 0,
   `visit_count`    INT NOT NULL DEFAULT 0           COMMENT '累计消费次数，用于 10送1',
   `total_spent`    DECIMAL(12,2) NOT NULL DEFAULT 0,
+  `rewards_issued` INT NOT NULL DEFAULT 0                 COMMENT '累计已发奖励券张数；达标判定用 floor(进度/阈值) 减本字段',
   `level_id`       INT DEFAULT NULL,
   `level_since`    DATE DEFAULT NULL,
 
@@ -201,6 +203,10 @@ CREATE TABLE `coupon` (
   `store_code`    VARCHAR(20) NOT NULL,
   `member_id`     BIGINT UNSIGNED NOT NULL,
   `coupon_type`   TINYINT NOT NULL              COMMENT '1=10送1免餐券 2=赠券 3=生日券',
+  `source`        TINYINT NOT NULL DEFAULT 1    COMMENT '1=满次自动 2=满额自动 3=后台手工',
+  `amount_cents`  INT NOT NULL DEFAULT 0        COMMENT '面额（分）；0=免一份套餐，按核销时实际套餐价抵扣',
+  `progress_at_grant` INT NOT NULL DEFAULT 0    COMMENT '发放时的进度快照，便于对账与申诉',
+  `note`          VARCHAR(200) DEFAULT NULL     COMMENT '手工发放的原因',
   `code`          VARCHAR(40) NOT NULL,
   `status`        TINYINT NOT NULL DEFAULT 1    COMMENT '1=未使用 2=已核销 3=已过期 4=已作废',
   `valid_from`    DATE DEFAULT NULL,
@@ -217,6 +223,29 @@ CREATE TABLE `coupon` (
 ```
 
 核销动作**严格在 Pad 端标记本地库**，收银员再到 POS 端手动做对应折扣收银。
+
+### 5.1 发券由 `RewardService` 负责
+
+发分成功后调用 `checkAndGrant()`，按下式判断该不该发：
+
+```
+应发 = floor(进度 / 阈值)     进度 = member.visit_count 或 total_spent
+待发 = 应发 − member.rewards_issued
+```
+
+用「应发 − 已发」而不是「每次 +1」,是为了**自愈**：店家改阈值或事后补录
+历史消费后，数量会自动对上，既不重复发也不漏发。规则与配置见 `03` §5。
+
+`source` 区分券的来路。**后台手工发放（`source=3`）不计入 `rewards_issued`** ——
+否则补偿性质的一张会顶掉客人靠消费攒来的那张。
+
+`idx_member_status (store_code, member_id, status)` 供 Pad 每次选中会员时
+快速查「有几张可用券」,这是高频查询。
+
+### 5.2 过期不靠定时任务
+
+`expireStale()` 在每次查券时顺手把 `valid_to < 今天` 的置为已过期。
+不单开 Cron 任务 —— 券的过期不需要即时性，查的时候顺带处理即可。
 
 ## 6. 配置表
 

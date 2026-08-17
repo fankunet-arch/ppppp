@@ -133,6 +133,7 @@ try {
                 out('完整性监控', $app->sync()->checkIntegrity(7));
                 out('规则表巡检', $app->maintenance()->auditMenuRules($log));
                 out('合规到期',   $app->maintenance()->expireUnconfirmedMembers($log));
+                out('PII 留存', $app->maintenance()->purgeStalePii($log));
                 out('会话清理',   $app->maintenance()->purgeSessions());
             });
             break;

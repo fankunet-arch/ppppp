@@ -160,11 +160,17 @@ final class PointsService
         $detail   = $this->pos->fetchDetailForChecks($o['order_head_id'], $o['check_ids']);
         $analysis = PE::analyzeDetail($detail, $this->rules, $this->redeemPatterns());
 
+        // 「按含税价积分」开关 points_include_tax
+        //   1（默认）按小票 TOTAL 那个数积分
+        //   0        先扣掉 POS 给的真实税额（实测与小票 SubTotal 完全吻合）
+        $taxCents = $this->cfg->get('points_include_tax', '1') === '1'
+            ? 0
+            : (int)($o['tax_cents'] ?? 0);
+
+        // 先算一次常规基数；免费餐+额外消费计分时，餐费项也要排除
+        $excluded  = $analysis['excluded_cents'];
         $baseCents = PE::pointsBaseCents(
-            $o['should_cents'],
-            $o['actual_cents'],
-            $o['original_cents'],
-            $analysis['excluded_cents']
+            $o['should_cents'], $o['actual_cents'], $o['original_cents'], $excluded, $taxCents
         );
 
         $existing  = $this->orders->findBySerial($o['serial_id']);
@@ -175,11 +181,30 @@ final class PointsService
         //   按业务规则不计次也不计分，否则等于「拿奖励的同时又攒一次」。
         //   与服务员手工标记的 is_free_meal 分开存，审计时能区分判定来源。
         $isRedeemed = (bool)$analysis['is_redeemed'];
-        $eligible   = PE::checkEligible(
-            $o['eat_type'], $o['should_cents'], $o['actual_cents'], $isFree || $isRedeemed
-        );
-        if ($isRedeemed && $eligible['reason'] === 'free_meal') {
-            $eligible['reason'] = 'redeemed';   // 与人工标记的免费餐区分开
+
+        // 「免费餐的额外消费是否计入」—— 后台开关 free_meal_extra_earns
+        //   0（默认）核销/免费餐那一单整单不计分不计次
+        //   1        套餐部分不计分，但酒水甜点等【额外消费】照常计分
+        //            （计次仍然不给 —— 那一餐是兑换来的，不该再攒一次）
+        $extraEarns = $this->cfg->get('free_meal_extra_earns', '0') === '1';
+        $isFreeish  = $isFree || $isRedeemed;
+
+        if ($isFreeish && $extraEarns) {
+            // 只把餐费项从基数里剔掉，剩下的额外消费仍可积分
+            $eligible = PE::checkEligible($o['eat_type'], $o['should_cents'], $o['actual_cents'], false);
+        } else {
+            $eligible = PE::checkEligible($o['eat_type'], $o['should_cents'], $o['actual_cents'], $isFreeish);
+            if ($isRedeemed && $eligible['reason'] === 'free_meal') {
+                $eligible['reason'] = 'redeemed';   // 与人工标记的免费餐区分开
+            }
+        }
+
+        if ($isFreeish && $extraEarns) {
+            // 餐费项（套餐）不计分，其余照常
+            $excluded  = min($o['original_cents'], $excluded + $analysis['meal_fee_cents']);
+            $baseCents = PE::pointsBaseCents(
+                $o['should_cents'], $o['actual_cents'], $o['original_cents'], $excluded, $taxCents
+            );
         }
 
         $bizDate = $this->bizDay->of($o['order_end_time']);
@@ -197,8 +222,9 @@ final class PointsService
             'original_cents'     => $o['original_cents'],
             'should_cents'       => $o['should_cents'],
             'actual_cents'       => $o['actual_cents'],
+            'tax_cents'          => $o['tax_cents'] ?? 0,
             'total_cents'        => $baseCents,
-            'excluded_cents'     => $analysis['excluded_cents'],
+            'excluded_cents'     => $excluded,
             'portions_counted'   => $analysis['portions_counted'],
             'portions_uncounted' => $analysis['portions_uncounted'],
             'is_redeemed'        => $isRedeemed,
@@ -241,7 +267,7 @@ final class PointsService
             'portions_counted'   => $analysis['portions_counted'],
             'allocated_portions' => $allocPort,
             'remaining_portions' => max(0, $analysis['portions_counted'] - $allocPort),
-            'excluded'           => Money::toStr($analysis['excluded_cents']),
+            'excluded'           => Money::toStr($excluded),
             'items'              => $analysis['display'],
             'existing_ledger'    => $this->ledger->activeBySerial($o['serial_id']),
         ];
@@ -274,11 +300,17 @@ final class PointsService
             if ((int)$order['eat_type'] !== 0) {
                 return ['ok' => false, 'error' => 'not_dine_in'];
             }
-            if ((int)$order['is_free_meal'] === 1) {
+            // 免费餐 / 核销单是否放行，取决于「免费餐的额外消费是否计入」开关：
+            //   关（默认）整单拒绝
+            //   开        放行，但 total_amount 里餐费项已被剔除，
+            //             且下面会把计次强制归零 —— 兑换来的那餐不该再攒一次
+            $extraEarns = $this->cfg->get('free_meal_extra_earns', '0') === '1';
+            $freeish    = (int)$order['is_free_meal'] === 1 || (int)($order['is_redeemed'] ?? 0) === 1;
+
+            if ((int)$order['is_free_meal'] === 1 && !$extraEarns) {
                 return ['ok' => false, 'error' => 'free_meal'];
             }
-            // 十送一核销单：兑换奖励的那一餐不计次不计分
-            if ((int)($order['is_redeemed'] ?? 0) === 1) {
+            if ((int)($order['is_redeemed'] ?? 0) === 1 && !$extraEarns) {
                 return ['ok' => false, 'error' => 'redeemed'];
             }
 
@@ -325,7 +357,10 @@ final class PointsService
                 $points = PE::pointsFor($amt, $perEuro, $multiplier);
                 // by_portion：按 counts_visit=1 菜品的份数计次
                 // by_ledger ：每笔流水最多 1 次
-                $visits = $byPortion ? $prt : ($prt > 0 ? 1 : 0);
+                // ★ 免费餐 / 核销单不计次：那一餐是兑换来的，
+                //   再计一次就等于「拿奖励的同时又攒一次」。
+                //   金额可以照常积分（取决于 free_meal_extra_earns），但次数不给。
+                $visits = $freeish ? 0 : ($byPortion ? $prt : ($prt > 0 ? 1 : 0));
 
                 $lid = $this->ledger->insert([
                     'member_id'          => $memberId,
@@ -368,7 +403,7 @@ final class PointsService
                 'detail'        => ['mode' => $allocMode, 'entries' => $entries],
             ]);
 
-            return ['ok' => true, 'entries' => $entries];
+            return ['ok' => true, 'entries' => $entries, 'member_ids' => array_column($entries, 'member_id')];
         });
     }
 

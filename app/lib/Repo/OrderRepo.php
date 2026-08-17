@@ -33,11 +33,11 @@ final class OrderRepo
             'INSERT INTO pos_order
                (store_code, serial_id, order_head_id, check_ids, table_name, eat_type,
                 customer_num, order_end_time, business_date,
-                original_amount, should_amount, actual_amount, total_amount,
+                original_amount, should_amount, actual_amount, tax_amount, total_amount,
                 excluded_amount, portions_counted, portions_uncounted,
                 is_redeemed, redeem_amount,
                 created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON DUPLICATE KEY UPDATE
                order_head_id      = VALUES(order_head_id),
                check_ids          = VALUES(check_ids),
@@ -49,6 +49,7 @@ final class OrderRepo
                original_amount    = VALUES(original_amount),
                should_amount      = VALUES(should_amount),
                actual_amount      = VALUES(actual_amount),
+               tax_amount         = VALUES(tax_amount),
                total_amount       = VALUES(total_amount),
                excluded_amount    = VALUES(excluded_amount),
                portions_counted   = VALUES(portions_counted),
@@ -69,6 +70,7 @@ final class OrderRepo
                 Money::toStr($o['original_cents'] ?? 0),
                 Money::toStr($o['should_cents'] ?? 0),
                 Money::toStr($o['actual_cents'] ?? 0),
+                Money::toStr($o['tax_cents'] ?? 0),
                 Money::toStr($o['total_cents'] ?? 0),
                 Money::toStr($o['excluded_cents'] ?? 0),
                 $o['portions_counted'] ?? 0,

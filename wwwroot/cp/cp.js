@@ -56,7 +56,7 @@ function enterMain(op) {
 const LOADERS = {
   dashboard: loadDashboard, alerts: loadAlerts, reviews: loadReviews,
   rules: loadRules, members: () => {}, report: loadReport,
-  config: loadConfig, operators: loadOperators, audit: loadAudit,
+  config: loadConfig, operators: loadOperators, audit: loadAudit, coupons: loadCoupons,
 };
 $$('.tab').forEach(t => t.onclick = () => {
   $$('.tab').forEach(x => x.classList.toggle('on', x === t));
@@ -251,39 +251,126 @@ async function loadReport() {
 }
 
 /* ── 配置 ─────────────────────────────────────────── */
-const CFG_DESC = {
-  order_lookup_window_min: '订单查找窗口（分钟）',
-  lookup_fallback_window_min: '查不到时的放宽窗口（分钟）',
-  points_per_euro: '每欧元积分数', points_multiplier: '积分倍率（1.0=不启用）',
-  points_include_tax: '积分按含税价', free_meal_extra_earns: '免费餐当次的额外消费是否积分',
-  visit_count_mode: '计次口径 by_portion=按套餐份数 / by_ledger=每笔最多1次',
-  meal_item_alert_price: '规则表巡检价格阈值（全表扫，不按分组过滤）',
-  business_day_cutoff: '营业日切点（已用 POS 数据验证=02:00）',
-  sync_window_hours: '滚动校准窗口（小时）', verify_protect_days: '值比对保护期（天）',
-  sync_batch_size: '每批 LIMIT（上限 100）', sync_batch_sleep_ms: '批次间停顿（毫秒）',
-  sync_max_batches: '单次任务批次上限',
-  manual_entry_enabled: '是否允许手工录入降级', manual_entry_limit: '手工录入单笔限额',
-  manual_entry_daily_alert: '手工录入日频次告警阈值',
-  reversal_window_hours: '自由撤销时限（小时）',
-  consent_expire_days: '未确认会员的冻结期限（天）', pii_retention_years: 'PII 留存年限',
-};
+// 配置项的标签与说明由后端 ConfigSchema 提供（app/lib/ConfigSchema.php），
+// 前端不再维护第二份 —— 之前两边不同步，界面上还写着早已改名的 by_ledger。
 async function loadConfig() {
   const d = await api('/config', undefined, 'GET');
-  const keys = Object.keys(d.config).sort();
-  $('#config-list').innerHTML = `<table><tr><th>配置项</th><th>说明</th><th>值</th>${window.IS_ADMIN ? '<th></th>' : ''}</tr>${
-    keys.map(k => `<tr><td><code>${esc(k)}</code></td>
-      <td class="muted small">${esc(CFG_DESC[k] || '')}</td>
-      <td><input data-ck="${esc(k)}" value="${esc(d.config[k])}" style="min-width:200px"${window.IS_ADMIN ? '' : ' disabled'}></td>
-      ${window.IS_ADMIN ? `<td><button class="tiny primary" data-cs="${esc(k)}">保存</button></td>` : ''}</tr>`).join('')
-  }</table>`;
-  $$('[data-cs]').forEach(b => b.onclick = async () => {
-    const k = b.dataset.cs;
-    try {
-      await api('/config/save', { key: k, value: $(`[data-ck="${k}"]`).value });
-      toast('已保存', 'ok');
-    } catch (e) { toast(e.message, 'err'); }
+  const box = $('#config-list');
+  const ro  = !window.IS_ADMIN;
+
+  // 当前奖励规则用一句人话顶在最上面，店家一眼看到现在是几送一
+  const banner = `<div class="rule-banner">当前奖励规则：<b>${esc(d.reward_text)}</b></div>`;
+
+  box.innerHTML = banner + d.groups.map(g => {
+    const normal = g.items.filter(i => !i.advanced);
+    const adv    = g.items.filter(i => i.advanced);
+    if (!normal.length && !adv.length) return '';
+    const rows = list => list.map(it => cfgRow(it, ro)).join('');
+    return `<section class="cfg-group">
+      <h4>${esc(g.title)}</h4>
+      ${g.desc ? `<p class="muted small">${esc(g.desc)}</p>` : ''}
+      <div class="cfg-items">${rows(normal)}</div>
+      ${adv.length ? `<details class="cfg-adv"><summary>技术参数（${adv.length} 项，一般不用动）</summary>
+        <div class="cfg-items">${rows(adv)}</div></details>` : ''}
+    </section>`;
+  }).join('');
+
+  if (ro) return;
+  $$('[data-cs]').forEach(b => b.onclick = () => saveCfg(b.dataset.cs));
+  // 开关类改完立刻存，不用再点保存
+  $$('.cfg-items input[type=checkbox]').forEach(c => c.onchange = () => saveCfg(c.dataset.ck));
+  $$('.cfg-items select').forEach(sel => sel.onchange = () => saveCfg(sel.dataset.ck));
+}
+
+/** 渲染一项配置。类型决定用什么控件 —— 开关就是开关，别让人填 0/1 */
+function cfgRow(it, ro) {
+  const dis = ro ? ' disabled' : '';
+  let ctrl;
+  if (it.type === 'bool') {
+    ctrl = `<label class="switch-wrap">
+      <input type="checkbox" data-ck="${esc(it.key)}"${it.value === '1' ? ' checked' : ''}${dis}>
+      <span>${it.value === '1' ? '已开启' : '已关闭'}</span></label>`;
+  } else if (it.type === 'select') {
+    ctrl = `<select data-ck="${esc(it.key)}"${dis}>${
+      Object.entries(it.options || {}).map(([v, t]) =>
+        `<option value="${esc(v)}"${v === it.value ? ' selected' : ''}>${esc(t)}</option>`).join('')
+    }</select>`;
+  } else {
+    const mode = (it.type === 'int' || it.type === 'decimal') ? ' inputmode="decimal"' : '';
+    ctrl = `<span class="cfg-input">
+      <input data-ck="${esc(it.key)}" value="${esc(it.value)}"${mode}${dis}>
+      ${it.unit ? `<em>${esc(it.unit)}</em>` : ''}
+      ${ro ? '' : `<button class="tiny primary" data-cs="${esc(it.key)}">保存</button>`}</span>`;
+  }
+  return `<div class="cfg-item">
+    <div class="cfg-label">${esc(it.label)}<code>${esc(it.key)}</code></div>
+    <div class="cfg-ctrl">${ctrl}</div>
+    <div class="cfg-desc muted small">${esc(it.desc)}</div>
+  </div>`;
+}
+
+async function saveCfg(key) {
+  const el = $(`[data-ck="${key}"]`);
+  const val = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+  try {
+    await api('/config/save', { key, value: val });
+    toast('已保存', 'ok');
+    loadConfig();          // 重载：奖励规则那句话要跟着变
+  } catch (e) {
+    toast(e.message + (e.detail?.hint ? '：' + e.detail.hint : ''), 'err');
+    loadConfig();          // 存失败就把界面复原，别让人以为改成功了
+  }
+}
+
+/* ── 奖励券 ───────────────────────────────────────── */
+const CSRC = { 1: '满次自动', 2: '满额自动', 3: '手工发放' };
+const CST  = { 1: ['可用', 'on'], 2: ['已核销', ''], 3: ['已过期', 'warn'], 4: ['已作废', 'err'] };
+
+async function loadCoupons() {
+  const d = await api('/coupons', undefined, 'GET');
+  $('#coupon-rule').innerHTML = `当前奖励规则：<b>${esc(d.rule)}</b>`;
+  $('#coupon-stats').innerHTML = [
+    ['可用', d.stats.active], ['已核销', d.stats.redeemed],
+    ['已过期', d.stats.expired, d.stats.expired > 0 ? 'warn' : ''],
+    ['已作废', d.stats.void], ['累计发放', d.stats.total],
+  ].map(([k, v, cls]) => `<div class="stat ${cls || ''}"><div class="n">${v}</div><div class="k">${k}</div></div>`).join('');
+
+  $('#coupon-list').innerHTML = d.coupons.length ? `<table>
+    <tr><th>券码</th><th>会员</th><th>来源</th><th>状态</th><th>有效期至</th><th>核销时间</th><th>备注</th><th></th></tr>${
+    d.coupons.map(c => {
+      const st = CST[c.status] || ['?', ''];
+      return `<tr>
+        <td><code>${esc(c.code)}</code></td>
+        <td>${esc(c.card_no || '(已删除)')}</td>
+        <td>${CSRC[c.source] || c.source}</td>
+        <td><span class="tag ${st[1]}">${st[0]}</span></td>
+        <td class="muted small">${esc(c.valid_to || '永久')}</td>
+        <td class="muted small">${esc(c.redeemed_at || '')}${c.redeemed_serial_id ? '<br>单 ' + esc(c.redeemed_serial_id) : ''}</td>
+        <td class="muted small">${esc(c.note || '')}</td>
+        <td>${+c.status === 1 ? `<button class="tiny" data-cv="${c.id}" data-cvc="${esc(c.code)}">作废</button>` : ''}</td>
+      </tr>`;
+    }).join('')}</table>` : '<div class="empty">还没有发出任何券</div>';
+
+  $$('[data-cv]').forEach(b => b.onclick = async () => {
+    const why = prompt(`作废券 ${b.dataset.cvc} 的原因：`);
+    if (why === null || !why.trim()) return;
+    try { await api('/coupons/void', { id: +b.dataset.cv, reason: why }); toast('已作废', 'ok'); loadCoupons(); }
+    catch (e) { toast(e.message, 'err'); }
   });
 }
+
+$('#btn-coupon-grant').onclick = async () => {
+  const card = $('#cp-grant-card').value.trim(), note = $('#cp-grant-note').value.trim();
+  if (!card || !note) return toast('请填卡号与原因', 'err');
+  try {
+    const m = await api('/members/search', { type: 'card', value: card });
+    if (!m.found) return toast('查不到该卡号', 'err');
+    await api('/coupons/grant', { member_id: m.member.id, note });
+    toast('已发放', 'ok');
+    $('#cp-grant-card').value = ''; $('#cp-grant-note').value = '';
+    loadCoupons();
+  } catch (e) { toast(e.message + (e.detail?.hint ? '：' + e.detail.hint : ''), 'err'); }
+};
 
 /* ── 操作员 ───────────────────────────────────────── */
 const ROLE = { 1: '服务员', 2: '经理', 3: '管理员' };

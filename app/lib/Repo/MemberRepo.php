@@ -168,6 +168,28 @@ final class MemberRepo
         );
     }
 
+    /**
+     * 末次消费超过 N 年、且尚未假名化的会员（LOPDGDD 存储限制原则）。
+     * 「末次消费」取账本里最后一条流水的时间，从没消费过的用建档时间。
+     */
+    public function staleForPii(int $years, int $limit = 100): array
+    {
+        $cut = date('Y-m-d H:i:s', strtotime("-{$years} years"));
+        return $this->db->all(
+            'SELECT m.id, m.card_no,
+                    COALESCE(MAX(l.created_at), m.created_at) AS last_activity
+               FROM member m
+               LEFT JOIN point_ledger l
+                      ON l.member_id = m.id AND l.store_code = m.store_code
+              WHERE m.store_code = ? AND m.pseudonymized = 0
+              GROUP BY m.id, m.card_no, m.created_at
+             HAVING last_activity < ?
+              ORDER BY last_activity ASC
+              LIMIT ' . max(1, min($limit, 100)),
+            [$this->storeCode, $cut]
+        );
+    }
+
     public function markConsentExpired(int $memberId): void
     {
         $this->db->exec(
