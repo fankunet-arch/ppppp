@@ -189,6 +189,15 @@ final class PointsEngine
         $hasMealFeeItem    = false;
         $portionsCounted   = 0;   // counts_visit=1 的 SUM(quantity)
         $portionsUncounted = 0;   // counts_visit=0 但属餐费项的份数
+        // ★ 计次份数再拆成「付费」与「免费」两档，供 Pad 直接显示，
+        //   免得收银员对着一个总数猜里面几个是免单的。
+        //   判据是【行合计】actual_price 是否为 0 —— 实测真库里
+        //   actual_price 存的是行合计而非单价（如 17.90 × 2 份 = 35.80），
+        //   所以整行免单就是 0，与份数多少无关。
+        $portionsPaid      = 0;
+        $portionsFree      = 0;
+        // 出现在本单、但套餐规则表里没有的菜品：份数无法判定，要如实告诉前台
+        $unknownItems      = [];
         $waivedCents       = 0;   // 「被免金额」：原价 - 实收
         $display           = [];
         $redeemCents       = 0;   // 十送一核销折扣额（正数）
@@ -229,6 +238,16 @@ final class PointsEngine
             }
             if ($rules->countsVisit($itemId)) {
                 $portionsCounted += $qty;
+                if ($lineC > 0) {
+                    $portionsPaid += $qty;
+                } else {
+                    $portionsFree += $qty;
+                }
+            } elseif (!$rules->isKnown($itemId)) {
+                // 规则表没收录 → countsVisit 回落成 false（安全默认，宁可少算）。
+                // 但「少算」和「本来就不该算」在界面上看起来一模一样，都是 0，
+                // 收银员没法判断该不该手工补。所以把这些菜品名带出去，让前台明说。
+                $unknownItems[$itemId] = (string)($row['menu_item_name'] ?? ('#' . $itemId));
             }
 
             // 被免金额：原价（优先 original_price，回落 product_price×qty）与实收之差
@@ -272,6 +291,9 @@ final class PointsEngine
             'has_meal_fee_item'   => $hasMealFeeItem,
             'portions_counted'    => $portionsCounted,
             'portions_uncounted'  => $portionsUncounted,
+            'portions_paid'       => $portionsPaid,
+            'portions_free'       => $portionsFree,
+            'unknown_items'       => array_values($unknownItems),
             'waived_cents'        => $waivedCents,
             // 合并用的键只是内部产物，对外仍是顺序数组
             'display'             => array_values($display),

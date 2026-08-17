@@ -296,12 +296,44 @@ $('#btn-free-meal').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
+/**
+ * 份数明细 —— 全部从 POS 明细读出来，收银员不用自己数、更不用手填。
+ *
+ *   买单人数   = POS 的 customer_num
+ *   付费套餐   = counts_visit 的套餐行里【行合计 > 0】的份数
+ *   免费套餐   = 同上但【行合计 = 0】的份数（整行免单）
+ *
+ * ★ 规则表没收录的菜品会被安全默认当成「不计次」，份数吞成 0。
+ *   那种 0 和「本来就没点套餐」在界面上长得一模一样，收银员没法判断
+ *   该不该手工补 —— 所以这里必须把菜品名点出来，明说是漏配。
+ */
+function renderPortionBreakdown(o) {
+  const el = $('#portion-detail');
+  if (!el) return;
+  const bits = [];
+  if (o.customer_num) bits.push(`买单 ${o.customer_num} 人`);
+  if (o.portions_paid)  bits.push(`付费套餐 <b>${o.portions_paid}</b> 份`);
+  if (o.portions_free)  bits.push(`免费套餐 <b>${o.portions_free}</b> 份`);
+  if (o.allocated_portions) bits.push(`已分配 ${o.allocated_portions} 份`);
+
+  let html = bits.length ? `<div class="port-bits">${bits.join(' · ')}</div>` : '';
+  const unknown = o.unknown_items || [];
+  if (unknown.length) {
+    html += `<div class="port-warn">⚠ 这些菜品不在「套餐规则」里，份数按 0 计：
+             ${unknown.map(escapeHtml).join('、')}<br>
+             如果它们属于套餐，请让经理到后台补规则，别在这里手工凑数字。</div>`;
+  }
+  el.innerHTML = html;
+  el.hidden = !html;
+}
+
 /* ── 步骤 4：分配 ────────────────────────────────── */
 function startAssign() {
   const o = S.order;
   $('#assign-title').textContent = { 1: '整单记给一位会员', 2: '均摊 AA', 3: '点选菜品' }[S.mode];
   $('#sum-total').textContent = money(o.remaining_cents);
   $('#sum-port-total').textContent = o.remaining_portions;
+  renderPortionBreakdown(o);
   showErr('#assign-err', '');
   const body = $('#assign-body');
   body.innerHTML = '';

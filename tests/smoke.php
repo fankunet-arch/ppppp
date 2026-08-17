@@ -560,6 +560,113 @@ eq(3, (int)$db->value('SELECT status FROM coupon WHERE id = ?', [$cid90]),
 eq(1, (int)$db->value('SELECT status FROM coupon WHERE id = ?', [$cid180]),
    '未到期的券不受影响');
 
+// ── 12ter. 整单记给一人时按份数计次 ──────────────────────────
+step('⑫ter 整单记给一位会员 —— 几份套餐就算几次');
+
+/**
+ * ★ 店家口径：一桌 10 个人吃，账单整单记给其中一位会员，
+ *   那一次要算 10 次，不是 1 次 —— 十送一就该当场满。
+ *
+ * 这条链路上有三个地方可能把它做错，所以三处都要验：
+ *   1) Pad 的「整单记给一位会员」必须把【整单份数】传给那一个人
+ *      （pad.js 里是 portions: o.remaining_portions，不是 1）；
+ *   2) 服务端 visit_count_mode = by_portion 时 counted_visit 取份数；
+ *   3) 奖励进度读的是 visit_count，于是一单直接满 10 次发券。
+ * 任何一处退化成「每单最多 1 次」，客人就会觉得次数少了却查不出原因。
+ */
+$pos->addHead([
+    'serial_id' => '2608130090', 'order_head_id' => 92390, 'check_id' => 1,
+    'table_name' => '50', 'eat_type' => 0, 'customer_num' => 10,
+    'original_amount' => '239.00', 'should_amount' => '239.00', 'actual_amount' => '239.00',
+    'order_end_time' => '2026-08-13 23:20:00',
+]);
+$pos->addDetail(92390, 1, [
+    // ★ actual_price 是【行合计】不是单价：23.90 × 10 = 239.00（实测真库如此）
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '239.00', 10),
+]);
+
+$loc10 = $svc->locate('50');
+$ctx10 = $loc10['candidates'][0];
+eq(10, $ctx10['portions_counted'], '10 人 10 份 → 计次份数 10');
+
+// 全新会员，从 0 次起算，好判断到底加了几次
+$mid10 = (int)$app->members()->create('+34600000010', null, null)['id'];
+$g10 = $svc->grant('2608130090',
+    [['member_id' => $mid10, 'amount_cents' => 23900, 'portions' => 10]],
+    PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
+ok($g10['ok'], '整单记给一位会员成功');
+eq(10, (int)$g10['entries'][0]['visits'], '★ 整单记给一人 → 本次计 10 次（不是 1 次）');
+
+eq(10, (int)$db->value('SELECT counted_visit FROM point_ledger WHERE store_code=? AND serial_id=?',
+    [SMOKE_STORE, '2608130090']), '账本里 counted_visit = 10');
+eq(10, (int)$db->value('SELECT visit_count FROM member WHERE id=?', [$mid10]),
+    '★ 会员累计次数 = 10（一单吃满）');
+
+// 十送一：这一单结束就该满一张券
+$db->exec('UPDATE sys_config SET config_value=? WHERE store_code=? AND config_key=?',
+    ['10', SMOKE_STORE, 'reward_threshold_visits']);
+$rw = (new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))->rewards();
+$gr = $rw->checkAndGrant($mid10, ['id' => 1, 'name' => '收银员甲']);
+eq(1, (int)$gr['granted'], '★ 十送一：10 人同桌整单记一人，当场发 1 张券');
+
+// 反向确认：按笔计次时同一单只算 1 次 —— 证明上面的 10 确实来自份数
+$db->exec('UPDATE sys_config SET config_value=? WHERE store_code=? AND config_key=?',
+    ['by_ledger', SMOKE_STORE, 'visit_count_mode']);
+$pos->addHead([
+    'serial_id' => '2608130091', 'order_head_id' => 92391, 'check_id' => 1,
+    'table_name' => '51', 'eat_type' => 0, 'customer_num' => 10,
+    'original_amount' => '239.00', 'should_amount' => '239.00', 'actual_amount' => '239.00',
+    'order_end_time' => '2026-08-13 23:25:00',
+]);
+$pos->addDetail(92391, 1, [
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '239.00', 10),
+]);
+// 配置是按 App 实例缓存的，改完必须新建实例才生效
+$svcL = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$svcL->setLocalDb($db);
+$svcL->setPosSource($pos);
+$svcL->points()->locate('51');
+$midL = (int)$app->members()->create('+34600000011', null, null)['id'];
+$gL = $svcL->points()->grant('2608130091',
+    [['member_id' => $midL, 'amount_cents' => 23900, 'portions' => 10]],
+    PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
+eq(1, (int)$gL['entries'][0]['visits'],
+    '对照：visit_count_mode=by_ledger 时同样一单只算 1 次');
+$db->exec('UPDATE sys_config SET config_value=? WHERE store_code=? AND config_key=?',
+    ['by_portion', SMOKE_STORE, 'visit_count_mode']);
+
+// ── 12quater. 份数明细自动读出，不需要人工填 ──────────────────
+step('⑫quater 份数明细 —— 付费/免费/漏配都从明细读出来');
+
+/**
+ * 收银员不该在 Pad 上手填份数：这些数 POS 明细里全都有。
+ *   付费套餐 = counts_visit 行里【行合计 > 0】的份数
+ *   免费套餐 = 同上但【行合计 = 0】（整行免单，实测真库确有此形态）
+ *
+ * ★ actual_price 是行合计不是单价 —— 真库里 17.90 的套餐点 2 份，
+ *   该字段存 35.80。所以判「免费」只能看这一行是不是 0，与份数无关。
+ */
+$pos->addHead([
+    'serial_id' => '2608130092', 'order_head_id' => 92392, 'check_id' => 1,
+    'table_name' => '52', 'eat_type' => 0, 'customer_num' => 6,
+    'original_amount' => '95.60', 'should_amount' => '95.60', 'actual_amount' => '95.60',
+    'order_end_time' => '2026-08-13 23:26:00',
+]);
+$pos->addDetail(92392, 1, [
+    // 同一套餐，4 份照付、2 份免单（整行 0）—— 真库里就是这个形态
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '95.60', 4),
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '0.00',  2),
+    FakePosSource::line(99999,'新品套餐（未配规则）',  '20.00', '40.00', 2),
+]);
+$loc6  = $svcL->points()->locate('52');
+$ctx6  = $loc6['candidates'][0];
+eq(4, $ctx6['portions_paid'], '★ 付费套餐 4 份（行合计 > 0）');
+eq(2, $ctx6['portions_free'], '★ 免费套餐 2 份（行合计 = 0，整行免单）');
+eq(6, $ctx6['portions_counted'], '计次份数合计 6 = 付费 4 + 免费 2');
+eq(6, (int)$ctx6['customer_num'], '买单人数 6 直接取自 POS');
+eq(1, count($ctx6['unknown_items']), '★ 未配规则的菜品被单独列出（否则份数被吞成 0 却看不出原因）');
+eq('新品套餐（未配规则）', $ctx6['unknown_items'][0], '列出的是菜品名，前台能直接看懂');
+
 // ── 13. 不变量总校验 ─────────────────────────────────────────
 step('⑬ 不变量总校验');
 

@@ -267,6 +267,13 @@ final class PointsService
             'portions_counted'   => $analysis['portions_counted'],
             'allocated_portions' => $allocPort,
             'remaining_portions' => max(0, $analysis['portions_counted'] - $allocPort),
+            // 份数拆档，Pad 直接显示，收银员不用自己数：
+            //   付费套餐几份、免费套餐几份、买单人数（POS 的 customer_num）
+            'portions_paid'      => $analysis['portions_paid'],
+            'portions_free'      => $analysis['portions_free'],
+            // 规则表没收录的菜品：份数会被安全默认吞成 0，必须让前台看得见，
+            // 否则界面上「本来就 0 份」和「漏配所以算不出来」长得一模一样。
+            'unknown_items'      => $analysis['unknown_items'],
             'excluded'           => Money::toStr($excluded),
             'items'              => $analysis['display'],
             'existing_ledger'    => $this->ledger->activeBySerial($o['serial_id']),

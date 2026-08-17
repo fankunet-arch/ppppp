@@ -304,3 +304,17 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
 .reward-has b { font-size: 16px; }
 .reward-progress { font-size: 12px; margin-top: 4px; }
 .card.reward-card { border: 2px solid #f0c14b; background: #fffaf0; }
+
+/* ── 份数明细（分配页顶部）───────────────────────── */
+.portion-detail { margin: 0 0 10px; }
+.portion-detail .port-bits {
+  font-size: 14px; color: #555;
+  background: #f4f7fb; border: 1px solid #dfe7f1;
+  border-radius: 8px; padding: 7px 10px;
+}
+.portion-detail .port-bits b { color: #14181f; font-size: 16px; }
+.portion-detail .port-warn {
+  margin-top: 6px; font-size: 13px; line-height: 1.5;
+  background: #fff4f4; border: 1px solid #f0c9c9;
+  border-radius: 8px; padding: 7px 10px; color: #9a2c2c;
+}
