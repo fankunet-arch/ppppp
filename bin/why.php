@@ -171,6 +171,83 @@ try {
         tip('把上面这段发出来即可定位；同样的内容也在 PHP 错误日志里，前缀 [api]');
     }
 
+    /**
+     * ── ③bis 明细到底在哪张表 ─────────────────────────────
+     *
+     * 份数是数明细行数出来的，明细没有 → 份数必然是 0。
+     * 而这家 POS 有两套表：order_detail 是活单明细，
+     * history_order_detail 是归档后的。如果归档有延迟，
+     * 刚结账的单在历史表里就是「有头无明细」——
+     * 表现正是「订单查得到、套餐 0 份」。
+     */
+    h('③bis 这几张单的明细在哪张表');
+    $ids = [];
+    foreach ($rows ?? [] as $r) { $ids[(int)$r['order_head_id']] = true; }
+    $ids = array_slice(array_keys($ids), 0, 5);
+    if (!$ids) {
+        echo "  （上面没查到单，跳过）\n";
+    } else {
+        printf("  %-10s %-22s %s\n", '订单号', 'history_order_detail', 'order_detail（活单）');
+        foreach ($ids as $id) {
+            $h1 = $db->select('SELECT COUNT(*) AS c FROM history_order_detail WHERE order_head_id = ? LIMIT 1',
+                [$id], 'i')[0]['c'] ?? 0;
+            $l1 = $db->select('SELECT COUNT(*) AS c FROM order_detail WHERE order_head_id = ? LIMIT 1',
+                [$id], 'i')[0]['c'] ?? 0;
+            printf("  %-10s %-22s %s%s\n", $id, $h1, $l1,
+                (int)$h1 === 0 ? "   \033[31m← 历史表无明细，份数必然为 0\033[0m" : '');
+        }
+        $none = array_filter($ids, static fn($id) =>
+            (int)($db->select('SELECT COUNT(*) AS c FROM history_order_detail WHERE order_head_id = ? LIMIT 1',
+                [$id], 'i')[0]['c'] ?? 0) === 0);
+        if ($none) {
+            no_('有订单在 history_order_detail 里没有任何明细行');
+            tip('若明细还在 order_detail（活单表），说明归档有延迟 —— 那就不是配置问题，');
+            tip('而是要等归档，或者改成也读活单明细。把这张表的数字发出来即可判断。');
+        }
+    }
+
+    // ── ④ 套餐规则是否对得上门店码 ────────────────────────
+    h('④ 套餐规则表 —— 「套餐 0 份」几乎都是这里出的问题');
+    try {
+        $ldb   = $app->localDb();
+        $store = $app->storeCode();
+        $mine  = (int)$ldb->value('SELECT COUNT(*) FROM meal_item_rule WHERE store_code = ?', [$store]);
+        $all   = (int)$ldb->value('SELECT COUNT(*) FROM meal_item_rule');
+        printf("  当前门店码 %s：%d 条规则（全表共 %d 条）\n", $store, $mine, $all);
+
+        if ($mine === 0 && $all > 0) {
+            no_('规则表里有数据，但【没有一条属于当前门店码】');
+            $others = $ldb->all('SELECT store_code, COUNT(*) n FROM meal_item_rule GROUP BY store_code');
+            foreach ($others as $o) {
+                printf("      门店码「%s」下有 %d 条\n", $o['store_code'], $o['n']);
+            }
+            /**
+             * 这是最容易踩的部署坑：db/seeds/*.sql 里门店码写死成 S001，
+             * 用 phpMyAdmin 手工导入就会原样落成 S001；而应用读的是
+             * config.php 的 store_code。两者不一致 → 一条规则都读不到
+             * → countsVisit() 全部回落 false → 所有订单都显示「套餐 0 份」。
+             * php bin/init.php seed 会按当前门店码替换后再灌，是幂等的。
+             */
+            tip('种子文件里门店码写死为 S001，手工导入 SQL 就会落成 S001。');
+            tip('改用 php bin/init.php seed 重灌（幂等，会自动替换成当前门店码）');
+        } elseif ($mine === 0) {
+            no_('规则表是空的 —— 所有菜品都会按安全默认「不计次」处理，份数恒为 0');
+            tip('跑 php bin/init.php seed');
+        } else {
+            ok_("规则表已覆盖当前门店（{$mine} 条）");
+            $cv = (int)$ldb->value(
+                'SELECT COUNT(*) FROM meal_item_rule WHERE store_code = ? AND counts_visit = 1', [$store]);
+            if ($cv === 0) {
+                no_('但没有任何一条 counts_visit = 1 —— 份数照样恒为 0');
+                tip('到后台「套餐规则」页把套餐项的「计次」打开');
+            } else {
+                ok_("其中 {$cv} 条参与计次");
+            }
+        }
+    } catch (Throwable $e) {
+        no_('读不到本地库的规则表：' . $e->getMessage());
+    }
+
     h('结论');
     echo "  Pad 只显示【已结账 + 堂食 + 在时间窗内 + 桌号完全相等】的单。\n";
     echo "  上面哪一条打了 ✗，就是它；③ 若抛异常，异常本身就是答案。\n";
