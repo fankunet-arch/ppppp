@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="same-origin">
+<title>会员积分 · Pad</title>
+<link rel="stylesheet" href="/assets/pad.css">
+</head>
+<body>
+
+<!-- ══ 登录 ══════════════════════════════════════════════ -->
+<section id="view-login" class="view active">
+  <div class="login-box">
+    <h1>会员积分</h1>
+    <label>工号
+      <input id="login-name" type="text" inputmode="text" autocomplete="username" autocapitalize="off">
+    </label>
+    <label>PIN
+      <input id="login-pin" type="password" inputmode="numeric" autocomplete="current-password">
+    </label>
+    <button id="btn-login" class="primary big">登录</button>
+    <p id="login-err" class="err" hidden></p>
+    <p class="muted small" id="health-note"></p>
+  </div>
+</section>
+
+<!-- ══ 主界面 ════════════════════════════════════════════ -->
+<section id="view-main" class="view">
+  <header class="topbar">
+    <span id="op-name" class="op"></span>
+    <span id="pos-status" class="pill" hidden></span>
+    <button id="btn-logout" class="link">退出</button>
+  </header>
+
+  <!-- 步骤 1：找订单。两条路并存：有小票就输票号（精确），没有就输桌号 -->
+  <div id="step-table" class="step active">
+    <h2>① 找订单</h2>
+
+    <div class="lookup-tabs">
+      <button id="tab-invoice" class="lookup-tab on"  data-mode="invoice">小票号</button>
+      <button id="tab-table"   class="lookup-tab"     data-mode="table">桌号</button>
+    </div>
+
+    <!-- 按小票号：Factura Simplificada = 全局唯一，不受时间窗限制 -->
+    <div id="pane-invoice" class="lookup-pane">
+      <div class="row">
+        <input id="invoice-input" type="text" inputmode="numeric" placeholder="小票号" autocomplete="off">
+        <button id="btn-locate-invoice" class="primary">查找订单</button>
+      </div>
+      <p class="muted small">
+        输小票上 <b>Factura Simplificada</b> 那一行的号（如 <code>000092521</code>，前面的 0 可不输）。
+        最准，不受 30 分钟限制。
+      </p>
+    </div>
+
+    <!-- 按桌号：原有路径，客人没拿小票时用 -->
+    <div id="pane-table" class="lookup-pane" hidden>
+      <div class="row">
+        <input id="table-input" type="text" inputmode="numeric" placeholder="桌号" autocomplete="off">
+        <button id="btn-locate" class="primary">查找订单</button>
+      </div>
+      <p class="muted small">查找最近 <span id="win-label">30</span> 分钟内该桌已结账的订单</p>
+    </div>
+
+    <p id="locate-err" class="err" hidden></p>
+    <div id="locate-fallback" hidden>
+      <button id="btn-widen" class="ghost">放宽到 <span id="fallback-label">60</span> 分钟再找</button>
+      <button id="btn-manual" class="ghost warn">改用手工录入</button>
+    </div>
+  </div>
+
+  <!-- 步骤 2：选订单 -->
+  <div id="step-order" class="step">
+    <h2>② 选择订单</h2>
+    <div id="order-list" class="cards"></div>
+    <button class="ghost" data-back="step-table">返回</button>
+  </div>
+
+  <!-- 步骤 3：选记账方式 -->
+  <div id="step-mode" class="step">
+    <h2>③ 记账方式</h2>
+    <div id="order-summary" class="summary"></div>
+    <div id="existing-ledger" class="ledger-box" hidden></div>
+    <div class="modes">
+      <button class="mode" data-mode="1"><b>整单记一人</b><span>全部金额与份数记给一位会员</span></button>
+      <button class="mode" data-mode="2"><b>均摊 AA</b><span>按人数平均分摊，余数给第一位</span></button>
+      <button class="mode" data-mode="3"><b>点选菜品</b><span>每位客人认领自己点的菜</span></button>
+    </div>
+    <button id="btn-free-meal" class="ghost warn">标记为免费餐（10送1 核销）</button>
+    <button class="ghost" data-back="step-order">返回</button>
+  </div>
+
+  <!-- 步骤 4：分配 -->
+  <div id="step-assign" class="step">
+    <h2>④ <span id="assign-title"></span></h2>
+    <div id="assign-body"></div>
+    <div id="assign-people" class="people"></div>
+    <div class="totals">
+      <span>已分配 <b id="sum-alloc">0.00</b> / 可分配 <b id="sum-total">0.00</b></span>
+      <span>份数 <b id="sum-port">0</b> / <b id="sum-port-total">0</b></span>
+    </div>
+    <button id="btn-submit" class="primary big">提交积分</button>
+    <p id="assign-err" class="err" hidden></p>
+    <button class="ghost" data-back="step-mode">返回</button>
+  </div>
+
+  <!-- 步骤 5：结果 -->
+  <div id="step-done" class="step">
+    <h2>✓ 记账完成</h2>
+    <div id="done-body" class="cards"></div>
+    <button id="btn-new" class="primary big">下一单</button>
+  </div>
+
+  <!-- 手工录入 -->
+  <div id="step-manual" class="step">
+    <h2>手工录入（降级）</h2>
+    <p class="muted small">仅在系统查不到订单或主库不可用时使用。所有手工录入都会进入后台待复核队列。</p>
+    <div id="manual-member"></div>
+    <label>金额（欧元）<input id="manual-amount" type="text" inputmode="decimal" placeholder="0.00"></label>
+    <label>原因
+      <select id="manual-reason">
+        <option value="system_not_found">系统未查到订单</option>
+        <option value="network_error">网络/主库故障</option>
+        <option value="other">其他</option>
+      </select>
+    </label>
+    <button id="btn-manual-submit" class="primary big">提交</button>
+    <p id="manual-err" class="err" hidden></p>
+    <button class="ghost" data-back="step-table">返回</button>
+  </div>
+</section>
+
+<!-- ══ 会员选择弹层 ══════════════════════════════════════ -->
+<div id="member-modal" class="modal" hidden>
+  <div class="modal-box">
+    <h3>选择会员</h3>
+    <div class="seg" id="search-type">
+      <button class="on" data-type="card">卡号</button>
+      <button data-type="phone">手机号</button>
+      <button data-type="email">邮箱</button>
+    </div>
+    <div class="row">
+      <input id="member-input" type="text" autocomplete="off" placeholder="输入后点查找">
+      <button id="btn-member-search" class="primary">查找</button>
+    </div>
+    <div id="member-result"></div>
+    <hr>
+    <details id="member-new">
+      <summary>客人没有卡 —— 现场新建</summary>
+      <p class="muted small">仅需手机号或邮箱其一。系统会立即发送含隐私政策的确认消息，
+        客人确认前积分照常入账但暂不可兑换。</p>
+      <label>手机号<input id="new-phone" type="tel" inputmode="tel" autocomplete="off"></label>
+      <label>邮箱<input id="new-email" type="email" inputmode="email" autocomplete="off"></label>
+      <label>生日（选填）<input id="new-birthday" type="date"></label>
+      <button id="btn-member-create" class="primary">创建并选用</button>
+    </details>
+    <p id="member-err" class="err" hidden></p>
+    <button id="btn-member-close" class="ghost">取消</button>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/assets/pad.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# 实际配置（含数据库账号密码），绝不入库
+/app/config/config.php
+/app/config/*.local.php
+
+# 运行时
+/var/
+*.log
+
+# 模拟环境的生成物（每次注入活单都会重写）
+/tests/sim/live_orders.json
+
+# 依赖
+/vendor/
+node_modules/
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
