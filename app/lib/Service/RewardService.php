@@ -197,12 +197,25 @@ final class RewardService
         return ['ok' => true, 'coupon' => $c];
     }
 
-    /** 落一张券 */
+    /**
+     * 落一张券。
+     *
+     * ★ 有效期【写死在券上】，不是全局规则实时算出来的。
+     *   发券当刻按当时的 coupon_valid_days 算出 valid_to 存进这一行，
+     *   之后店家把规则从 180 天改成 90 天，**已发出去的券一律不受影响**，
+     *   只有新发的按新规则。过期判定（expireStale）读的也是券上的
+     *   valid_to，不碰配置。
+     *
+     *   这是硬性约定：客人拿到手的券，到期日就不该再变。
+     *   别把它「优化」成按当前配置实时计算 —— 那会让老客人的券凭空缩水或延长。
+     *   tests/cases/SchemaCompatTest.php 有断言守着。
+     */
     private function issue(int $memberId, int $source, int $progress,
                            int $validDays, ?string $note, array $operator): array
     {
         $now  = $this->db->now();
         $code = strtoupper(bin2hex(random_bytes(4)));   // 8 位，够短能口头核对
+        // 发券当刻定死；0 = 永久（valid_to 存 NULL）
         $to   = $validDays > 0
             ? date('Y-m-d', strtotime($now) + $validDays * 86400)
             : null;

@@ -485,6 +485,57 @@ $ci = $app->sync()->checkIntegrity(3);
 ok($ci['ok'], '完整性监控执行成功');
 ok(is_array($ci['findings']), '返回检查结果列表');
 
+// ── 12b. 奖励券：有效期写在券上，不随规则变动 ────────────────
+step('⑫bis 奖励券 —— 改规则不影响已发的券');
+
+$setCfg = static function (LocalDb $db, string $k, string $v): void {
+    $db->exec('UPDATE sys_config SET config_value = ? WHERE store_code = ? AND config_key = ?',
+        [$v, SMOKE_STORE, $k]);
+};
+// 规则里没有这几项就补上（smoke 库的种子是自己灌的）
+foreach (['reward_enabled' => '1', 'reward_mode' => 'visits',
+          'reward_threshold_visits' => '10', 'reward_threshold_amount' => '300.00',
+          'reward_auto_grant' => '1', 'coupon_valid_days' => '180'] as $k => $v) {
+    $db->exec('INSERT INTO sys_config (store_code, config_key, config_value, updated_at)
+               VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)',
+        [SMOKE_STORE, $k, $v, $db->now()]);
+}
+
+$rwMember = $app->members()->create('600990001', null, null);
+$rwId     = (int)$rwMember['id'];
+$db->exec('UPDATE member SET visit_count = 10 WHERE id = ?', [$rwId]);
+
+$g180 = (new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))
+    ->rewards()->checkAndGrant($rwId, ['id' => 1, 'name' => 'smoke']);
+eq(1, $g180['granted'], '满 10 次发 1 张券');
+$cid180 = (int)$g180['coupons'][0]['id'];
+$exp180 = date('Y-m-d', strtotime($db->now()) + 180 * 86400);
+eq($exp180, (string)$db->value('SELECT valid_to FROM coupon WHERE id = ?', [$cid180]),
+    '按当时规则 180 天定下到期日');
+
+// 规则改成 90 天后再发一张
+$setCfg($db, 'coupon_valid_days', '90');
+$db->exec('UPDATE member SET visit_count = 20 WHERE id = ?', [$rwId]);
+$g90 = (new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))
+    ->rewards()->checkAndGrant($rwId, ['id' => 1, 'name' => 'smoke']);
+$cid90 = (int)$g90['coupons'][0]['id'];
+eq(date('Y-m-d', strtotime($db->now()) + 90 * 86400),
+   (string)$db->value('SELECT valid_to FROM coupon WHERE id = ?', [$cid90]),
+   '新券按新规则 90 天');
+eq($exp180, (string)$db->value('SELECT valid_to FROM coupon WHERE id = ?', [$cid180]),
+   '★ 改规则后，先发的那张仍是 180 天 —— 客人拿到手的券到期日不会变');
+
+// 过期判定读券上的日期，不读当前规则
+$db->exec('UPDATE coupon SET valid_to = ? WHERE id = ?',
+    [date('Y-m-d', strtotime('-1 day')), $cid90]);
+$setCfg($db, 'coupon_valid_days', '3650');
+(new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))
+    ->rewards()->expireStale();
+eq(3, (int)$db->value('SELECT status FROM coupon WHERE id = ?', [$cid90]),
+   '★ 过期按券上的日期判定（规则改成 3650 天也救不回来）');
+eq(1, (int)$db->value('SELECT status FROM coupon WHERE id = ?', [$cid180]),
+   '未到期的券不受影响');
+
 // ── 13. 不变量总校验 ─────────────────────────────────────────
 step('⑬ 不变量总校验');
 

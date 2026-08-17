@@ -355,6 +355,26 @@ foreach (['reward_mode' => '按次还是按金额',
     T::true(in_array($k, $schema, true), "★ 「{$what}」在后台可设（{$k}）");
 }
 
+T::group('券的有效期写在券上，不随规则变动');
+
+/**
+ * 硬性约定：客人拿到手的券，到期日不该再变。
+ * 发券当刻按当时的 coupon_valid_days 算出 valid_to 存进那一行；
+ * 之后店家把规则从 180 天改成 90 天，已发的券一律不受影响。
+ * 真库行为由 tests/smoke.php 验证，这里守住实现方式不被「优化」掉。
+ */
+$rwSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/Service/RewardService.php');
+T::true((bool)preg_match('/private function issue\(.*?\$validDays.*?\)/s', $rwSrc),
+    '发券时把有效期天数当参数传进去（而不是在里面读配置）');
+T::true((bool)preg_match('/INSERT INTO coupon.*?valid_to/s', $rwSrc),
+    '★ valid_to 在发券时就写进 coupon 行');
+T::true((bool)preg_match('/expireStale.*?valid_to IS NOT NULL AND valid_to <\s*\?/s', $rwSrc),
+    '★ 过期判定读券上的 valid_to，不读当前配置');
+T::false((bool)preg_match('/expireStale.*?coupon_valid_days/s', $rwSrc),
+    '★ 过期判定里没有出现 coupon_valid_days（否则改规则会波及老券）');
+T::false((bool)preg_match("/UPDATE coupon SET[^;]*valid_to\s*=/i", $rwSrc),
+    '★ 没有任何地方批量改写已发券的 valid_to');
+
 T::group('跨平台 —— Windows 与 Linux 都要能跑');
 
 /**

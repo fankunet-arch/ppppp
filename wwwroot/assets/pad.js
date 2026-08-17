@@ -393,7 +393,8 @@ function renderPeople(keepItems) {
     d.innerHTML = `
       <div class="who">
         ${p.member
-          ? `<b>${escapeHtml(p.member.card_no)}</b><small>${p.member.points_balance} 分 · 已 ${p.member.visit_count} 次${p.member.points_frozen ? ' · 待确认' : ''}</small>`
+          ? `<b>${escapeHtml(p.member.card_no)}</b><small>${p.member.points_balance} 分 · 已 ${p.member.visit_count} 次${p.member.points_frozen ? ' · 待确认' : ''}</small>
+             <div class="reward-slot" data-rw="${i}"></div>`
           : `<button class="link" data-pick="${i}">＋ 选择会员</button>`}
       </div>
       <label class="amt">金额<input type="text" inputmode="decimal" data-amt="${i}" value="${money(p.amountCents)}"${S.mode === 3 ? ' readonly' : ''}></label>
@@ -409,6 +410,9 @@ function renderPeople(keepItems) {
     add.onclick = addPerson;
     box.appendChild(add);
   }
+
+  // 每位已选会员异步补上「奖励进度 / 可用券」
+  S.people.forEach((p, i) => { if (p.member) loadRewardSlot(i, p.member.id); });
 
   $$('[data-pick]', box).forEach(b => b.onclick = () => openMemberModal(parseInt(b.dataset.pick, 10)));
   $$('[data-rm]', box).forEach(b => b.onclick = () => {
@@ -438,6 +442,50 @@ function updateTotals() {
   $('#btn-submit').disabled = over || a <= 0;
 }
 
+/* ── 奖励券 ──────────────────────────────────────── */
+/**
+ * 显示该会员的攒次进度与可用券。
+ * ★ 核销只改侧系统的券状态；收银员还要在 POS 上打对应折扣 ——
+ *   两边通过 serial_id 对账，界面上要把这句写清楚，别让人以为点一下就打折了。
+ */
+async function loadRewardSlot(personIndex, memberId) {
+  const slot = $(`[data-rw="${personIndex}"]`);
+  if (!slot) return;
+  try {
+    const d = await api('/member/rewards', { member_id: memberId });
+    const n = d.available.length;
+    slot.innerHTML = n
+      ? `<div class="reward-has">🎁 有 <b>${n}</b> 张可用券
+           <button class="link" data-redeem="${personIndex}">核销一张</button>
+         </div>
+         <div class="reward-progress muted">${escapeHtml(d.progress.text)}</div>`
+      : `<div class="reward-progress muted">${escapeHtml(d.progress.text)}</div>`;
+    slot._coupons = d.available;
+
+    const btn = $(`[data-redeem="${personIndex}"]`, slot);
+    if (btn) btn.onclick = () => redeemCoupon(personIndex, memberId);
+  } catch {
+    slot.innerHTML = '';   // 查不到就不显示，别打断收银
+  }
+}
+
+async function redeemCoupon(personIndex, memberId) {
+  const slot = $(`[data-rw="${personIndex}"]`);
+  const list = (slot && slot._coupons) || [];
+  if (!list.length) return;
+  const c = list[0];   // 最早到期的那张（服务端已排好序）
+  if (!confirm(
+    `核销券 ${c.code}？\n\n` +
+    `有效期至 ${c.valid_to || '永久'}\n\n` +
+    `★ 核销后请记得在 POS 上打对应的折扣，两边才对得上账。`
+  )) return;
+  try {
+    await api('/coupon/redeem', { coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null });
+    toast(`券 ${c.code} 已核销，请到 POS 打折`, 'ok');
+    loadRewardSlot(personIndex, memberId);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
 /* ── 提交 ────────────────────────────────────────── */
 $('#btn-submit').onclick = async () => {
   showErr('#assign-err', '');
@@ -455,7 +503,18 @@ $('#btn-submit').onclick = async () => {
     const d = await api('/points/grant', { serial_id: S.order.serial_id, mode: S.mode, allocations });
     $('#done-body').innerHTML = d.entries.map(e => `
       <div class="card"><div class="amount">+${e.points} 分</div>
-      <div class="meta">${escapeHtml(e.card_no)} · € ${e.amount} · 计次 +${e.visits}</div></div>`).join('');
+      <div class="meta">${escapeHtml(e.card_no)} · € ${e.amount} · 计次 +${e.visits}</div></div>`).join('')
+      // 本次达标发了新券就大字提示 —— 服务员要当场告诉客人
+      + (d.rewards || []).map(r => r.granted > 0
+        ? `<div class="card reward-card">
+             <div class="amount">🎁 +${r.granted} 张免费券</div>
+             <div class="meta">${escapeHtml(r.card_no)} 已达标，请告知客人下次可用</div>
+             <div class="meta">券码 ${r.coupons.map(c => escapeHtml(c.code)).join('、')}</div>
+           </div>`
+        : `<div class="card reward-card">
+             <div class="amount">🎁 已达标 ${r.pending} 次</div>
+             <div class="meta">${escapeHtml(r.card_no)} 达到门槛，但后台设为「人工发券」，请经理在后台发放</div>
+           </div>`).join('');
     step('step-done');
   } catch (e) {
     showErr('#assign-err', e.message + (e.detail && e.detail.total ? `（可分配 € ${e.detail.total}，已分配 € ${e.detail.allocated}）` : ''));
