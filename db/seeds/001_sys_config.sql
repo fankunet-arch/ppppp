@@ -68,6 +68,11 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
 (@store,'pii_retention_years','3',@now),
   -- 末次消费后保留年限
 
+-- ── 按小票号查单 ──────────────────────────────────────────
+(@store,'invoice_lookup_max_days','7',@now),
+  -- 小票 Factura Simplificada 号可回溯的最大天数（0 = 不限）。
+  -- 小票可以隔天补记，但不该让人拿半年前的小票来领分。
+
 -- ── 十送一核销识别 ────────────────────────────────────────
 (@store,'redeem_line_patterns','TARJETA 10+1,10+1',@now)
   -- 明细里 menu_item_id = -2 的折扣行，名称命中这些子串（忽略大小写）

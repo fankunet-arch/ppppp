@@ -50,6 +50,27 @@ final class FakePosSource implements PosSource
         return $out;
     }
 
+    /**
+     * 按 Factura Simplificada 号（= order_head_id）取单。
+     * 与 PosReader 一致：【不过滤 eat_type】，外带单也要能查出来，
+     * 再由 checkEligible 给出「外带不积分」的明确提示。
+     */
+    public function findByInvoice(int $orderHeadId, int $limit = 20): array
+    {
+        $out = [];
+        foreach ($this->heads as $h) {
+            if ((int)$h['order_head_id'] !== $orderHeadId) {
+                continue;
+            }
+            $out[] = $h;
+            if (count($out) >= $limit) {
+                break;
+            }
+        }
+        usort($out, static fn($a, $b) => (int)$a['check_id'] <=> (int)$b['check_id']);
+        return $out;
+    }
+
     public function fetchSince(string $watermark, string $until, int $limit = 100, int $offset = 0): array
     {
         $out = [];

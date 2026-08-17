@@ -82,6 +82,56 @@ final class PointsService
     }
 
     /**
+     * 按小票上的「Factura Simplificada」号定位订单。
+     *
+     * 小票实测（docs/01 §2.9）：Factura Simplificada = order_head_id，全局唯一。
+     * 因此这条路不需要时间窗、不受翻台影响、分单的多张 check 一次取全。
+     *
+     * ★ 为什么不用「Número Ticket」：那是 check_number，实测当日会重号
+     *   （2026-08-03 票号 323 在 13:05 与 21:36 各发过一次），做不了唯一键。
+     *
+     * 唯一的时间约束是【最大回溯天数】：小票可以隔天补记，但不该让人拿着
+     * 半年前的小票来领分。超期返回 too_old，由店家在后台调 invoice_lookup_max_days。
+     *
+     * @return array{ok:bool,reason?:string,candidates:array}
+     */
+    public function locateByInvoice(int $orderHeadId): array
+    {
+        if ($orderHeadId <= 0) {
+            return ['ok' => false, 'reason' => 'bad_invoice', 'candidates' => []];
+        }
+
+        try {
+            $rows = $this->pos->findByInvoice($orderHeadId);
+        } catch (PosUnavailable $e) {
+            return ['ok' => false, 'reason' => 'pos_unavailable', 'candidates' => []];
+        }
+        if (!$rows) {
+            return ['ok' => true, 'reason' => 'not_found', 'candidates' => []];
+        }
+
+        $agg = PE::aggregateCandidates($rows);
+        $out = [];
+        foreach ($agg as $o) {
+            $out[] = $this->buildContext($o);
+        }
+
+        // 回溯天数上限：0 表示不限
+        $maxDays = $this->cfg->int('invoice_lookup_max_days', 7);
+        if ($maxDays > 0 && $out) {
+            $cut = date('Y-m-d H:i:s', strtotime($this->pos->now()) - $maxDays * 86400);
+            $fresh = array_values(array_filter($out, static fn($c) => $c['order_end_time'] >= $cut));
+            if (!$fresh) {
+                return ['ok' => true, 'reason' => 'too_old', 'max_days' => $maxDays,
+                        'order_end_time' => $out[0]['order_end_time'], 'candidates' => []];
+            }
+            $out = $fresh;
+        }
+
+        return ['ok' => true, 'candidates' => $out];
+    }
+
+    /**
      * 十送一核销行的名称模式。
      *
      * 店家在 POS 里改了名称时，改后台 sys_config.redeem_line_patterns 即可

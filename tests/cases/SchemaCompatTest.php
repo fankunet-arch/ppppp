@@ -206,6 +206,24 @@ T::false((bool)preg_match('/^\$\w+\s*=\s*new\s+\w+\(\s*\$app->(localDb|cfg|order
 T::true((bool)preg_match('/\$authRef\s*\?\?=/', $routesSrc),
     'AuthService 惰性构造');
 
+// ── 按小票号查单（docs/01 §2.9）────────────────────────────
+T::true(str_contains($routesSrc, "'/order/locate-invoice'"), '注册了按小票号查单的接口');
+T::true((bool)preg_match('/locate-invoice.*?\$requireOperator\(\)/s', $routesSrc),
+    '★ 按小票号查单同样要求登录（不能因为是新接口就漏掉鉴权）');
+T::true((bool)preg_match("/preg_replace\('\/\\\\D\+\/'/", $routesSrc),
+    '小票号只取数字（小票印的是 000092521 这种零填充）');
+
+$posSrcIface = file_get_contents(__DIR__ . '/../../app/lib/PosSource.php');
+T::true(str_contains($posSrcIface, 'findByInvoice'), 'PosSource 契约里有 findByInvoice');
+$readerSrc = file_get_contents(__DIR__ . '/../../app/lib/PosReader.php');
+T::true((bool)preg_match('/findByInvoice.*?WHERE order_head_id = \?/s', $readerSrc),
+    '★ 按 order_head_id 单点查（命中 idx_headcheck，是最省 POS 的查法）');
+T::false((bool)preg_match('/findByInvoice.*?eat_type\s*=/s', $readerSrc),
+    '★ 按小票号查【不过滤 eat_type】—— 外带单也要查得出来，'
+  . '再由 checkEligible 提示「外带不积分」，而不是让人以为号输错了');
+$fakeSrc = file_get_contents(__DIR__ . '/../../tests/FakePosSource.php');
+T::true(str_contains($fakeSrc, 'findByInvoice'), 'FakePosSource 实现了 findByInvoice（否则冒烟测试无法注入）');
+
 $entrySrc = file_get_contents(__DIR__ . '/../../wwwroot/api.php');
 T::true((bool)preg_match('/catch\s*\(\s*\\\\?PDOException/', $entrySrc),
     '入口顶层捕获 PDOException → 返回 db_unavailable 而非空响应体');
@@ -222,6 +240,42 @@ T::true((bool)preg_match('/password_verify\s*\(/', $authSrc), '校验用 passwor
 T::true((bool)preg_match("/hash\('sha256',\s*\\\$token\)/", $authSrc),
     '会话令牌库中存 SHA-256，明文只在 Cookie');
 T::true((bool)preg_match('/MAX_FAILED/', $authSrc), '有连续失败锁定（防 4 位 PIN 被枚举）');
+
+T::group('前端 —— hidden 属性不得被样式压过');
+
+/**
+ * 浏览器内置的 [hidden]{display:none} 属于 UA 样式表，
+ * 优先级低于任何作者规则。于是 `.modal{display:flex}` 会让
+ * <div class="modal" hidden> 照样显示 —— 实测会员选择弹层常驻最上层，
+ * 连登录页都被盖住，而所有 API 测试都发现不了（它们不渲染页面）。
+ */
+foreach ([
+    'wwwroot/assets/pad.css' => 'wwwroot/index.html',
+    'wwwroot/cp/cp.css'      => 'wwwroot/cp/index.html',
+] as $cssPath => $htmlPath) {
+    $css  = (string)file_get_contents(__DIR__ . '/../../' . $cssPath);
+    $name = basename($cssPath);
+    T::true((bool)preg_match('/\[hidden\]\s*\{[^}]*display:\s*none\s*!important/i', $css),
+        "{$name} 有 [hidden]{display:none!important} 全局兜底");
+
+    // 再逐个查：HTML 里带 hidden 的元素，其类名不得在 CSS 里被赋予 display
+    $html = (string)file_get_contents(__DIR__ . '/../../' . $htmlPath);
+    preg_match_all('/<[^>]*class="([^"]+)"[^>]*\shidden[\s>]/i', $html, $m);
+    $classes = [];
+    foreach ($m[1] as $cl) {
+        foreach (preg_split('/\s+/', trim($cl)) as $one) {
+            if ($one !== '') { $classes[$one] = true; }
+        }
+    }
+    foreach (array_keys($classes) as $cl) {
+        if (preg_match('/\.' . preg_quote($cl, '/') . '\s*\{([^}]*)\}/', $css, $mm)
+            && preg_match('/display:\s*(?!none)/i', $mm[1])) {
+            // 有兜底规则时不算失败，只是提醒它确实在起作用
+            T::true((bool)preg_match('/\[hidden\][^{]*\{[^}]*!important/i', $css),
+                "{$name}: .{$cl} 带 display，靠 [hidden] 兜底才不会误显示");
+        }
+    }
+}
 
 T::group('CP 后台 —— 权限与只读边界');
 

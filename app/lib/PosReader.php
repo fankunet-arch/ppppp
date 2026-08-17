@@ -50,6 +50,33 @@ final class PosReader implements PosSource
     }
 
     /**
+     * 按小票上的「Factura Simplificada」号取单。
+     *
+     * 实测（docs/01 §2.9）：小票印的 Factura Simplificada 就是 order_head_id，
+     * 000092518 / 000092521 两张小票在库里都能精确命中。
+     *
+     * 相比按桌号查，这条路少了三个麻烦：不受 30 分钟窗口限制、
+     * 不会撞上翻台、分单的多张 check 天然一次取全。
+     * 代价也更低 —— 命中 idx_headcheck 是单点查（type=ref, rows=1），
+     * 比按时间范围扫还便宜。
+     *
+     * ★ 这里【不过滤 eat_type】。既然收银员是照着小票输的号，
+     *   外带单也该查得出来，再由 checkEligible 给出「外带不积分」的明确提示；
+     *   直接返回「查无此单」会让人以为输错了号。
+     */
+    public function findByInvoice(int $orderHeadId, int $limit = 20): array
+    {
+        $limit = max(1, min($limit, PosDb::MAX_LIMIT));
+        $sql = "SELECT serial_id, order_head_id, check_id, table_name, eat_type,
+                       customer_num, original_amount, should_amount, actual_amount, order_end_time
+                FROM history_order_head
+                WHERE order_head_id = ?
+                ORDER BY check_id ASC
+                LIMIT {$limit}";
+        return $this->db->select($sql, [$orderHeadId], 'i');
+    }
+
+    /**
      * 增量补抓：水位线之后的订单。
      * 命中 idx_order_end_time。
      *

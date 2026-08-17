@@ -20,6 +20,12 @@ interface PosSource
     /** 近 N 分钟 + 指定桌号 + 堂食。命中 idx_order_end_time */
     public function findRecentByTable(string $tableName, int $windowMinutes, int $limit = 20): array;
 
+    /**
+     * 按小票上的「Factura Simplificada」号取单 = order_head_id。
+     * 命中 idx_headcheck，单点查，是最省 POS 的一种查法。
+     */
+    public function findByInvoice(int $orderHeadId, int $limit = 20): array;
+
     /** 水位线之后的订单，增量补抓用。命中 idx_order_end_time */
     public function fetchSince(string $watermark, string $until, int $limit = 100, int $offset = 0): array;
 

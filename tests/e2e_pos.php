@@ -70,9 +70,8 @@ if (!is_file($cfgPath)) {
 $cfg = require $cfgPath;
 $app = new App($cfg);
 $app->setStoreCode($E2E_STORE);
-$db  = $app->localDb();
-$pos = $app->posReader();
-
+$db     = $app->localDb();
+$pos    = $app->posReader();
 echo "\033[1mE2E · 真实 POS 主库 + 真实本地库\033[0m\n";
 echo "  门店码 {$E2E_STORE}   POS {$cfg['pos_db']['host']}:{$cfg['pos_db']['port']}/{$cfg['pos_db']['database']}"
    . "   本地 {$cfg['local_db']['database']}\n";
@@ -102,6 +101,11 @@ $db->exec('INSERT INTO sys_config (store_code, config_key, config_value, updated
              FROM sys_config WHERE store_code = ?', [$E2E_STORE, $srcStore]);
 $nRules = (int)$db->value('SELECT COUNT(*) FROM meal_item_rule WHERE store_code=?', [$E2E_STORE]);
 echo "  已从门店 {$srcStore} 复制 {$nRules} 条套餐规则到 {$E2E_STORE}\n";
+
+// ★ 必须在规则复制【之后】才构造 —— MealRules 是构造时一次性读进内存的，
+//   提前构造会捕获到空规则集，counts_visit 全部回落成 false，计次恒为 0。
+$points = $app->points();
+$member = $app->members();
 
 // ══════════════════════════════════════════════════════════
 head('① 只读边界 —— 数据库层必须拒绝写');
@@ -243,6 +247,84 @@ eq_(reset($aggAsc)['serial_id'], reset($aggDesc)['serial_id'],
     '★ 聚合出的 serial_id 与行序无关（否则 Pad 与 Cron 两条路径会各存一个键，同单发两次分）');
 
 // ══════════════════════════════════════════════════════════
+head('③bis 按小票号查单 —— Factura Simplificada = order_head_id');
+
+// 用注入的活单反查：先按桌号拿到 ohid，再用它当小票号查
+$rowsInv = $pos->findRecentByTable('30', 30, 20);
+$ohidInv = (int)($rowsInv[0]['order_head_id'] ?? 0);
+if ($ohidInv <= 0) {
+    bad_('桌 30 未定位到订单，无法测小票号查单');
+} else {
+    $byInv = $pos->findByInvoice($ohidInv);
+    is_(count($byInv) >= 1, "小票号 {$ohidInv} 能查到订单");
+    eq_($ohidInv, (int)$byInv[0]['order_head_id'], '★ 小票号即 order_head_id，精确命中');
+
+    // 分单单：4 张 check 必须一次全取回
+    $rows23i = $pos->findRecentByTable('23', 30, 20);
+    $ohid23  = (int)($rows23i[0]['order_head_id'] ?? 0);
+    eq_(4, count($pos->findByInvoice($ohid23)),
+        '★ 分单的 4 张 check 一次全取回（不像按桌号还要拼窗口）');
+
+    // 外带：按桌号查不到，按小票号必须查得到
+    $rowsLl = $pos->findRecentByTable('Llevar', 30, 20);
+    eq_(0, count($rowsLl), '外带按桌号查不到（eat_type 过滤）');
+    // 直接问 POS 要一张外带单，不依赖本地 pos_order（此刻尚未补抓）
+    $llRows = $pos->fetchSince(
+        date('Y-m-d H:i:s', strtotime($pos->now()) - 86400),
+        date('Y-m-d H:i:s', strtotime($pos->now()) + 60), 100, 0);
+    $ohidLl = 0;
+    foreach ($llRows as $r) {
+        if ((int)$r['eat_type'] !== 0) { $ohidLl = (int)$r['order_head_id']; break; }
+    }
+    if ($ohidLl > 0) {
+        is_(count($pos->findByInvoice($ohidLl)) >= 1,
+            '★ 外带单按小票号【查得到】—— 好让收银员看到「外带不积分」而不是「查无此单」');
+        $liLl = $points->locateByInvoice($ohidLl);
+        $cLl  = $liLl['candidates'][0] ?? null;
+        is_($cLl !== null && $cLl['eligible'] === false, '外带单可查但不可积分');
+        eq_('not_dine_in', $cLl['ineligible_reason'] ?? '', '★ 给出「外带不积分」而不是「查无此单」');
+    } else {
+        bad_('未找到外带单用于验证', '注入活单里应有一张 Llevar');
+    }
+
+    // 服务层：定位 → 可发分判定
+    $li = $points->locateByInvoice($ohidInv);
+    is_(($li['ok'] ?? false) === true, 'locateByInvoice 成功', json_encode($li, JSON_UNESCAPED_UNICODE));
+    eq_(1, count($li['candidates']), '返回 1 张订单');
+    $ci = $li['candidates'][0];
+    eq_($ohidInv, (int)$ci['order_head_id'], '候选订单就是该小票号对应的单');
+
+    // 与按桌号查到的必须是同一张单、同样的金额与份数
+    $lt = $points->locate('30', 30);
+    $ct = $lt['candidates'][0] ?? null;
+    if ($ct !== null) {
+        eq_($ct['serial_id'],        $ci['serial_id'],        '★ 两条查法定位到同一个幂等键');
+        eq_($ct['total_cents'],      $ci['total_cents'],      '★ 两条查法算出同样的可积分金额');
+        eq_($ct['portions_counted'], $ci['portions_counted'], '★ 两条查法算出同样的计次份数');
+    }
+
+    // 不存在的号
+    $none = $points->locateByInvoice(99999999);
+    eq_('not_found', $none['reason'] ?? '', '不存在的小票号返回 not_found');
+    // 非法号
+    $bad = $points->locateByInvoice(0);
+    eq_('bad_invoice', $bad['reason'] ?? '', '小票号为 0 返回 bad_invoice');
+
+    // 回溯天数上限：直接从主库拿一张远早于上限的历史单
+    $maxDays = $app->cfg()->int('invoice_lookup_max_days', 7);
+    $oldFrom = date('Y-m-d H:i:s', strtotime($pos->now()) - ($maxDays + 60) * 86400);
+    $oldRows = $pos->fetchSince($oldFrom, date('Y-m-d H:i:s', strtotime($oldFrom) + 86400), 10, 0);
+    if ($oldRows) {
+        $tooOld = $points->locateByInvoice((int)$oldRows[0]['order_head_id']);
+        eq_('too_old', $tooOld['reason'] ?? '',
+            "★ 超过 {$maxDays} 天的小票返回 too_old（防止拿半年前的小票来领分）");
+        eq_(0, count($tooOld['candidates']), '超期时不返回任何候选');
+    } else {
+        bad_('未找到超期历史单用于验证');
+    }
+}
+
+// ══════════════════════════════════════════════════════════
 head('④ 明细分析 —— 伪行 / 配料行 / 退菜行');
 
 $detail = $pos->fetchDetail(900001, 1);
@@ -274,8 +356,6 @@ is_(true, "含退菜的订单读到 " . count($detRet) . " 行明细，其中 is
 // ══════════════════════════════════════════════════════════
 head('⑤ 完整流程 —— 定位 → 建单 → 发分');
 
-$points = $app->points();
-$member = $app->members();
 
 $loc = $points->locate('30', 30);
 is_(($loc['ok'] ?? false) === true, 'locate 成功', json_encode($loc, JSON_UNESCAPED_UNICODE));

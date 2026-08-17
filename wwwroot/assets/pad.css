@@ -1,5 +1,12 @@
 /* Pad 端样式 —— 针对平板触摸操作，触摸目标不小于 44px */
 
+/* ★ hidden 属性必须压过一切布局规则。
+   浏览器内置的 [hidden]{display:none} 属于 UA 样式表，优先级低于任何作者规则，
+   所以 `.modal{display:flex}` 会把 <div class="modal" hidden> 照样显示出来 ——
+   实测会员选择弹层因此常驻在最上层，连登录页都被盖住。
+   放一条全局兜底，往后新增带 display 的类也不会再踩。 */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #f4f5f7;
   --card: #ffffff;
@@ -270,3 +277,19 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
 }
 .toast.err { background: var(--err); }
 .toast.ok  { background: var(--ok); }
+
+/* ── 找单方式切换（小票号 / 桌号）───────────────────── */
+.lookup-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+.lookup-tab {
+  flex: 1; padding: 12px 8px; font-size: 17px; font-family: inherit;
+  border: 2px solid var(--line); border-radius: 12px;
+  background: #fff; color: var(--muted); cursor: pointer;
+}
+.lookup-tab.on {
+  border-color: var(--primary); background: #eaf1fd;
+  color: var(--primary); font-weight: 700;
+}
+.lookup-pane code {
+  background: #f2f4f7; padding: 1px 6px; border-radius: 5px;
+  font-size: 0.95em; font-family: ui-monospace, Menlo, Consolas, monospace;
+}

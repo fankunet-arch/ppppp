@@ -33,14 +33,36 @@
     <button id="btn-logout" class="link">退出</button>
   </header>
 
-  <!-- 步骤 1：输桌号 -->
+  <!-- 步骤 1：找订单。两条路并存：有小票就输票号（精确），没有就输桌号 -->
   <div id="step-table" class="step active">
-    <h2>① 输入桌号</h2>
-    <div class="row">
-      <input id="table-input" type="text" inputmode="numeric" placeholder="桌号" autocomplete="off">
-      <button id="btn-locate" class="primary">查找订单</button>
+    <h2>① 找订单</h2>
+
+    <div class="lookup-tabs">
+      <button id="tab-invoice" class="lookup-tab on"  data-mode="invoice">小票号</button>
+      <button id="tab-table"   class="lookup-tab"     data-mode="table">桌号</button>
     </div>
-    <p class="muted small">查找最近 <span id="win-label">30</span> 分钟内该桌已结账的订单</p>
+
+    <!-- 按小票号：Factura Simplificada = 全局唯一，不受时间窗限制 -->
+    <div id="pane-invoice" class="lookup-pane">
+      <div class="row">
+        <input id="invoice-input" type="text" inputmode="numeric" placeholder="小票号" autocomplete="off">
+        <button id="btn-locate-invoice" class="primary">查找订单</button>
+      </div>
+      <p class="muted small">
+        输小票上 <b>Factura Simplificada</b> 那一行的号（如 <code>000092521</code>，前面的 0 可不输）。
+        最准，不受 30 分钟限制。
+      </p>
+    </div>
+
+    <!-- 按桌号：原有路径，客人没拿小票时用 -->
+    <div id="pane-table" class="lookup-pane" hidden>
+      <div class="row">
+        <input id="table-input" type="text" inputmode="numeric" placeholder="桌号" autocomplete="off">
+        <button id="btn-locate" class="primary">查找订单</button>
+      </div>
+      <p class="muted small">查找最近 <span id="win-label">30</span> 分钟内该桌已结账的订单</p>
+    </div>
+
     <p id="locate-err" class="err" hidden></p>
     <div id="locate-fallback" hidden>
       <button id="btn-widen" class="ghost">放宽到 <span id="fallback-label">60</span> 分钟再找</button>

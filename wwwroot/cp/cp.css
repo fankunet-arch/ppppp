@@ -1,5 +1,12 @@
 /* 管理后台样式 —— 桌面浏览器为主 */
 
+/* ★ hidden 属性必须压过一切布局规则。
+   浏览器内置的 [hidden]{display:none} 属于 UA 样式表，优先级低于任何作者规则，
+   所以 `.modal{display:flex}` 会把 <div class="modal" hidden> 照样显示出来 ——
+   实测会员选择弹层因此常驻在最上层，连登录页都被盖住。
+   放一条全局兜底，往后新增带 display 的类也不会再踩。 */
+[hidden] { display: none !important; }
+
 :root {
   --bg: #f6f7f9; --card: #fff; --ink: #1c1f23; --muted: #6b7280;
   --line: #dfe2e7; --primary: #1f6feb; --warn: #b45309; --err: #c0392b; --ok: #1a7f4b;

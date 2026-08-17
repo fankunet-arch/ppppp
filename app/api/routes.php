@@ -126,6 +126,37 @@ $api->on('POST', '/order/locate', static function () use ($app, $requireOperator
     ]);
 });
 
+/**
+ * 按小票上的「Factura Simplificada」号定位订单。
+ *
+ * 小票印的是零填充的 000092521，这里接受任意形式（带前导零、带空格都行）。
+ * 与按桌号查并存：手边有小票就输号（精确），没有就照旧输桌号。
+ */
+$api->on('POST', '/order/locate-invoice', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $b   = Api::body();
+    $raw = trim((string)($b['invoice_no'] ?? ''));
+    // 小票上是 000092521，去掉前导零与分隔符；只留数字
+    $digits = preg_replace('/\D+/', '', $raw) ?? '';
+    if ($digits === '') {
+        Api::fail('bad_request', 400, ['hint' => '请输入小票上的 Factura Simplificada 号']);
+    }
+    $invoice = (int)ltrim($digits, '0');
+
+    $r = $app->points()->locateByInvoice($invoice);
+
+    if (!$r['ok'] && ($r['reason'] ?? '') === 'pos_unavailable') {
+        Api::fail('pos_unavailable', 503);
+    }
+    Api::ok([
+        'invoice_no' => $invoice,
+        'reason'     => $r['reason'] ?? null,
+        'max_days'   => $r['max_days'] ?? null,
+        'order_end_time' => $r['order_end_time'] ?? null,
+        'candidates' => $r['candidates'],
+    ]);
+});
+
 /** 标记/取消标记免费餐（10送1 核销） */
 $api->on('POST', '/order/free-meal', static function () use ($app, $requireOperator): void {
     $op     = $requireOperator();

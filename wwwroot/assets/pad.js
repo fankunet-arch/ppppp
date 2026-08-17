@@ -116,10 +116,25 @@ async function checkHealth() {
 function resetFlow() {
   S.order = null; S.people = []; S.picks = {}; S.mode = 1;
   $('#table-input').value = '';
+  $('#invoice-input').value = '';
   showErr('#locate-err', '');
   $('#locate-fallback').hidden = true;
   step('step-table');
+  setLookupMode(S.lookupMode || 'invoice');
 }
+
+/* 两种找单方式切换：小票号（精确）/ 桌号（客人没拿小票时） */
+function setLookupMode(mode) {
+  S.lookupMode = mode;
+  $$('.lookup-tab').forEach(t => t.classList.toggle('on', t.dataset.mode === mode));
+  $('#pane-invoice').hidden = (mode !== 'invoice');
+  $('#pane-table').hidden   = (mode !== 'table');
+  showErr('#locate-err', '');
+  $('#locate-fallback').hidden = true;
+  const box = mode === 'invoice' ? $('#invoice-input') : $('#table-input');
+  setTimeout(() => box.focus(), 0);
+}
+$$('.lookup-tab').forEach(t => t.onclick = () => setLookupMode(t.dataset.mode));
 $('#btn-new').onclick = resetFlow;
 $$('[data-back]').forEach(b => b.onclick = () => step(b.dataset.back));
 
@@ -148,6 +163,37 @@ $('#btn-locate').onclick = () => locate(0);
 $('#table-input').addEventListener('keydown', e => { if (e.key === 'Enter') locate(0); });
 $('#btn-widen').onclick = () => locate(parseInt($('#fallback-label').textContent, 10) || 60);
 $('#btn-manual').onclick = () => { openManual(); };
+
+/**
+ * 按小票号找单 —— Factura Simplificada = 全局唯一，不需要时间窗。
+ * 前导零可不输，界面上照着小票原样输也认。
+ */
+async function locateByInvoice() {
+  const raw = $('#invoice-input').value.trim();
+  showErr('#locate-err', '');
+  $('#locate-fallback').hidden = true;
+  if (!raw) return showErr('#locate-err', '请输入小票上的 Factura Simplificada 号');
+  try {
+    const d = await api('/order/locate-invoice', { invoice_no: raw });
+    if (!d.candidates.length) {
+      if (d.reason === 'too_old') {
+        showErr('#locate-err',
+          `这张小票是 ${(d.order_end_time || '').slice(0, 10)} 的，超过 ${d.max_days} 天不再受理，请找经理处理`);
+      } else {
+        showErr('#locate-err', `没找到小票号 ${d.invoice_no} 对应的订单，请核对 Factura Simplificada 那一行`);
+      }
+      $('#locate-fallback').hidden = false;
+      return;
+    }
+    renderOrders(d.candidates);
+    step('step-order');
+  } catch (e) {
+    showErr('#locate-err', e.message);
+    $('#locate-fallback').hidden = (e.error !== 'pos_unavailable');
+  }
+}
+$('#btn-locate-invoice').onclick = () => locateByInvoice();
+$('#invoice-input').addEventListener('keydown', e => { if (e.key === 'Enter') locateByInvoice(); });
 
 /* ── 步骤 2：候选订单 ────────────────────────────── */
 function renderOrders(list) {
