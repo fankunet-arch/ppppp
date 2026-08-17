@@ -241,6 +241,33 @@ T::true((bool)preg_match("/hash\('sha256',\s*\\\$token\)/", $authSrc),
     '会话令牌库中存 SHA-256，明文只在 Cookie');
 T::true((bool)preg_match('/MAX_FAILED/', $authSrc), '有连续失败锁定（防 4 位 PIN 被枚举）');
 
+// ── PIN 可改可重置（账号生命周期不能只进不出）──────────────
+// 早先只有 create 和 toggle，文档写「忘记只能重建账号」,而这条路走不通：
+// (store_code, login_name) 唯一索引挡住同名重建，audit_log 按 operator_id
+// 引用会变孤儿，唯一的管理员忘了 PIN 就彻底锁死。
+T::true(str_contains($authSrc, 'function changePin'), 'AuthService 支持自助改 PIN');
+T::true(str_contains($authSrc, 'function resetPin'),  'AuthService 支持管理员重置 PIN');
+T::true((bool)preg_match('/changePin.*?password_verify\\(\\$oldPin/s', $authSrc),
+    '★ 改自己的 PIN 必须验旧 PIN（否则拿到会话就能改密码）');
+T::true((bool)preg_match('/resetPin.*?writePin\\(\\$operatorId, \\$newPin, true\\)/s', $authSrc),
+    '★ 管理员重置时一并解除锁定（忘记 PIN 的人通常已试错到被锁）');
+T::true((bool)preg_match('/function revokeSessions/', $authSrc),
+    '★ 改/重置 PIN 后作废会话（PIN 疑似泄露时能把人踢下线）');
+T::true(str_contains($authSrc, 'MIN_PIN = 6'), 'PIN 最短 6 位');
+
+$initSrc = file_get_contents(__DIR__ . '/../../bin/init.php');
+T::true(str_contains($initSrc, "case 'passwd'"),
+    '★ CLI 有 passwd 逃生口（唯一管理员锁死时的唯一恢复路径）');
+T::true((bool)preg_match('/doPasswd.*?resetPin\\(/s', $initSrc), 'passwd 走的是同一套 resetPin');
+
+$cpSrcPin  = file_get_contents(__DIR__ . '/../../app/cp/routes.php');
+$padSrcPin = file_get_contents(__DIR__ . '/../../app/api/routes.php');
+T::true(str_contains($cpSrcPin, "'/operators/reset-pin'"), 'CP 有重置 PIN 接口');
+T::true((bool)preg_match('/reset-pin.*?requireAdmin\\(\\)/s', $cpSrcPin), '★ 重置他人 PIN 限管理员');
+T::true(str_contains($cpSrcPin,  "'/auth/change-pin'"), 'CP 有自助改 PIN 接口');
+T::true(str_contains($padSrcPin, "'/auth/change-pin'"), 'Pad 有自助改 PIN 接口（收银员也能改）');
+T::true((bool)preg_match('/change-pin.*?requireOperator\\(\\)/s', $padSrcPin), '自助改 PIN 要求已登录');
+
 T::group('前端 —— hidden 属性不得被样式压过');
 
 /**

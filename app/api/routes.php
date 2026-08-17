@@ -88,6 +88,25 @@ $api->on('POST', '/auth/login', static function () use ($auth): void {
     Api::ok(['operator' => $r['operator']]);
 });
 
+/**
+ * 收银员改自己的 PIN。必须验旧 PIN。
+ * 改完保留当前会话，其余会话作废（PIN 泄露时能把别人踢下线）。
+ */
+$api->on('POST', '/auth/change-pin', static function () use ($app, $requireOperator): void {
+    $op  = $requireOperator();
+    $b   = Api::body();
+    $old = (string)($b['old_pin'] ?? '');
+    $new = (string)($b['new_pin'] ?? '');
+    if ($old === '' || $new === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->auth()->changePin((int)$op['id'], $old, $new, Api::readToken());
+    if (!($r['ok'] ?? false)) {
+        Api::fail((string)$r['error'], $r['error'] === 'invalid_credentials' ? 401 : 400);
+    }
+    Api::ok(['changed' => true]);
+});
+
 $api->on('POST', '/auth/logout', static function () use ($auth): void {
     $auth()->logout(Api::readToken());
     Api::clearToken();

@@ -298,13 +298,44 @@ async function loadOperators() {
           ${o.locked_until ? '<span class="tag err">锁定中</span>' : ''}
           ${+o.failed_count ? `<span class="muted small">失败 ${o.failed_count} 次</span>` : ''}</td>
       <td class="muted small">${esc(o.last_login_at || '从未')}</td>
-      ${window.IS_ADMIN ? `<td><button class="tiny" data-ot="${o.id}">${+o.enabled ? '停用' : '启用'}</button></td>` : ''}</tr>`).join('')
+      ${window.IS_ADMIN ? `<td>
+        <button class="tiny" data-ot="${o.id}">${+o.enabled ? '停用' : '启用'}</button>
+        <button class="tiny" data-rp="${o.id}" data-rpn="${esc(o.login_name)}">重置 PIN</button>
+      </td>` : ''}</tr>`).join('')
   }</table>`;
   $$('[data-ot]').forEach(b => b.onclick = async () => {
     try { await api('/operators/toggle', { id: +b.dataset.ot }); toast('已更新', 'ok'); loadOperators(); }
     catch (e) { toast(e.message, 'err'); }
   });
+
+  // 管理员重置他人 PIN —— 不需要旧 PIN，同时解掉连续失败锁定
+  $$('[data-rp]').forEach(b => b.onclick = async () => {
+    const who = b.dataset.rpn;
+    const pin = prompt(`为「${who}」设置新 PIN（至少 6 位）：`);
+    if (pin === null) return;
+    if (pin.length < 6) return toast('PIN 至少 6 位', 'err');
+    if (!confirm(`确认重置「${who}」的 PIN？\n该账号所有已登录设备都会被踢下线。`)) return;
+    try {
+      await api('/operators/reset-pin', { id: +b.dataset.rp, new_pin: pin });
+      toast('已重置，锁定一并解除', 'ok');
+      loadOperators();
+    } catch (e) { toast(e.message, 'err'); }
+  });
 }
+
+/* 改自己的 PIN —— 必须验旧 PIN */
+$('#btn-change-pin').onclick = async () => {
+  const oldPin = $('#my-old-pin').value;
+  const p1 = $('#my-new-pin').value, p2 = $('#my-new-pin2').value;
+  if (!oldPin || !p1) return toast('请填写当前 PIN 与新 PIN', 'err');
+  if (p1 !== p2)      return toast('两次输入的新 PIN 不一致', 'err');
+  if (p1.length < 6)  return toast('新 PIN 至少 6 位', 'err');
+  try {
+    await api('/auth/change-pin', { old_pin: oldPin, new_pin: p1 });
+    toast('PIN 已修改，其他设备上的登录已失效', 'ok');
+    $('#my-old-pin').value = ''; $('#my-new-pin').value = ''; $('#my-new-pin2').value = '';
+  } catch (e) { toast(e.message, 'err'); }
+};
 
 $('#btn-add-op').onclick = async () => {
   try {

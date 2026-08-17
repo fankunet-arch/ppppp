@@ -112,6 +112,28 @@ async function checkHealth() {
   } catch {}
 }
 
+/* ── 改自己的 PIN ────────────────────────────────── */
+$('#btn-my-pin').onclick = () => {
+  $('#pin-old').value = ''; $('#pin-new').value = ''; $('#pin-new2').value = '';
+  showErr('#pin-err', '');
+  $('#pin-modal').hidden = false;
+  setTimeout(() => $('#pin-old').focus(), 0);
+};
+$('#btn-pin-cancel').onclick = () => { $('#pin-modal').hidden = true; };
+
+$('#btn-pin-submit').onclick = async () => {
+  const oldPin = $('#pin-old').value, p1 = $('#pin-new').value, p2 = $('#pin-new2').value;
+  showErr('#pin-err', '');
+  if (!oldPin || !p1) return showErr('#pin-err', '请填写当前 PIN 与新 PIN');
+  if (p1 !== p2)      return showErr('#pin-err', '两次输入的新 PIN 不一致');
+  if (p1.length < 6)  return showErr('#pin-err', '新 PIN 至少 6 位');
+  try {
+    await api('/auth/change-pin', { old_pin: oldPin, new_pin: p1 });
+    $('#pin-modal').hidden = true;
+    toast('PIN 已修改', 'ok');
+  } catch (e) { showErr('#pin-err', e.message); }
+};
+
 /* ── 步骤 1：桌号 ────────────────────────────────── */
 function resetFlow() {
   S.order = null; S.people = []; S.picks = {}; S.mode = 1;

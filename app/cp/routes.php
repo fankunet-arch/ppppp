@@ -396,6 +396,46 @@ $api->on('POST', '/operators/create', static function () use ($app, $requireAdmi
     Api::ok(['id' => $id]);
 });
 
+/**
+ * 管理员重置他人 PIN（不需要旧 PIN）。
+ *
+ * 与 toggle 一样限管理员。会一并解掉连续失败锁定，
+ * 并作废该账号的全部会话 —— 忘记 PIN 的人通常已经试错到被锁了。
+ */
+$api->on('POST', '/operators/reset-pin', static function () use ($app, $requireAdmin): void {
+    $op  = $requireAdmin();
+    $b   = Api::body();
+    $id  = Api::int($b, 'id', 0);
+    $pin = (string)($b['new_pin'] ?? '');
+    if ($id <= 0 || $pin === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->auth()->resetPin($id, $pin, $op);
+    if (!($r['ok'] ?? false)) {
+        Api::fail((string)$r['error'], $r['error'] === 'not_found' ? 404 : 400);
+    }
+    Api::ok(['id' => $id]);
+});
+
+/**
+ * 改自己的 PIN（管理员与经理都可用；必须验旧 PIN）。
+ * 改完保留当前这条会话，其余会话作废。
+ */
+$api->on('POST', '/auth/change-pin', static function () use ($app, $requireOperator): void {
+    $op  = $requireOperator();
+    $b   = Api::body();
+    $old = (string)($b['old_pin'] ?? '');
+    $new = (string)($b['new_pin'] ?? '');
+    if ($old === '' || $new === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->auth()->changePin((int)$op['id'], $old, $new, Api::readToken());
+    if (!($r['ok'] ?? false)) {
+        Api::fail((string)$r['error'], $r['error'] === 'invalid_credentials' ? 401 : 400);
+    }
+    Api::ok(['changed' => true]);
+});
+
 $api->on('POST', '/operators/toggle', static function () use ($app, $requireAdmin): void {
     $op = $requireAdmin();
     $b  = Api::body();
