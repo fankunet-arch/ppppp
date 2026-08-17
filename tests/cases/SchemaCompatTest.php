@@ -363,6 +363,13 @@ $cronSrc = file_get_contents(__DIR__ . '/../../bin/cron.php');
 T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $cronSrc), 'cron.php 拒绝从网络访问');
 T::true((bool)preg_match('/flock\(/', $cronSrc), 'cron 有并发锁');
 
+$diagSrc = file_get_contents(__DIR__ . '/../../bin/diag.php');
+T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $diagSrc), 'diag.php 拒绝从网络访问');
+T::true(str_contains($diagSrc, '1045') && str_contains($diagSrc, '1044'),
+    'diag 能把 SQLSTATE 翻译成具体原因（页面提示是统一兜底，看不出是哪种）');
+T::true(str_contains($diagSrc, 'www-data'),
+    '★ diag 提醒用 Web 用户再跑一遍（MySQL 按来源主机授权，命令行能连不代表网页能连）');
+
 // ── 回归：数值参数不能直接取 $argv[2] ────────────────────────────
 // 用法是 `cron.php <任务> [天数] [-v]`，直接取 $argv[2] 会把 "-v"
 // 当天数，(int)"-v" = 0 → 完整性监控一天都不查却报成功（静默失效）。
