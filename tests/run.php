@@ -6,6 +6,13 @@ declare(strict_types=1);
  *   php tests/run.php
  */
 
+// 只允许命令行执行 —— 守卫不依赖「/tests 放在文档根之外」这一前提，
+// 文档根配错时这一行就是最后一道闸。
+if (PHP_SAPI !== 'cli') {
+    http_response_code(404);
+    exit;
+}
+
 spl_autoload_register(static function (string $class): void {
     $prefix = 'Vip\\';
     if (!str_starts_with($class, $prefix)) {

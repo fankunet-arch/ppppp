@@ -25,6 +25,30 @@ declare(strict_types=1);
  * ════════════════════════════════════════════════════════════════
  */
 
+/**
+ * ★ 只允许命令行执行。
+ *
+ *   本脚本不该被放进 wwwroot，但守卫不能依赖「放对了位置」——
+ *   文档根一旦配错（比如把项目根整个指过去），这个文件就暴露在网上了。
+ *   那时一次未经认证的 GET 就会连上数据库、跑完整个流程（写入再删除
+ *   SMOKE 数据），并把库名、主机、数据库版本原样打回页面。
+ *
+ *   实测（PHP 8.4）：register_argc_argv=On 时，Web 下被查询串填充的是
+ *   $_SERVER['argv']（GET /x.php?--fresh → ["--fresh"]），
+ *   而全局 $argv 不会被填充 —— 也就是下面那行读到的仍是空数组，
+ *   `?--fresh` 触发不了 DROP TABLE。
+ *
+ *   但【不要】因此觉得可以省掉守卫：
+ *     · 上面说的未认证 DB 写入与信息泄漏本身就不可接受；
+ *     · 哪天有人把 $argv 改成 $_SERVER['argv']（看着像是「让它到处都能跑」
+ *       的合理重构），DROP TABLE 那条路立刻就通了。
+ *   守卫放在读参数之前，这两种情况一起挡掉。
+ */
+if (PHP_SAPI !== 'cli') {
+    http_response_code(404);
+    exit;
+}
+
 const SMOKE_STORE = 'SMOKE';
 
 spl_autoload_register(static function (string $class): void {
