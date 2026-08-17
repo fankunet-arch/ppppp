@@ -84,7 +84,8 @@ $log = static function (string $m) use ($verbose): void {
  */
 function withLock(string $name, callable $fn): mixed
 {
-    $dir = sys_get_temp_dir() . '/vip-cron';
+    // sys_get_temp_dir() 在 Windows 下返回带反斜杠的路径，两个分隔符都剥
+    $dir = rtrim(sys_get_temp_dir(), "/\\") . '/vip-cron';
     if (!is_dir($dir)) {
         @mkdir($dir, 0700, true);
     }

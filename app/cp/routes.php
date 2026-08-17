@@ -421,8 +421,10 @@ $api->on('POST', '/operators/reset-pin', static function () use ($app, $requireA
  * 改自己的 PIN（管理员与经理都可用；必须验旧 PIN）。
  * 改完保留当前这条会话，其余会话作废。
  */
-$api->on('POST', '/auth/change-pin', static function () use ($app, $requireOperator): void {
-    $op  = $requireOperator();
+$api->on('POST', '/auth/change-pin', static function () use ($app, $requireManager): void {
+    // CP 只有经理以上能登录，这里用 requireManager 即可
+    // （本文件没有 requireOperator —— 守卫必须用本文件定义过的）
+    $op  = $requireManager();
     $b   = Api::body();
     $old = (string)($b['old_pin'] ?? '');
     $new = (string)($b['new_pin'] ?? '');

@@ -11,7 +11,8 @@ declare(strict_types=1);
  * 本脚本逐项试出来，直接告诉你是哪一种、怎么改。
  *
  * ★ 一定要用【Web 服务器的身份】跑一遍：
- *     sudo -u www-data php bin/diag.php
+ *     Linux    sudo -u www-data php bin/diag.php
+ *     Windows  在 IIS/Apache 服务账号下跑，或直接看 §④ 的授权提示
  *   很多「命令行好好的、网页就不行」都是身份差异造成的 ——
  *   配置文件权限、以及 MySQL 按来源主机授权（localhost 与 127.0.0.1
  *   在 MySQL 眼里是两个不同的授权条目）。
@@ -29,8 +30,14 @@ $no = static fn(string $m) => print('  ' . "\033[31m✗\033[0m" . " {$m}\n");
 $wa = static fn(string $m) => print('  ' . "\033[33m!\033[0m" . " {$m}\n");
 $hd = static fn(string $m) => print("\n\033[1m{$m}\033[0m\n");
 
-$whoami = trim((string)(posix_getpwuid(posix_geteuid())['name'] ?? get_current_user()));
+// posix_* 只在 Linux/Unix 有；Windows 上没有这套扩展，必须回落
+$IS_WIN  = strncasecmp(PHP_OS_FAMILY, 'Windows', 7) === 0;
+$whoami  = function_exists('posix_geteuid')
+    ? (string)(posix_getpwuid(posix_geteuid())['name'] ?? get_current_user())
+    : (string)(getenv('USERNAME') ?: get_current_user());
+$whoami  = trim($whoami) !== '' ? trim($whoami) : '(未知)';
 echo "\033[1m连接诊断\033[0m   当前身份：{$whoami}\n";
+echo "                 平台：" . PHP_OS_FAMILY . "\n";
 if ($whoami === 'root') {
     $wa('你正在用 root 跑。请【再用 Web 用户跑一遍】：sudo -u www-data php bin/diag.php');
 }
@@ -50,11 +57,14 @@ $ok('文件存在');
 
 if (!is_readable($cfgFile)) {
     $st = stat($cfgFile);
-    $owner = posix_getpwuid($st['uid'])['name'] ?? $st['uid'];
+    $owner = function_exists('posix_getpwuid')
+        ? (posix_getpwuid($st['uid'])['name'] ?? $st['uid']) : $st['uid'];
     $no("当前身份 {$whoami} 【读不到】这个文件（属主 {$owner}，权限 "
         . substr(sprintf('%o', $st['mode']), -3) . '）');
     echo "     这种情况页面通常是空白 500，不是「数据库不可用」。修法：\n";
-    echo "       chown {$whoami}:{$whoami} app/config/config.php && chmod 640 app/config/config.php\n";
+    echo $IS_WIN
+        ? "       在文件属性→安全里，给 IIS/Apache 的服务账号加上「读取」权限\n"
+        : "       chown {$whoami}:{$whoami} app/config/config.php && chmod 640 app/config/config.php\n";
     exit(1);
 }
 $ok('可读');
@@ -85,7 +95,29 @@ echo "     本地库目标：{$local['user']}@{$local['host']}:{$local['port']}/
 // ── 2. PHP 扩展 ───────────────────────────────────────────
 $hd('② PHP 扩展');
 foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读'] as $ext => $why) {
-    extension_loaded($ext) ? $ok("{$ext}（{$why}）") : $no("缺少 {$ext}（{$why}）—— 装 php-mysql 后重启 PHP-FPM");
+    if (extension_loaded($ext)) {
+        $ok("{$ext}（{$why}）");
+        continue;
+    }
+    $fail++;
+    $no("缺少 {$ext}（{$why}）");
+    // 这正是错误日志里 "could not find driver" 的成因
+    echo "     ★ 页面报「本地数据库暂时不可用」、日志写 could not find driver，\n";
+    echo "       就是这一条 —— PDO 装了但没有 MySQL 驱动。\n";
+    if ($IS_WIN) {
+        echo "       Windows：编辑 php.ini，去掉这两行前面的分号后重启 Web 服务\n";
+        echo "           extension=pdo_mysql\n           extension=mysqli\n";
+        echo "       php.ini 位置：" . (php_ini_loaded_file() ?: '(未加载 php.ini)') . "\n";
+        echo "       确认 ext 目录下有 php_pdo_mysql.dll、php_mysqli.dll，\n";
+        echo "       且 php.ini 的 extension_dir 指向它。\n";
+    } else {
+        echo "       Debian/Ubuntu：apt install php-mysql && systemctl restart php*-fpm\n";
+        echo "       RHEL/CentOS ：dnf install php-mysqlnd && systemctl restart php-fpm\n";
+    }
+    echo "       改完用这条确认：php -m | findstr mysql   （Linux 用 grep）\n";
+}
+if (php_ini_loaded_file()) {
+    echo "     当前 php.ini：" . php_ini_loaded_file() . "\n";
 }
 
 // ── 3. 网络层能不能通 ─────────────────────────────────────
@@ -189,14 +221,16 @@ if ($miss) {
 // ── 6. 日志位置 ───────────────────────────────────────────
 $hd('⑥ 错误日志');
 $logDir = $cfg['log_path'] ?? (__DIR__ . '/../var/log');
-$logFile = rtrim((string)$logDir, '/') . '/php-error.log';
+$logFile = rtrim((string)$logDir, "/\\") . '/php-error.log';
 if (is_file($logFile)) {
     $ok("日志：{$logFile}");
-    is_writable($logFile) ? $ok('可写') : $no("当前身份写不了 —— chown {$whoami} {$logFile}");
+    is_writable($logFile) ? $ok('可写')
+        : $no('当前身份写不了 —— ' . ($IS_WIN ? '在文件属性里给服务账号「写入」权限' : "chown {$whoami} {$logFile}"));
 } else {
     is_dir($logDir) && is_writable($logDir)
         ? $wa("日志尚未生成：{$logFile}")
-        : $no("日志目录不可写：{$logDir} —— mkdir -p 后 chown {$whoami}");
+        : $no("日志目录不可写：{$logDir} —— "
+            . ($IS_WIN ? '建好目录后给服务账号「写入」权限' : "mkdir -p 后 chown {$whoami}"));
 }
 echo "     出问题时先看它：tail -50 {$logFile}\n";
 

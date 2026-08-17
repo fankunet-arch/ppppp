@@ -244,12 +244,15 @@ function doAdmin(App $app, ?string $login, ?string $name): void
 function readPinTwice(): string
 {
     $min = AuthService::MIN_PIN;
-    echo "  请输入 PIN（至少 {$min} 位，输入不回显）：";
-    system('stty -echo 2>/dev/null');
+    // stty 是 Unix 专属；Windows 上没有，只能回显输入
+    $canHide = strncasecmp(PHP_OS_FAMILY, 'Windows', 7) !== 0;
+    echo "  请输入 PIN（至少 {$min} 位"
+       . ($canHide ? '，输入不回显' : '，注意：Windows 下会显示出来') . '）：';
+    if ($canHide) { system('stty -echo 2>/dev/null'); }
     $pin = trim((string)fgets(STDIN));
     echo "\n  请再输入一次：";
     $pin2 = trim((string)fgets(STDIN));
-    system('stty echo 2>/dev/null');
+    if ($canHide) { system('stty echo 2>/dev/null'); }
     echo "\n";
 
     if ($pin !== $pin2)      { bad('两次输入不一致'); exit(1); }

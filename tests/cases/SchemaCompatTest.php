@@ -206,6 +206,26 @@ T::false((bool)preg_match('/^\$\w+\s*=\s*new\s+\w+\(\s*\$app->(localDb|cfg|order
 T::true((bool)preg_match('/\$authRef\s*\?\?=/', $routesSrc),
     'AuthService 惰性构造');
 
+/**
+ * ★ 路由里用到的守卫闭包，必须在【同一个文件】里定义过。
+ * 实测踩过：CP 的 /auth/change-pin 写成了 use ($requireOperator)，
+ * 而 cp/routes.php 只定义了 requireManager / requireAdmin ——
+ * PHP 只报一条 Warning，然后调用 null 抛异常，
+ * 接口直接 500，而单测因为不实际发请求完全发现不了。
+ */
+foreach ([
+    'app/api/routes.php' => $routesSrc,
+    'app/cp/routes.php'  => file_get_contents(__DIR__ . '/../../app/cp/routes.php'),
+] as $file => $src) {
+    preg_match_all('/^\$(require\w+)\s*=/m', $src, $defM);
+    $defined = array_flip($defM[1]);
+    preg_match_all('/\$(require\w+)/', $src, $useM);
+    foreach (array_unique($useM[1]) as $used) {
+        T::true(isset($defined[$used]),
+            basename($file) . " 里用到的 \${$used} 在本文件有定义");
+    }
+}
+
 // ── 按小票号查单（docs/01 §2.9）────────────────────────────
 T::true(str_contains($routesSrc, "'/order/locate-invoice'"), '注册了按小票号查单的接口');
 T::true((bool)preg_match('/locate-invoice.*?\$requireOperator\(\)/s', $routesSrc),
@@ -267,6 +287,83 @@ T::true((bool)preg_match('/reset-pin.*?requireAdmin\\(\\)/s', $cpSrcPin), '★ �
 T::true(str_contains($cpSrcPin,  "'/auth/change-pin'"), 'CP 有自助改 PIN 接口');
 T::true(str_contains($padSrcPin, "'/auth/change-pin'"), 'Pad 有自助改 PIN 接口（收银员也能改）');
 T::true((bool)preg_match('/change-pin.*?requireOperator\\(\\)/s', $padSrcPin), '自助改 PIN 要求已登录');
+
+T::group('跨平台 —— Windows 与 Linux 都要能跑');
+
+/**
+ * 运行环境会在 Windows / Linux 之间切换，任何一边的专属调用都不能裸用。
+ * 实测踩过：diag.php 用 posix_geteuid()（Windows 没有这套扩展 → 直接崩），
+ * init.php 用 stty 隐藏 PIN 输入（Windows 没有这个命令）。
+ */
+$phpFiles = [];
+foreach (['app', 'bin'] as $dir) {
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(__DIR__ . '/../../' . $dir, FilesystemIterator::SKIP_DOTS));
+    foreach ($it as $fi) {
+        if ($fi->isFile() && $fi->getExtension() === 'php') { $phpFiles[] = $fi->getPathname(); }
+    }
+}
+T::true(count($phpFiles) > 20, '扫到 ' . count($phpFiles) . ' 个 PHP 文件');
+
+foreach ($phpFiles as $f) {
+    $src  = (string)file_get_contents($f);
+    $name = basename($f);
+    // posix_* 必须有 function_exists 保护
+    if (preg_match('/(?<![\w>])posix_\w+\s*\(/', $src)) {
+        T::true(str_contains($src, "function_exists('posix_"),
+            "{$name} 用了 posix_*，有 function_exists 保护（Windows 无此扩展）");
+    }
+    // 调外部命令必须先判平台
+    if (preg_match("/(?<![\w>])(system|exec|shell_exec|passthru)\s*\(\s*['\"]/", $src)) {
+        T::true(str_contains($src, 'PHP_OS_FAMILY'),
+            "{$name} 调了外部命令，有 PHP_OS_FAMILY 平台判断");
+    }
+    // 不得硬编码盘符或 Unix 绝对路径
+    T::false((bool)preg_match('/[\'\"][A-Za-z]:\\\\/', $src), "{$name} 没有硬编码 Windows 盘符");
+    T::false((bool)preg_match('#[\'\"](/tmp|/var/log|/etc)/#', $src), "{$name} 没有硬编码 Unix 绝对路径");
+}
+
+// 目录分隔符：拼路径前要把两种分隔符都剥掉
+// （不要用 [^)]* 去框参数 —— rtrim(sys_get_temp_dir(), ...) 内层就有括号，
+//   会在那里截断，这条断言本身之前就是这么写错的）
+foreach (['app/bootstrap.php', 'bin/cron.php', 'bin/diag.php'] as $rel) {
+    $src = (string)file_get_contents(__DIR__ . '/../../' . $rel);
+    if (!str_contains($src, 'rtrim')) {
+        continue;
+    }
+    // 允许 "/\\" 或 '/\\' 两种写法
+    T::true(str_contains($src, '"/\\\\"') || str_contains($src, "'/\\\\'"),
+        basename($rel) . ' 剥路径分隔符时两种都剥（Windows 路径以 \\ 结尾）');
+    // 反过来：不许再出现只剥正斜杠的写法
+    T::false((bool)preg_match('/rtrim\s*\(.*,\s*[\'"]\/[\'"]\s*\)/', $src),
+        basename($rel) . ' 没有只剥正斜杠的 rtrim 残留');
+}
+
+// PSR-4：类名/命名空间必须与路径大小写严格一致
+// Windows 文件系统不区分大小写，Linux 区分 —— 在 Windows 上开发好好的，
+// 拷到 Linux 就 class not found
+$libDir = __DIR__ . '/../../app/lib';
+$itLib = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($libDir, FilesystemIterator::SKIP_DOTS));
+$nCls = 0; $badCase = [];
+foreach ($itLib as $fi) {
+    if (!$fi->isFile() || $fi->getExtension() !== 'php') { continue; }
+    $src = (string)file_get_contents($fi->getPathname());
+    if (!preg_match('/^\s*(?:final\s+|abstract\s+)*(?:class|interface|trait)\s+(\w+)/m', $src, $m)) {
+        continue;
+    }
+    $nCls++;
+    if ($m[1] !== $fi->getBasename('.php')) {
+        $badCase[] = $fi->getBasename() . ' 里是 ' . $m[1];
+    }
+    // 命名空间要对应目录
+    if (preg_match('/^namespace\s+([\w\\]+);/m', $src, $nm)) {
+        $relDir = trim(str_replace([$libDir, '\\'], ['', '/'], $fi->getPath()), '/');
+        $expect = 'Vip' . ($relDir !== '' ? '\\' . str_replace('/', '\\', $relDir) : '');
+        if ($nm[1] !== $expect) { $badCase[] = $fi->getBasename() . " namespace={$nm[1]} 期望={$expect}"; }
+    }
+}
+T::eq([], $badCase, "★ {$nCls} 个类的类名/命名空间与路径大小写完全一致（Linux 区分大小写）");
 
 T::group('前端 —— hidden 属性不得被样式压过');
 
