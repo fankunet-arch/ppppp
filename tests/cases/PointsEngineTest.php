@@ -254,6 +254,47 @@ T::eq('H70762', $zero['70762']['serial_id'], 'serial=0 的单经聚合后拿到�
 T::eq(17320, $zero['70762']['should_cents'], '金额照常累加 71.70 + 101.50');
 
 // ════════════════════════════════════════════════════════════
+T::group('展示行合并 —— 必须与小票印出的行一致');
+
+// 实测订单 92518（2026-08-16 Mesa 49，小票在手）：
+// POS 把两瓶水存成两行各 2.95，小票印的是「2 Agua 5.90」。
+// 服务员照着小票核对，不合并就会小票 2 行、Pad 3 行，像是多收了一笔。
+$rulesR = new MealRules([
+    ['menu_item_id' => 2590, 'is_meal_fee' => 1, 'counts_visit' => 1, 'earns_points' => 1],
+]);
+$twoWaters = [
+    ['menu_item_id'=>2590,'menu_item_name'=>'MENÚ INFINITY VIERNES','quantity'=>2,
+     'product_price'=>'25.90','original_price'=>null,'actual_price'=>'51.80',
+     'is_return_item'=>0,'condiment_belong_item'=>0],
+    ['menu_item_id'=>431,'menu_item_name'=>'Agua','quantity'=>1,
+     'product_price'=>'2.95','original_price'=>null,'actual_price'=>'2.95',
+     'is_return_item'=>0,'condiment_belong_item'=>0],
+    ['menu_item_id'=>431,'menu_item_name'=>'Agua','quantity'=>1,
+     'product_price'=>'2.95','original_price'=>null,'actual_price'=>'2.95',
+     'is_return_item'=>0,'condiment_belong_item'=>0],
+];
+$da = PE::analyzeDetail($twoWaters, $rulesR);
+T::eq(2, count($da['display']), '★ 两行 Agua 合并成一行（与小票一致）');
+$agua = null;
+foreach ($da['display'] as $d) { if ($d['menu_item_id'] === 431) { $agua = $d; } }
+T::eq(2,   $agua['quantity'],   'Agua 数量合并为 2');
+T::eq(590, $agua['line_cents'], 'Agua 金额合并为 5.90');
+T::eq(5770, $da['line_total_cents'], '★ 合计仍是 57.70，与小票 TOTAL 一致');
+T::eq(2, $da['portions_counted'], '2 份套餐 = 2 次');
+
+// 同名但一个被免、一个照价收，不能合并 —— 否则看不出哪份是免的
+$mixed = [
+    ['menu_item_id'=>431,'menu_item_name'=>'Agua','quantity'=>1,
+     'product_price'=>'2.95','original_price'=>null,'actual_price'=>'2.95',
+     'is_return_item'=>0,'condiment_belong_item'=>0],
+    ['menu_item_id'=>431,'menu_item_name'=>'Agua','quantity'=>1,
+     'product_price'=>'2.95','original_price'=>'2.95','actual_price'=>'0.00',
+     'is_return_item'=>0,'condiment_belong_item'=>0],
+];
+$dm = PE::analyzeDetail($mixed, $rulesR);
+T::eq(2, count($dm['display']), '★ 被免的与照价收的同名菜不合并');
+
+// ════════════════════════════════════════════════════════════
 T::group('十送一核销识别 —— menu_item_id = -2 折扣行');
 
 // 实测 -2 折扣行共 4 种名称，只有 TARJETA 10+1 是核销

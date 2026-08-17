@@ -236,17 +236,30 @@ final class PointsEngine
             }
 
             if (self::isDisplayableRow($row)) {
-                $display[] = [
-                    'menu_item_id'   => $itemId,
-                    'name'           => (string)($row['menu_item_name'] ?? ''),
-                    'quantity'       => $qty,
-                    'line_cents'     => $lineC,
-                    'unit_cents'     => $prodC,
-                    'is_waived'      => $lineC === 0 && $refC > 0,
-                    'counts_visit'   => $rules->countsVisit($itemId),
-                    'earns_points'   => $rules->earnsPoints($itemId),
-                    'is_meal_fee'    => $rules->isMealFee($itemId),
-                ];
+                $waived = $lineC === 0 && $refC > 0;
+                // ★ 同一菜品的多行要合并显示。
+                // POS 把「2 瓶水」存成两行各 2.95，而小票印的是「2 Agua 5.90」
+                // （实测订单 92518）。服务员是照着手里的小票核对的，
+                // 不合并就会出现小票 3 行、Pad 4 行，看起来像少收/多收。
+                // 只在单价与三个开关都相同时合并，避免把「被免的」和
+                // 「照价收的」同名菜混成一行。
+                $key = $itemId . '|' . $prodC . '|' . ($waived ? 1 : 0);
+                if (isset($display[$key])) {
+                    $display[$key]['quantity']   += $qty;
+                    $display[$key]['line_cents'] += $lineC;
+                } else {
+                    $display[$key] = [
+                        'menu_item_id'   => $itemId,
+                        'name'           => (string)($row['menu_item_name'] ?? ''),
+                        'quantity'       => $qty,
+                        'line_cents'     => $lineC,
+                        'unit_cents'     => $prodC,
+                        'is_waived'      => $waived,
+                        'counts_visit'   => $rules->countsVisit($itemId),
+                        'earns_points'   => $rules->earnsPoints($itemId),
+                        'is_meal_fee'    => $rules->isMealFee($itemId),
+                    ];
+                }
             }
         }
 
@@ -258,7 +271,8 @@ final class PointsEngine
             'portions_counted'    => $portionsCounted,
             'portions_uncounted'  => $portionsUncounted,
             'waived_cents'        => $waivedCents,
-            'display'             => $display,
+            // 合并用的键只是内部产物，对外仍是顺序数组
+            'display'             => array_values($display),
             'redeem_cents'        => $redeemCents,
             'redeem_lines'        => $redeemLines,
             'is_redeemed'         => $redeemCents > 0,
