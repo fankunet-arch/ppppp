@@ -317,6 +317,14 @@ function renderPortionBreakdown(o) {
   if (o.allocated_portions) bits.push(`已分配 ${o.allocated_portions} 份`);
 
   let html = bits.length ? `<div class="port-bits">${bits.join(' · ')}</div>` : '';
+
+  // 明细还没归档过来 —— 和「客人没点套餐」长得一样，必须说破
+  if (o.detail_missing) {
+    html += `<div class="port-warn">⚠ 这一单的<b>菜品明细还没同步过来</b>，所以份数显示 0。
+             <br>这不是没点套餐，也不是规则没配 —— 过几分钟再查一次即可。
+             <br>若急着发分，份数请按实际用餐人数手工填写。</div>`;
+  }
+
   const unknown = o.unknown_items || [];
   if (unknown.length) {
     html += `<div class="port-warn">⚠ 这些菜品不在「套餐规则」里，份数按 0 计：

@@ -667,6 +667,34 @@ eq(6, (int)$ctx6['customer_num'], '买单人数 6 直接取自 POS');
 eq(1, count($ctx6['unknown_items']), '★ 未配规则的菜品被单独列出（否则份数被吞成 0 却看不出原因）');
 eq('新品套餐（未配规则）', $ctx6['unknown_items'][0], '列出的是菜品名，前台能直接看懂');
 
+// ── 12quinquies. 有头无明细必须说破 ──────────────────────────
+step('⑫quinquies 明细没同步过来 —— 不能只显示「0 份」了事');
+
+/**
+ * 实测该店 history_order_detail 明显落后于 history_order_head
+ * （订单头到 8-17，明细只到 8-13）。刚结的账因此是「有头无明细」，
+ * Pad 上表现为「查得到、套餐 0 份」—— 与「客人没点套餐」无法区分。
+ * 收银员照 0 份发分就会把该计的次数永久漏掉，所以必须单独标出来。
+ */
+$pos->addHead([
+    'serial_id' => '2608130093', 'order_head_id' => 92393, 'check_id' => 1,
+    'table_name' => '53', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '53.70', 'should_amount' => '53.70', 'actual_amount' => '53.70',
+    'order_end_time' => '2026-08-13 23:27:00',
+]);
+// 故意不 addDetail —— 复现「明细尚未归档」
+
+$locNd = $svcL->points()->locate('53');
+$ctxNd = $locNd['candidates'][0];
+ok($ctxNd !== null, '有头无明细的订单仍能定位（不该因为没明细就查不到）');
+eq(0, $ctxNd['portions_counted'], '份数为 0（没有明细可数）');
+ok($ctxNd['detail_missing'] === true, '★ detail_missing 标记为真 —— 前台才能说清「不是没点套餐，是明细没到」');
+eq('53.70', $ctxNd['total'], '金额仍按订单头算，不受明细缺失影响');
+ok($ctxNd['eligible'], '仍可发分（金额是准的，只是份数要人工确认）');
+
+// 对照：有明细时不得误报
+ok($ctx6['detail_missing'] === false, '对照：有明细的订单不会被误标为「明细缺失」');
+
 // ── 13. 不变量总校验 ─────────────────────────────────────────
 step('⑬ 不变量总校验');
 

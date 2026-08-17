@@ -271,6 +271,19 @@ final class PointsService
             //   付费套餐几份、免费套餐几份、买单人数（POS 的 customer_num）
             'portions_paid'      => $analysis['portions_paid'],
             'portions_free'      => $analysis['portions_free'],
+            /**
+             * ★ 「订单有金额，但一条明细都读不到」必须单独报出来。
+             *
+             * 实测这家 POS 的 history_order_detail 会明显落后于
+             * history_order_head：订单头已经有 8-17 的单，明细却只到 8-13。
+             * 于是刚结的账在 Pad 上表现为「查得到、套餐 0 份」——
+             * 而这和「客人真的没点套餐」长得一模一样，收银员没法分辨，
+             * 很容易当成 0 份就发分，把该计的次数漏掉。
+             *
+             * 这不是配置问题也不是漏配菜品，等明细归档过来就好了，
+             * 所以要说清楚「等一会儿再查」而不是让人去后台翻规则。
+             */
+            'detail_missing'     => $detail === [] && $baseCents > 0,
             // 规则表没收录的菜品：份数会被安全默认吞成 0，必须让前台看得见，
             // 否则界面上「本来就 0 份」和「漏配所以算不出来」长得一模一样。
             'unknown_items'      => $analysis['unknown_items'],
