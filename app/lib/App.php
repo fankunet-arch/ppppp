@@ -14,6 +14,7 @@ use Vip\Repo\OrderRepo;
 use Vip\Service\AuthService;
 use Vip\Service\MaintenanceService;
 use Vip\Service\PointsService;
+use Vip\Service\RewardService;
 use Vip\Service\ReconcileService;
 use Vip\Service\SyncService;
 
@@ -170,6 +171,14 @@ final class App
         return $this->once('maintenance', fn() => new MaintenanceService(
             $this->posReader(), $this->cfg(), $this->mealRuleRepo(), $this->members(),
             $this->alerts(), $this->audit(), $this->auth(),
+        ));
+    }
+
+    public function rewards(): RewardService
+    {
+        return $this->once('rewards', fn() => new RewardService(
+            $this->localDb(), $this->storeCode(), $this->cfg(),
+            $this->members(), $this->audit(),
         ));
     }
 

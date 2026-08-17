@@ -136,11 +136,121 @@ final class AuthService
         );
     }
 
+    /** PIN 最短长度。别再放宽 —— 纯数字 PIN 本来熵就低，靠长度和锁定撑着 */
+    public const MIN_PIN = 6;
+
+    /**
+     * 改自己的 PIN（必须验旧 PIN）。
+     *
+     * ★ 改完要踢掉该操作员的【其他】会话：改密码的常见动机就是怀疑泄露，
+     *   不踢的话攻击者手上那个 Cookie 还能继续用 12 小时。
+     *   当前这条会话保留，免得刚改完就被踹出登录页。
+     *
+     * @return array{ok:bool,error?:string}
+     */
+    public function changePin(int $operatorId, string $oldPin, string $newPin, ?string $keepToken = null): array
+    {
+        $op = $this->db->one(
+            'SELECT * FROM operator WHERE store_code = ? AND id = ?',
+            [$this->storeCode, $operatorId]
+        );
+        if ($op === null || (int)$op['enabled'] !== 1) {
+            return ['ok' => false, 'error' => 'invalid_credentials'];
+        }
+        if (!password_verify($oldPin, (string)$op['pin_hash'])) {
+            return ['ok' => false, 'error' => 'invalid_credentials'];
+        }
+        if (strlen($newPin) < self::MIN_PIN) {
+            return ['ok' => false, 'error' => 'pin_too_short'];
+        }
+        if ($newPin === $oldPin) {
+            return ['ok' => false, 'error' => 'pin_unchanged'];
+        }
+
+        $this->writePin($operatorId, $newPin);
+        $this->revokeSessions($operatorId, $keepToken);
+        $this->audit->log('operator_pin_change', [
+            'target_type'   => 'operator', 'target_id' => (string)$operatorId,
+            // 自助修改，操作人就是本人
+            'operator_id'   => $operatorId,
+            'operator_name' => $op['display_name'],
+            'detail' => ['login_name' => $op['login_name'], 'by' => 'self'],
+        ]);
+        return ['ok' => true];
+    }
+
+    /**
+     * 管理员重置他人 PIN（不需要旧 PIN）。
+     *
+     * 同时解掉连续失败锁定 —— 忘记 PIN 的人通常已经试错到被锁了，
+     * 只改 PIN 不解锁等于没解决问题。
+     *
+     * 该操作员的【全部】会话都作废（含当前会话）。
+     *
+     * @return array{ok:bool,error?:string}
+     */
+    public function resetPin(int $operatorId, string $newPin, array $byOperator): array
+    {
+        $op = $this->db->one(
+            'SELECT * FROM operator WHERE store_code = ? AND id = ?',
+            [$this->storeCode, $operatorId]
+        );
+        if ($op === null) {
+            return ['ok' => false, 'error' => 'not_found'];
+        }
+        if (strlen($newPin) < self::MIN_PIN) {
+            return ['ok' => false, 'error' => 'pin_too_short'];
+        }
+
+        $this->writePin($operatorId, $newPin, true);
+        $this->revokeSessions($operatorId);
+        $this->audit->log('operator_pin_reset', [
+            'target_type'   => 'operator', 'target_id' => (string)$operatorId,
+            // 操作人是【执行重置的管理员】，不是被重置的那个账号
+            'operator_id'   => $byOperator['id']   ?? null,
+            'operator_name' => $byOperator['name'] ?? null,
+            'detail' => [
+                'login_name'  => $op['login_name'],
+                'target_name' => $op['display_name'],
+                'by'          => 'admin',
+            ],
+        ]);
+        return ['ok' => true];
+    }
+
+    /** 写入新 PIN；$unlock=true 时一并清掉失败计数与锁定 */
+    private function writePin(int $operatorId, string $pin, bool $unlock = false): void
+    {
+        $sql = $unlock
+            ? 'UPDATE operator SET pin_hash = ?, failed_count = 0, locked_until = NULL, updated_at = ?
+                WHERE store_code = ? AND id = ?'
+            : 'UPDATE operator SET pin_hash = ?, updated_at = ?
+                WHERE store_code = ? AND id = ?';
+        $this->db->exec($sql, [
+            password_hash($pin, PASSWORD_DEFAULT), $this->db->now(), $this->storeCode, $operatorId,
+        ]);
+    }
+
+    /** 作废该操作员的会话；$keepToken 传明文令牌时保留那一条 */
+    private function revokeSessions(int $operatorId, ?string $keepToken = null): int
+    {
+        if ($keepToken !== null && $keepToken !== '') {
+            return $this->db->exec(
+                'DELETE FROM operator_session WHERE store_code = ? AND operator_id = ? AND token_hash <> ?',
+                [$this->storeCode, $operatorId, hash('sha256', $keepToken)]
+            );
+        }
+        return $this->db->exec(
+            'DELETE FROM operator_session WHERE store_code = ? AND operator_id = ?',
+            [$this->storeCode, $operatorId]
+        );
+    }
+
     /** 建操作员（CP 后台与初始化脚本用） */
     public function createOperator(string $loginName, string $displayName, string $pin, int $role): int
     {
-        if (strlen($pin) < 4) {
-            throw new \InvalidArgumentException('PIN 至少 4 位');
+        if (strlen($pin) < self::MIN_PIN) {
+            throw new \InvalidArgumentException('PIN 至少 ' . self::MIN_PIN . ' 位');
         }
         $this->db->exec(
             'INSERT INTO operator

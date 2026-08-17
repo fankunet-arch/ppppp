@@ -40,6 +40,8 @@ $logDir = $VIP_CONFIG['log_path'] ?? (__DIR__ . '/../var/log');
 if (!is_dir($logDir)) {
     @mkdir($logDir, 0750, true);
 }
-ini_set('error_log', rtrim($logDir, '/') . '/php-error.log');
+// 两个分隔符都要剥 —— Windows 上路径可能是 C:\wwwroot\var\log\
+// （PHP 在 Windows 上正斜杠也认，所以拼接统一用 '/'）
+ini_set('error_log', rtrim($logDir, "/\\") . '/php-error.log');
 
 return $VIP_CONFIG;

@@ -106,3 +106,28 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .toast.ok  { background: var(--ok); }
 .empty { color: var(--muted); padding: 20px; text-align: center; background: var(--card);
          border: 1px dashed var(--line); border-radius: 9px; }
+
+/* ── 配置页：按业务分组，不再是平铺的 key-value ────── */
+.rule-banner {
+  background: #eaf1fd; border: 1px solid #c9dcfa; border-radius: 9px;
+  padding: 12px 16px; margin-bottom: 18px; font-size: 15px;
+}
+.cfg-group { background: var(--card); border: 1px solid var(--line);
+  border-radius: 9px; padding: 16px 18px; margin-bottom: 16px; }
+.cfg-group h4 { margin: 0 0 4px; font-size: 15px; }
+.cfg-group > .muted { margin: 0 0 14px; }
+.cfg-items { display: flex; flex-direction: column; gap: 14px; }
+.cfg-item { display: grid; grid-template-columns: 260px 1fr; gap: 4px 16px; align-items: start; }
+.cfg-label { font-weight: 600; font-size: 14px; }
+.cfg-label code { display: block; font-weight: 400; font-size: 11px; color: #9aa1ab; margin-top: 2px; }
+.cfg-ctrl { display: flex; align-items: center; }
+.cfg-desc { grid-column: 1 / -1; margin: 0; line-height: 1.6; }
+.cfg-item input, .cfg-item select { margin-top: 0; }
+.cfg-input { display: flex; align-items: center; gap: 8px; }
+.cfg-input em { font-style: normal; color: var(--muted); font-size: 13px; }
+.switch-wrap { display: flex; align-items: center; gap: 8px; margin: 0; cursor: pointer; }
+.switch-wrap input { width: 20px; height: 20px; min-width: 20px; margin: 0; }
+.cfg-adv { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--line); }
+.cfg-adv summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.cfg-adv .cfg-items { margin-top: 12px; }
+@media (max-width: 720px) { .cfg-item { grid-template-columns: 1fr; } }

@@ -31,6 +31,7 @@
       <button class="tab" data-tab="members">会员</button>
       <button class="tab" data-tab="report">报表</button>
       <button class="tab" data-tab="config">配置</button>
+      <button class="tab" data-tab="coupons">奖励券</button>
       <button class="tab" data-tab="operators">操作员</button>
       <button class="tab" data-tab="audit">审计</button>
     </nav>
@@ -105,6 +106,23 @@
   </div>
 
   <!-- 操作员 -->
+  <!-- 奖励券 -->
+  <div id="tab-coupons" class="panel">
+    <h3>奖励券</h3>
+    <div id="coupon-rule" class="rule-banner"></div>
+    <div id="coupon-stats" class="stats"></div>
+    <details class="add-box">
+      <summary>手工发一张券（补偿 / 投诉处理）</summary>
+      <div class="row">
+        <label>会员卡号<input id="cp-grant-card" type="text" placeholder="卡号"></label>
+        <label>原因（必填）<input id="cp-grant-note" type="text" placeholder="如：投诉补偿"></label>
+      </div>
+      <button id="btn-coupon-grant" class="primary">发放</button>
+      <p class="muted small">手工发放不占用客人靠消费攒来的那张，会单独记入审计日志。</p>
+    </details>
+    <div id="coupon-list"></div>
+  </div>
+
   <div id="tab-operators" class="panel">
     <h3>操作员</h3>
     <div id="operators-list"></div>
@@ -119,6 +137,17 @@
         </select></label>
       </div>
       <button id="btn-add-op" class="primary">创建</button>
+    </details>
+
+    <details class="add-box">
+      <summary>改我自己的 PIN</summary>
+      <div class="row">
+        <label>当前 PIN<input id="my-old-pin" type="password" autocomplete="current-password"></label>
+        <label>新 PIN<input id="my-new-pin" type="password" autocomplete="new-password"></label>
+        <label>再输一次<input id="my-new-pin2" type="password" autocomplete="new-password"></label>
+      </div>
+      <button id="btn-change-pin" class="primary">修改</button>
+      <p class="muted small">改完后，你在其他设备上的登录会全部失效，当前这台不受影响。</p>
     </details>
   </div>
 

@@ -9,6 +9,7 @@ declare(strict_types=1);
  *   php bin/init.php migrate            建表（会 DROP，有安全闸门）
  *   php bin/init.php seed               灌入配置、餐期、套餐规则
  *   php bin/init.php admin <工号> <姓名> 创建管理员（PIN 交互输入）
+ *   php bin/init.php passwd <工号>      重置某人的 PIN（管理员锁死时的逃生口）
  *   php bin/init.php all                以上全部（migrate 除外，需显式执行）
  * ════════════════════════════════════════════════════════════════
  */
@@ -27,6 +28,7 @@ if ($task === '' || in_array($task, ['-h', '--help', 'help'], true)) {
       migrate                   建表（DROP TABLE，有安全闸门）
       seed                      灌入配置、餐期、套餐规则（幂等，可重复执行）
       admin <工号> <显示名>      创建管理员账号
+      passwd <工号>              重置该账号 PIN 并解除锁定（忘记 PIN 时用）
       all                       check + seed（migrate 需显式单独执行）
 
     TXT;
@@ -232,20 +234,80 @@ function doAdmin(App $app, ?string $login, ?string $name): void
     }
     head("创建管理员 {$login}（{$name}）");
 
-    echo '  请输入 PIN（至少 6 位，输入不回显）：';
-    system('stty -echo 2>/dev/null');
+    $pin = readPinTwice();
+    $id  = $app->auth()->createOperator($login, $name, $pin, AuthService::ROLE_ADMIN);
+    ok("已创建，operator_id = {$id}");
+    warn('PIN 用 password_hash 存储，不可找回。忘记了用 `php bin/init.php passwd ' . $login . '` 重置');
+}
+
+/** 交互式读两遍 PIN，不回显 */
+function readPinTwice(): string
+{
+    $min = AuthService::MIN_PIN;
+    // stty 是 Unix 专属；Windows 上没有，只能回显输入
+    $canHide = strncasecmp(PHP_OS_FAMILY, 'Windows', 7) !== 0;
+    echo "  请输入 PIN（至少 {$min} 位"
+       . ($canHide ? '，输入不回显' : '，注意：Windows 下会显示出来') . '）：';
+    if ($canHide) { system('stty -echo 2>/dev/null'); }
     $pin = trim((string)fgets(STDIN));
     echo "\n  请再输入一次：";
     $pin2 = trim((string)fgets(STDIN));
-    system('stty echo 2>/dev/null');
+    if ($canHide) { system('stty echo 2>/dev/null'); }
     echo "\n";
 
-    if ($pin !== $pin2)  { bad('两次输入不一致'); exit(1); }
-    if (strlen($pin) < 6) { bad('管理员 PIN 至少 6 位'); exit(1); }
+    if ($pin !== $pin2)      { bad('两次输入不一致'); exit(1); }
+    if (strlen($pin) < $min) { bad("PIN 至少 {$min} 位"); exit(1); }
+    return $pin;
+}
 
-    $id = $app->auth()->createOperator($login, $name, $pin, AuthService::ROLE_ADMIN);
-    ok("已创建，operator_id = {$id}");
-    warn('PIN 已用 password_hash 存储，无法找回；忘记只能重建账号');
+/**
+ * 重置某个操作员的 PIN —— 【管理员把自己锁死时唯一的逃生口】。
+ *
+ * 没有这条路的话：唯一的管理员忘了 PIN → 登不进后台建新管理员，
+ * 而 (store_code, login_name) 是唯一索引、同名也建不了第二个，
+ * audit_log 又按 operator_id 引用，删号会把历史审计记录变成孤儿 ——
+ * 等于整个后台永久锁死。
+ *
+ * 本命令要求服务器 shell 权限，这个信任边界是合理的：
+ * 能登服务器的人本来就能直接改库。
+ */
+function doPasswd(App $app, ?string $login): void
+{
+    if ($login === null) {
+        echo "用法：php bin/init.php passwd <工号>\n";
+        exit(1);
+    }
+    $db = $app->localDb();
+    $op = $db->one('SELECT id, login_name, display_name, role, enabled FROM operator
+                     WHERE store_code = ? AND login_name = ?',
+                   [$app->storeCode(), $login]);
+    if ($op === null) {
+        bad("门店 {$app->storeCode()} 下没有工号 {$login}");
+        $all = $db->all('SELECT login_name, role, enabled FROM operator WHERE store_code = ? ORDER BY id',
+                        [$app->storeCode()]);
+        if ($all) {
+            echo "  现有工号：\n";
+            foreach ($all as $a) {
+                printf("    %-12s role=%s %s\n", $a['login_name'], $a['role'],
+                    (int)$a['enabled'] === 1 ? '' : '（已停用）');
+            }
+        }
+        exit(1);
+    }
+
+    head("重置 {$op['login_name']}（{$op['display_name']}）的 PIN");
+    $pin = readPinTwice();
+
+    $r = $app->auth()->resetPin((int)$op['id'], $pin, ['id' => 0, 'name' => 'CLI']);
+    if (!($r['ok'] ?? false)) {
+        bad('重置失败：' . ($r['error'] ?? '未知'));
+        exit(1);
+    }
+    ok('已重置，连续失败锁定一并解除');
+    warn('该账号原有的登录会话全部作废，需要重新登录');
+    if ((int)$op['enabled'] !== 1) {
+        warn('注意：该账号当前是【停用】状态，重置后仍然登不进去，请先在后台启用');
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -255,6 +317,7 @@ try {
         case 'migrate': doMigrate($app); break;
         case 'seed':    doSeed($app); break;
         case 'admin':   doAdmin($app, $argv[2] ?? null, $argv[3] ?? null); break;
+        case 'passwd':  doPasswd($app, $argv[2] ?? null); break;
         case 'all':     doCheck($app, $config); doSeed($app); break;
         default:
             fwrite(STDERR, "未知任务：{$task}\n");

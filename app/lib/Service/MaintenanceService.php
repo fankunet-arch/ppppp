@@ -142,6 +142,38 @@ final class MaintenanceService
         return ['ok' => true, 'processed' => count($rows)];
     }
 
+    /**
+     * 长期不消费的会员到期假名化（LOPDGDD 存储限制原则）。
+     *
+     * 与 expireUnconfirmedMembers 的区别：那个管「注册了但没确认」,
+     * 这个管「确认过、但很久没来」—— 末次消费超过 pii_retention_years 年。
+     * 消费流水一律保留（税务与会计留存义务），只抹掉个人身份信息。
+     */
+    public function purgeStalePii(?callable $log = null): array
+    {
+        $log ??= static fn(string $m) => null;
+        $years = $this->cfg->int('pii_retention_years', 3);
+        if ($years <= 0) {
+            $log('pii_retention_years = 0，未启用');
+            return ['ok' => true, 'processed' => 0];
+        }
+
+        $rows = $this->members->staleForPii($years, 100);
+        foreach ($rows as $m) {
+            $id = (int)$m['id'];
+            $this->members->pseudonymize($id);
+            $this->audit->log('data_erase', [
+                'target_type' => 'member', 'target_id' => (string)$id,
+                'detail' => ['reason' => 'pii_retention_expired', 'years' => $years,
+                             'last_activity' => $m['last_activity'] ?? null,
+                             'note' => 'PII 已假名化，消费流水保留'],
+            ]);
+        }
+        $log(sprintf('处理 %d 名超过 %d 年未消费的会员（假名化，流水保留）', count($rows), $years));
+
+        return ['ok' => true, 'processed' => count($rows)];
+    }
+
     /** 清理过期会话 */
     public function purgeSessions(): array
     {

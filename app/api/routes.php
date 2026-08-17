@@ -88,6 +88,25 @@ $api->on('POST', '/auth/login', static function () use ($auth): void {
     Api::ok(['operator' => $r['operator']]);
 });
 
+/**
+ * 收银员改自己的 PIN。必须验旧 PIN。
+ * 改完保留当前会话，其余会话作废（PIN 泄露时能把别人踢下线）。
+ */
+$api->on('POST', '/auth/change-pin', static function () use ($app, $requireOperator): void {
+    $op  = $requireOperator();
+    $b   = Api::body();
+    $old = (string)($b['old_pin'] ?? '');
+    $new = (string)($b['new_pin'] ?? '');
+    if ($old === '' || $new === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->auth()->changePin((int)$op['id'], $old, $new, Api::readToken());
+    if (!($r['ok'] ?? false)) {
+        Api::fail((string)$r['error'], $r['error'] === 'invalid_credentials' ? 401 : 400);
+    }
+    Api::ok(['changed' => true]);
+});
+
 $api->on('POST', '/auth/logout', static function () use ($auth): void {
     $auth()->logout(Api::readToken());
     Api::clearToken();
@@ -280,7 +299,57 @@ $api->on('POST', '/points/grant', static function () use ($app, $requireOperator
     $r = $app->points()->grant($serial, $clean, $mode, [
         'id' => $op['id'], 'name' => $op['name'], 'device' => $op['device'],
     ]);
-    Api::fromResult($r, ['entries' => $r['entries'] ?? []]);
+
+    // 发分成功后检查奖励达标（N 送 1）。
+    // 放在事务外：发券失败不该把已经记好的积分一起回滚，
+    // 而且 checkAndGrant 本身靠 rewards_issued 幂等，下次记账会自动补上。
+    $rewards = [];
+    if (($r['ok'] ?? false) === true) {
+        foreach (array_unique($r['member_ids'] ?? []) as $mid) {
+            $g = $app->rewards()->checkAndGrant((int)$mid,
+                ['id' => $op['id'], 'name' => $op['name']]);
+            if (($g['granted'] ?? 0) > 0 || ($g['pending'] ?? 0) > 0) {
+                $m = $app->members()->findById((int)$mid);
+                $rewards[] = [
+                    'member_id' => (int)$mid,
+                    'card_no'   => $m['card_no'] ?? '',
+                    'granted'   => $g['granted'],
+                    'pending'   => $g['pending'],
+                    'coupons'   => $g['coupons'],
+                ];
+            }
+        }
+    }
+    Api::fromResult($r, ['entries' => $r['entries'] ?? [], 'rewards' => $rewards]);
+});
+
+/** 某会员的奖励进度与可用券 —— Pad 选中会员后显示 */
+$api->on('POST', '/member/rewards', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $b   = Api::body();
+    $mid = Api::int($b, 'member_id', 0);
+    if ($mid <= 0) {
+        Api::fail('bad_request');
+    }
+    Api::ok([
+        'rule'      => $app->rewards()->ruleText(),
+        'progress'  => $app->rewards()->progress($mid),
+        'available' => $app->rewards()->availableFor($mid),
+    ]);
+});
+
+/** 核销一张奖励券 */
+$api->on('POST', '/coupon/redeem', static function () use ($app, $requireOperator): void {
+    $op  = $requireOperator();
+    $b   = Api::body();
+    $cid = Api::int($b, 'coupon_id', 0);
+    $ser = Api::str($b, 'serial_id');
+    if ($cid <= 0) {
+        Api::fail('bad_request');
+    }
+    $r = $app->rewards()->redeem($cid, $ser ?: null,
+        ['id' => $op['id'], 'name' => $op['name']]);
+    Api::fromResult($r, ['code' => $r['code'] ?? null]);
 });
 
 /** 均摊计算 —— 放服务端算，保证与落库口径完全一致（余数给第一位） */

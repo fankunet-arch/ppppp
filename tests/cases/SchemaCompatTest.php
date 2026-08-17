@@ -206,6 +206,26 @@ T::false((bool)preg_match('/^\$\w+\s*=\s*new\s+\w+\(\s*\$app->(localDb|cfg|order
 T::true((bool)preg_match('/\$authRef\s*\?\?=/', $routesSrc),
     'AuthService 惰性构造');
 
+/**
+ * ★ 路由里用到的守卫闭包，必须在【同一个文件】里定义过。
+ * 实测踩过：CP 的 /auth/change-pin 写成了 use ($requireOperator)，
+ * 而 cp/routes.php 只定义了 requireManager / requireAdmin ——
+ * PHP 只报一条 Warning，然后调用 null 抛异常，
+ * 接口直接 500，而单测因为不实际发请求完全发现不了。
+ */
+foreach ([
+    'app/api/routes.php' => $routesSrc,
+    'app/cp/routes.php'  => file_get_contents(__DIR__ . '/../../app/cp/routes.php'),
+] as $file => $src) {
+    preg_match_all('/^\$(require\w+)\s*=/m', $src, $defM);
+    $defined = array_flip($defM[1]);
+    preg_match_all('/\$(require\w+)/', $src, $useM);
+    foreach (array_unique($useM[1]) as $used) {
+        T::true(isset($defined[$used]),
+            basename($file) . " 里用到的 \${$used} 在本文件有定义");
+    }
+}
+
 // ── 按小票号查单（docs/01 §2.9）────────────────────────────
 T::true(str_contains($routesSrc, "'/order/locate-invoice'"), '注册了按小票号查单的接口');
 T::true((bool)preg_match('/locate-invoice.*?\$requireOperator\(\)/s', $routesSrc),
@@ -240,6 +260,177 @@ T::true((bool)preg_match('/password_verify\s*\(/', $authSrc), '校验用 passwor
 T::true((bool)preg_match("/hash\('sha256',\s*\\\$token\)/", $authSrc),
     '会话令牌库中存 SHA-256，明文只在 Cookie');
 T::true((bool)preg_match('/MAX_FAILED/', $authSrc), '有连续失败锁定（防 4 位 PIN 被枚举）');
+
+// ── PIN 可改可重置（账号生命周期不能只进不出）──────────────
+// 早先只有 create 和 toggle，文档写「忘记只能重建账号」,而这条路走不通：
+// (store_code, login_name) 唯一索引挡住同名重建，audit_log 按 operator_id
+// 引用会变孤儿，唯一的管理员忘了 PIN 就彻底锁死。
+T::true(str_contains($authSrc, 'function changePin'), 'AuthService 支持自助改 PIN');
+T::true(str_contains($authSrc, 'function resetPin'),  'AuthService 支持管理员重置 PIN');
+T::true((bool)preg_match('/changePin.*?password_verify\\(\\$oldPin/s', $authSrc),
+    '★ 改自己的 PIN 必须验旧 PIN（否则拿到会话就能改密码）');
+T::true((bool)preg_match('/resetPin.*?writePin\\(\\$operatorId, \\$newPin, true\\)/s', $authSrc),
+    '★ 管理员重置时一并解除锁定（忘记 PIN 的人通常已试错到被锁）');
+T::true((bool)preg_match('/function revokeSessions/', $authSrc),
+    '★ 改/重置 PIN 后作废会话（PIN 疑似泄露时能把人踢下线）');
+T::true(str_contains($authSrc, 'MIN_PIN = 6'), 'PIN 最短 6 位');
+
+$initSrc = file_get_contents(__DIR__ . '/../../bin/init.php');
+T::true(str_contains($initSrc, "case 'passwd'"),
+    '★ CLI 有 passwd 逃生口（唯一管理员锁死时的唯一恢复路径）');
+T::true((bool)preg_match('/doPasswd.*?resetPin\\(/s', $initSrc), 'passwd 走的是同一套 resetPin');
+
+$cpSrcPin  = file_get_contents(__DIR__ . '/../../app/cp/routes.php');
+$padSrcPin = file_get_contents(__DIR__ . '/../../app/api/routes.php');
+T::true(str_contains($cpSrcPin, "'/operators/reset-pin'"), 'CP 有重置 PIN 接口');
+T::true((bool)preg_match('/reset-pin.*?requireAdmin\\(\\)/s', $cpSrcPin), '★ 重置他人 PIN 限管理员');
+T::true(str_contains($cpSrcPin,  "'/auth/change-pin'"), 'CP 有自助改 PIN 接口');
+T::true(str_contains($padSrcPin, "'/auth/change-pin'"), 'Pad 有自助改 PIN 接口（收银员也能改）');
+T::true((bool)preg_match('/change-pin.*?requireOperator\\(\\)/s', $padSrcPin), '自助改 PIN 要求已登录');
+
+T::group('后台配置 —— 每个配置项都必须在后台露出来');
+
+/**
+ * 之前后台把 sys_config 当平铺 key-value 列出来，店家找不到
+ * 「几送一」「免费餐额外消费算不算」这些开关在哪；而且有三个配置项
+ * （free_meal_extra_earns / points_include_tax / pii_retention_years）
+ * 建了却从没被代码读过，是死配置 —— 界面上能改，改了没有任何效果。
+ * 这两类问题都靠下面的断言守住。
+ */
+require_once __DIR__ . '/../../app/lib/ConfigSchema.php';
+
+$seedSql = (string)file_get_contents(__DIR__ . '/../../db/seeds/001_sys_config.sql');
+preg_match_all("/\(@store,'([a-z0-9_]+)'/", $seedSql, $sm);
+$seeded = array_unique($sm[1]);
+T::true(count($seeded) > 20, '种子里有 ' . count($seeded) . ' 个配置项');
+
+$schema = array_keys(\Vip\ConfigSchema::ITEMS);
+
+// ① 种子里的每一项都要在 schema 里登记，否则后台没有标签与说明
+foreach ($seeded as $k) {
+    T::true(in_array($k, $schema, true), "配置项 {$k} 已在 ConfigSchema 登记（否则后台显示为未归类）");
+}
+
+// ② schema 里的每一项都要真的被代码读取，不能是死配置
+$appSrc = '';
+foreach ([__DIR__ . '/../../app', __DIR__ . '/../../bin'] as $dir) {
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS));
+    foreach ($it as $fi) {
+        if ($fi->isFile() && $fi->getExtension() === 'php'
+            && $fi->getFilename() !== 'ConfigSchema.php') {
+            $appSrc .= (string)file_get_contents($fi->getPathname());
+        }
+    }
+}
+foreach ($schema as $k) {
+    T::true(str_contains($appSrc, "'{$k}'"),
+        "★ 配置项 {$k} 确实被代码读取（不是改了没效果的死配置）");
+}
+
+// ③ 每项都要有分组、标签、说明
+foreach (\Vip\ConfigSchema::ITEMS as $k => $meta) {
+    T::true(isset(\Vip\ConfigSchema::GROUPS[$meta['group']]), "{$k} 的分组有效");
+    T::true(($meta['label'] ?? '') !== '' && ($meta['desc'] ?? '') !== '',
+        "{$k} 有中文标签与说明");
+    if ($meta['type'] === 'select') {
+        T::true(!empty($meta['options']), "{$k} 是下拉框，选项不为空");
+    }
+}
+
+// ④ 类型校验真的管用
+T::eq(null, \Vip\ConfigSchema::validate('reward_threshold_visits', '10'), '合法整数通过');
+T::true(\Vip\ConfigSchema::validate('reward_threshold_visits', '-1') !== null, '负数被拒');
+T::true(\Vip\ConfigSchema::validate('reward_threshold_visits', '很多') !== null, '文字被拒');
+T::true(\Vip\ConfigSchema::validate('reward_enabled', '2') !== null, '开关只能 0/1');
+T::true(\Vip\ConfigSchema::validate('reward_mode', 'whatever') !== null, '下拉框只能选已有项');
+T::eq(null, \Vip\ConfigSchema::validate('reward_mode', 'amount'), '合法选项通过');
+T::eq(null, \Vip\ConfigSchema::validate('business_day_cutoff', '02:00'), '时间格式通过');
+T::true(\Vip\ConfigSchema::validate('business_day_cutoff', '25:00') !== null, '非法时间被拒');
+
+// ⑤ 用户点名要的三项必须在
+foreach (['reward_mode' => '按次还是按金额',
+          'reward_threshold_visits' => '几送一',
+          'free_meal_extra_earns' => '免费餐额外消费是否计入'] as $k => $what) {
+    T::true(in_array($k, $schema, true), "★ 「{$what}」在后台可设（{$k}）");
+}
+
+T::group('跨平台 —— Windows 与 Linux 都要能跑');
+
+/**
+ * 运行环境会在 Windows / Linux 之间切换，任何一边的专属调用都不能裸用。
+ * 实测踩过：diag.php 用 posix_geteuid()（Windows 没有这套扩展 → 直接崩），
+ * init.php 用 stty 隐藏 PIN 输入（Windows 没有这个命令）。
+ */
+$phpFiles = [];
+foreach (['app', 'bin'] as $dir) {
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(__DIR__ . '/../../' . $dir, FilesystemIterator::SKIP_DOTS));
+    foreach ($it as $fi) {
+        if ($fi->isFile() && $fi->getExtension() === 'php') { $phpFiles[] = $fi->getPathname(); }
+    }
+}
+T::true(count($phpFiles) > 20, '扫到 ' . count($phpFiles) . ' 个 PHP 文件');
+
+foreach ($phpFiles as $f) {
+    $src  = (string)file_get_contents($f);
+    $name = basename($f);
+    // posix_* 必须有 function_exists 保护
+    if (preg_match('/(?<![\w>])posix_\w+\s*\(/', $src)) {
+        T::true(str_contains($src, "function_exists('posix_"),
+            "{$name} 用了 posix_*，有 function_exists 保护（Windows 无此扩展）");
+    }
+    // 调外部命令必须先判平台
+    if (preg_match("/(?<![\w>])(system|exec|shell_exec|passthru)\s*\(\s*['\"]/", $src)) {
+        T::true(str_contains($src, 'PHP_OS_FAMILY'),
+            "{$name} 调了外部命令，有 PHP_OS_FAMILY 平台判断");
+    }
+    // 不得硬编码盘符或 Unix 绝对路径
+    T::false((bool)preg_match('/[\'\"][A-Za-z]:\\\\/', $src), "{$name} 没有硬编码 Windows 盘符");
+    T::false((bool)preg_match('#[\'\"](/tmp|/var/log|/etc)/#', $src), "{$name} 没有硬编码 Unix 绝对路径");
+}
+
+// 目录分隔符：拼路径前要把两种分隔符都剥掉
+// （不要用 [^)]* 去框参数 —— rtrim(sys_get_temp_dir(), ...) 内层就有括号，
+//   会在那里截断，这条断言本身之前就是这么写错的）
+foreach (['app/bootstrap.php', 'bin/cron.php', 'bin/diag.php'] as $rel) {
+    $src = (string)file_get_contents(__DIR__ . '/../../' . $rel);
+    if (!str_contains($src, 'rtrim')) {
+        continue;
+    }
+    // 允许 "/\\" 或 '/\\' 两种写法
+    T::true(str_contains($src, '"/\\\\"') || str_contains($src, "'/\\\\'"),
+        basename($rel) . ' 剥路径分隔符时两种都剥（Windows 路径以 \\ 结尾）');
+    // 反过来：不许再出现只剥正斜杠的写法
+    T::false((bool)preg_match('/rtrim\s*\(.*,\s*[\'"]\/[\'"]\s*\)/', $src),
+        basename($rel) . ' 没有只剥正斜杠的 rtrim 残留');
+}
+
+// PSR-4：类名/命名空间必须与路径大小写严格一致
+// Windows 文件系统不区分大小写，Linux 区分 —— 在 Windows 上开发好好的，
+// 拷到 Linux 就 class not found
+$libDir = __DIR__ . '/../../app/lib';
+$itLib = new RecursiveIteratorIterator(
+    new RecursiveDirectoryIterator($libDir, FilesystemIterator::SKIP_DOTS));
+$nCls = 0; $badCase = [];
+foreach ($itLib as $fi) {
+    if (!$fi->isFile() || $fi->getExtension() !== 'php') { continue; }
+    $src = (string)file_get_contents($fi->getPathname());
+    if (!preg_match('/^\s*(?:final\s+|abstract\s+)*(?:class|interface|trait)\s+(\w+)/m', $src, $m)) {
+        continue;
+    }
+    $nCls++;
+    if ($m[1] !== $fi->getBasename('.php')) {
+        $badCase[] = $fi->getBasename() . ' 里是 ' . $m[1];
+    }
+    // 命名空间要对应目录
+    if (preg_match('/^namespace\s+([\w\\]+);/m', $src, $nm)) {
+        $relDir = trim(str_replace([$libDir, '\\'], ['', '/'], $fi->getPath()), '/');
+        $expect = 'Vip' . ($relDir !== '' ? '\\' . str_replace('/', '\\', $relDir) : '');
+        if ($nm[1] !== $expect) { $badCase[] = $fi->getBasename() . " namespace={$nm[1]} 期望={$expect}"; }
+    }
+}
+T::eq([], $badCase, "★ {$nCls} 个类的类名/命名空间与路径大小写完全一致（Linux 区分大小写）");
 
 T::group('前端 —— hidden 属性不得被样式压过');
 
@@ -335,6 +526,13 @@ T::true(str_contains($localDbSrc, 'utf8mb4_unicode_ci'),
 $cronSrc = file_get_contents(__DIR__ . '/../../bin/cron.php');
 T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $cronSrc), 'cron.php 拒绝从网络访问');
 T::true((bool)preg_match('/flock\(/', $cronSrc), 'cron 有并发锁');
+
+$diagSrc = file_get_contents(__DIR__ . '/../../bin/diag.php');
+T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $diagSrc), 'diag.php 拒绝从网络访问');
+T::true(str_contains($diagSrc, '1045') && str_contains($diagSrc, '1044'),
+    'diag 能把 SQLSTATE 翻译成具体原因（页面提示是统一兜底，看不出是哪种）');
+T::true(str_contains($diagSrc, 'www-data'),
+    '★ diag 提醒用 Web 用户再跑一遍（MySQL 按来源主机授权，命令行能连不代表网页能连）');
 
 // ── 回归：数值参数不能直接取 $argv[2] ────────────────────────────
 // 用法是 `cron.php <任务> [天数] [-v]`，直接取 $argv[2] 会把 "-v"

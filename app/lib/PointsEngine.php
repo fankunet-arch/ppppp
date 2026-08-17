@@ -62,6 +62,7 @@ final class PointsEngine
                     'original_cents'  => 0,
                     'should_cents'    => 0,
                     'actual_cents'    => 0,
+                    'tax_cents'       => 0,
                     'order_end_time'  => (string)$r['order_end_time'],
                 ];
             }
@@ -70,6 +71,7 @@ final class PointsEngine
             $a['original_cents'] += Money::toCents($r['original_amount'] ?? '0');
             $a['should_cents']   += Money::toCents($r['should_amount']   ?? '0');
             $a['actual_cents']   += Money::toCents($r['actual_amount']   ?? '0');
+            $a['tax_cents']      += Money::toCents($r['tax_amount']      ?? '0');
             // 多张 check 取最晚的结账时间
             if ((string)$r['order_end_time'] > $a['order_end_time']) {
                 $a['order_end_time'] = (string)$r['order_end_time'];
@@ -320,9 +322,16 @@ final class PointsEngine
         int $shouldCents,
         int $actualCents,
         int $originalCents,
-        int $excludedCents
+        int $excludedCents,
+        int $taxCents = 0
     ): int {
         $base = min($shouldCents, $actualCents);
+        // 按不含税价积分时先把税额扣掉（points_include_tax=0）。
+        // 用 POS 给的真实 tax_amount，不硬编码税率 ——
+        // 实测该字段与实物小票的 SubTotal 完全吻合（docs/01 §2.11）。
+        if ($taxCents > 0 && $base > 0) {
+            $base = max(0, $base - Money::scale($taxCents, $base, max(1, min($shouldCents, $actualCents))));
+        }
         if ($base <= 0) {
             return 0;
         }

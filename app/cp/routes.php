@@ -258,7 +258,11 @@ $api->on('POST', '/rules/save', static function () use ($app, $requireAdmin): vo
 
 $api->on('GET', '/config', static function () use ($app, $requireManager): void {
     $requireManager();
-    Api::ok(['config' => $app->cfg()->all()]);
+    // 按业务分组返回，每项带中文标签与说明 —— 后台不再是一张平铺的 key-value 表
+    Api::ok([
+        'groups'      => \Vip\ConfigSchema::grouped($app->cfg()->all()),
+        'reward_text' => $app->rewards()->ruleText(),
+    ]);
 });
 
 $api->on('POST', '/config/save', static function () use ($app, $requireAdmin): void {
@@ -269,6 +273,11 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin): v
     if ($key === '') {
         Api::fail('bad_request');
     }
+    // 按 schema 校验，别让「几次送一次」被填成负数或文字
+    $err = \Vip\ConfigSchema::validate($key, $val);
+    if ($err !== null) {
+        Api::fail('bad_request', 400, ['hint' => $err]);
+    }
     $app->cfg()->set($key, $val);
     $app->audit()->log('config_save', [
         'target_type' => 'config', 'target_id' => $key,
@@ -276,6 +285,56 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin): v
         'detail' => ['value' => $val],
     ]);
     Api::ok(['key' => $key, 'value' => $val]);
+});
+
+// ════════════════════════════════════════════════════════════
+// 奖励券
+// ════════════════════════════════════════════════════════════
+
+$api->on('GET', '/coupons', static function () use ($app, $requireManager): void {
+    $requireManager();
+    $app->rewards()->expireStale();
+    $rows = $app->localDb()->all(
+        'SELECT c.id, c.code, c.source, c.status, c.valid_to, c.note,
+                c.redeemed_at, c.redeemed_serial_id, c.created_at,
+                m.card_no, m.phone
+           FROM coupon c
+           LEFT JOIN member m ON m.id = c.member_id AND m.store_code = c.store_code
+          WHERE c.store_code = ?
+          ORDER BY c.id DESC
+          LIMIT 200',
+        [$app->storeCode()]
+    );
+    Api::ok([
+        'rule'    => $app->rewards()->ruleText(),
+        'stats'   => $app->rewards()->stats(),
+        'coupons' => $rows,
+    ]);
+});
+
+/** 手工发一张券（补偿、投诉处理），必须写原因 */
+$api->on('POST', '/coupons/grant', static function () use ($app, $requireManager): void {
+    $op  = $requireManager();
+    $b   = Api::body();
+    $mid = Api::int($b, 'member_id', 0);
+    $note = Api::str($b, 'note', '') ?: '';
+    if ($mid <= 0 || trim($note) === '') {
+        Api::fail('bad_request', 400, ['hint' => '需要会员与发放原因']);
+    }
+    $r = $app->rewards()->grantManual($mid, $note, $op);
+    Api::fromResult($r, ['coupon' => $r['coupon'] ?? null]);
+});
+
+/** 作废一张券 */
+$api->on('POST', '/coupons/void', static function () use ($app, $requireManager): void {
+    $op  = $requireManager();
+    $b   = Api::body();
+    $cid = Api::int($b, 'id', 0);
+    $why = Api::str($b, 'reason', '') ?: '';
+    if ($cid <= 0 || trim($why) === '') {
+        Api::fail('bad_request', 400, ['hint' => '需要券与作废原因']);
+    }
+    Api::fromResult($app->rewards()->void($cid, $why, $op));
 });
 
 // ════════════════════════════════════════════════════════════
@@ -394,6 +453,48 @@ $api->on('POST', '/operators/create', static function () use ($app, $requireAdmi
         'detail' => ['login_name' => $login, 'role' => $role],
     ]);
     Api::ok(['id' => $id]);
+});
+
+/**
+ * 管理员重置他人 PIN（不需要旧 PIN）。
+ *
+ * 与 toggle 一样限管理员。会一并解掉连续失败锁定，
+ * 并作废该账号的全部会话 —— 忘记 PIN 的人通常已经试错到被锁了。
+ */
+$api->on('POST', '/operators/reset-pin', static function () use ($app, $requireAdmin): void {
+    $op  = $requireAdmin();
+    $b   = Api::body();
+    $id  = Api::int($b, 'id', 0);
+    $pin = (string)($b['new_pin'] ?? '');
+    if ($id <= 0 || $pin === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->auth()->resetPin($id, $pin, $op);
+    if (!($r['ok'] ?? false)) {
+        Api::fail((string)$r['error'], $r['error'] === 'not_found' ? 404 : 400);
+    }
+    Api::ok(['id' => $id]);
+});
+
+/**
+ * 改自己的 PIN（管理员与经理都可用；必须验旧 PIN）。
+ * 改完保留当前这条会话，其余会话作废。
+ */
+$api->on('POST', '/auth/change-pin', static function () use ($app, $requireManager): void {
+    // CP 只有经理以上能登录，这里用 requireManager 即可
+    // （本文件没有 requireOperator —— 守卫必须用本文件定义过的）
+    $op  = $requireManager();
+    $b   = Api::body();
+    $old = (string)($b['old_pin'] ?? '');
+    $new = (string)($b['new_pin'] ?? '');
+    if ($old === '' || $new === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->auth()->changePin((int)$op['id'], $old, $new, Api::readToken());
+    if (!($r['ok'] ?? false)) {
+        Api::fail((string)$r['error'], $r['error'] === 'invalid_credentials' ? 401 : 400);
+    }
+    Api::ok(['changed' => true]);
 });
 
 $api->on('POST', '/operators/toggle', static function () use ($app, $requireAdmin): void {

@@ -68,6 +68,20 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
 (@store,'pii_retention_years','3',@now),
   -- 末次消费后保留年限
 
+-- ── 奖励（N 送 1）★ 核心业务规则 ──────────────────────────
+(@store,'reward_enabled','1',@now),
+  -- 总开关。关掉后不再发券，已发的仍可核销。
+(@store,'reward_mode','visits',@now),
+  -- 门槛口径：visits=按次（集满 N 次送 1 次） / amount=按金额（累计消费满 X 元送 1 次）
+(@store,'reward_threshold_visits','10',@now),
+  -- 按次口径下的 N。改成 8 就是「八送一」，改完历史进度会自动重算。
+(@store,'reward_threshold_amount','300.00',@now),
+  -- 按金额口径下的 X（欧元）。
+(@store,'reward_auto_grant','1',@now),
+  -- 1=达标自动发券  0=只在后台提示，由人工发（适合想先人工把关的门店）
+(@store,'coupon_valid_days','90',@now),
+  -- 券有效期天数，0 = 永久有效。
+
 -- ── 按小票号查单 ──────────────────────────────────────────
 (@store,'invoice_lookup_max_days','7',@now),
   -- 小票 Factura Simplificada 号可回溯的最大天数（0 = 不限）。

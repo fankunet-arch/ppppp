@@ -32,6 +32,8 @@ final class Api
         'free_meal'              => '该订单已标记为免费餐，不积分',
         'redeemed'               => '该订单已使用十送一核销，本餐不计次不积分',
         'bad_invoice'            => '小票号无效，请核对 Factura Simplificada',
+        'pin_too_short'          => 'PIN 太短，至少 6 位',
+        'pin_unchanged'          => '新 PIN 不能与旧 PIN 相同',
         'zero_amount'            => '该订单金额为 0，不积分',
         'exceeds_total'          => '分配金额超过订单可积分总额',
         'exceeds_portions'       => '分配份数超过订单套餐份数',

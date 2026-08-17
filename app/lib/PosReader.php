@@ -39,7 +39,8 @@ final class PosReader implements PosSource
     {
         $limit = max(1, min($limit, PosDb::MAX_LIMIT));
         $sql = "SELECT serial_id, order_head_id, check_id, table_name, eat_type,
-                       customer_num, original_amount, should_amount, actual_amount, order_end_time
+                       customer_num, original_amount, should_amount, actual_amount,
+                       tax_amount, order_end_time
                 FROM history_order_head
                 WHERE order_end_time >= NOW() - INTERVAL ? MINUTE
                   AND table_name = ?
@@ -68,7 +69,8 @@ final class PosReader implements PosSource
     {
         $limit = max(1, min($limit, PosDb::MAX_LIMIT));
         $sql = "SELECT serial_id, order_head_id, check_id, table_name, eat_type,
-                       customer_num, original_amount, should_amount, actual_amount, order_end_time
+                       customer_num, original_amount, should_amount, actual_amount,
+                       tax_amount, order_end_time
                 FROM history_order_head
                 WHERE order_head_id = ?
                 ORDER BY check_id ASC
@@ -87,7 +89,8 @@ final class PosReader implements PosSource
         $limit  = max(1, min($limit, PosDb::MAX_LIMIT));
         $offset = max(0, $offset);
         $sql = "SELECT serial_id, order_head_id, check_id, table_name, eat_type,
-                       customer_num, original_amount, should_amount, actual_amount, order_end_time
+                       customer_num, original_amount, should_amount, actual_amount,
+                       tax_amount, order_end_time
                 FROM history_order_head
                 WHERE order_end_time >= ?
                   AND order_end_time <  ?
