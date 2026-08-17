@@ -185,7 +185,14 @@ php tests/smoke.php
 php tests/smoke.php --fresh --keep
 ```
 
-未设置环境变量时，回落到 `app/config/config.php` 的 `local_db`。
+未设置环境变量时，回落到 `app/config/config.php` 的 `local_db` ——
+那是生产库，别在上面加 `--fresh`。
+
+上面是 Linux/macOS 的 shell 语法；**Windows 下 `VAR=值 命令` 不成立**，
+PowerShell / cmd 的写法见 `docs/06` §5.1。
+
+这是命令行脚本，**不要放进 `wwwroot`**：它只在终端跑，且自带 CLI 守卫，
+被 HTTP 请求到会直接返回 404。
 
 ### 安全设计
 

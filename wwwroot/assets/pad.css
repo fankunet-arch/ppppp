@@ -293,3 +293,14 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
   background: #f2f4f7; padding: 1px 6px; border-radius: 5px;
   font-size: 0.95em; font-family: ui-monospace, Menlo, Consolas, monospace;
 }
+
+/* ── 奖励券提示（分配页每位会员下方）───────────────── */
+.reward-slot { margin-top: 6px; }
+.reward-has {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: #fff6e0; border: 1px solid #f0d9a8; border-radius: 8px;
+  padding: 5px 10px; font-size: 14px; color: #8a5a00;
+}
+.reward-has b { font-size: 16px; }
+.reward-progress { font-size: 12px; margin-top: 4px; }
+.card.reward-card { border: 2px solid #f0c14b; background: #fffaf0; }

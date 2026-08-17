@@ -355,6 +355,26 @@ foreach (['reward_mode' => '按次还是按金额',
     T::true(in_array($k, $schema, true), "★ 「{$what}」在后台可设（{$k}）");
 }
 
+T::group('券的有效期写在券上，不随规则变动');
+
+/**
+ * 硬性约定：客人拿到手的券，到期日不该再变。
+ * 发券当刻按当时的 coupon_valid_days 算出 valid_to 存进那一行；
+ * 之后店家把规则从 180 天改成 90 天，已发的券一律不受影响。
+ * 真库行为由 tests/smoke.php 验证，这里守住实现方式不被「优化」掉。
+ */
+$rwSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/Service/RewardService.php');
+T::true((bool)preg_match('/private function issue\(.*?\$validDays.*?\)/s', $rwSrc),
+    '发券时把有效期天数当参数传进去（而不是在里面读配置）');
+T::true((bool)preg_match('/INSERT INTO coupon.*?valid_to/s', $rwSrc),
+    '★ valid_to 在发券时就写进 coupon 行');
+T::true((bool)preg_match('/expireStale.*?valid_to IS NOT NULL AND valid_to <\s*\?/s', $rwSrc),
+    '★ 过期判定读券上的 valid_to，不读当前配置');
+T::false((bool)preg_match('/expireStale.*?coupon_valid_days/s', $rwSrc),
+    '★ 过期判定里没有出现 coupon_valid_days（否则改规则会波及老券）');
+T::false((bool)preg_match("/UPDATE coupon SET[^;]*valid_to\s*=/i", $rwSrc),
+    '★ 没有任何地方批量改写已发券的 valid_to');
+
 T::group('跨平台 —— Windows 与 Linux 都要能跑');
 
 /**
@@ -533,6 +553,39 @@ T::true(str_contains($diagSrc, '1045') && str_contains($diagSrc, '1044'),
     'diag 能把 SQLSTATE 翻译成具体原因（页面提示是统一兜底，看不出是哪种）');
 T::true(str_contains($diagSrc, 'www-data'),
     '★ diag 提醒用 Web 用户再跑一遍（MySQL 按来源主机授权，命令行能连不代表网页能连）');
+
+/**
+ * ★ 所有 CLI 脚本一律拒绝网络访问 —— 包括 /tests 下的。
+ *
+ * 「反正 /tests 在文档根之外」不是理由：文档根配错是真会发生的事，
+ * 守卫不能依赖部署时摆对了位置。没有守卫时，一次未认证的 GET 就会
+ * 连库跑流程并把库名/主机/版本打回页面。
+ *
+ * （实测 PHP 8.4：被查询串填充的是 $_SERVER['argv']，全局 $argv 不会，
+ *   所以 ?--fresh 当下触发不了 DROP TABLE；但把读法换成 $_SERVER['argv']
+ *   就通了 —— 守卫放在读参数之前，两种情况一起挡。）
+ */
+foreach (['smoke.php', 'run.php', 'e2e_pos.php'] as $t) {
+    $src = (string)file_get_contents(__DIR__ . '/../' . $t);
+    T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $src),
+        "★ tests/{$t} 拒绝从网络访问");
+}
+/**
+ * 守卫必须在【真正读 $argv】之前 —— 放在后面等于没放。
+ * 按 token 扫，不能按字符串找：注释里也会提到 $argv（本文件上面就提了），
+ * 用 strpos 会把注释当成读取，测试就白写了。
+ */
+$smokeToks = token_get_all((string)file_get_contents(__DIR__ . '/../smoke.php'));
+$sapiLine = $argvLine = 0;
+foreach ($smokeToks as $tk) {
+    if (!is_array($tk)) {
+        continue;
+    }
+    if ($sapiLine === 0 && $tk[0] === T_STRING   && $tk[1] === 'PHP_SAPI') { $sapiLine = $tk[2]; }
+    if ($argvLine === 0 && $tk[0] === T_VARIABLE && $tk[1] === '$argv')    { $argvLine = $tk[2]; }
+}
+T::true($sapiLine > 0 && $argvLine > 0 && $sapiLine < $argvLine,
+    "★ smoke.php 的 CLI 守卫在读 \$argv 之前（守卫 L{$sapiLine} / 首次读取 L{$argvLine}）");
 
 // ── 回归：数值参数不能直接取 $argv[2] ────────────────────────────
 // 用法是 `cron.php <任务> [天数] [-v]`，直接取 $argv[2] 会把 "-v"

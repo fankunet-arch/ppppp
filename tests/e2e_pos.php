@@ -215,6 +215,45 @@ foreach ($live as $l) {
     $byTable[$l['table']][] = $l;
 }
 
+/**
+ * ★ 夹具保鲜检查 —— 必须在跑断言之前。
+ *
+ * 下面的定位断言全都走 findRecentByTable(..., 30, ...)，即
+ * `order_end_time >= NOW() - INTERVAL 30 MINUTE`。
+ * inject_live.php 把订单克隆到「注入那一刻的前几分钟」，所以夹具只有
+ * 大约半小时的保质期 —— 注入完隔一小时再跑，订单就整批掉出窗口。
+ *
+ * 不检查的话，表现是「桌号 23 期望 4 实得 0」这种红字，看上去像聚合逻辑
+ * 出了 bug，实际只是夹具过期。为这个白查一遍代码非常费时间，所以宁可
+ * 在这里花一条查询把话说清楚。
+ */
+/**
+ * 只看定位断言真正依赖的这几张桌 —— 不能拿「所有注入单里最老的一张」来判。
+ * 注入器故意把最老的一单放在正好 30 分钟前（桌 21，用于更宽窗口的补抓测试），
+ * 一刀切会让本检查在刚注入完时就误报过期。
+ *
+ * 桌 Llevar 也要在窗口内：它的断言是「取回 0 行」，一旦老出窗口，
+ * 这条断言会因为夹具没了而通过 —— 通过得毫无意义，比失败更糟。
+ */
+$needFresh = ['30', '23', '15', 'Llevar'];
+$staleMsg  = [];
+foreach ($needFresh as $t) {
+    $a = $posDb->select(
+        'SELECT TIMESTAMPDIFF(MINUTE, MIN(order_end_time), NOW()) AS age
+           FROM history_order_head
+          WHERE order_head_id >= 900000 AND table_name = ? LIMIT 1', [$t], 's');
+    $age = $a[0]['age'] ?? null;
+    if ($age === null || (int)$age >= 30) {
+        $staleMsg[] = $age === null ? "桌 {$t} 未注入" : "桌 {$t} 已 {$age} 分钟";
+    }
+}
+if ($staleMsg) {
+    bad_('模拟活单已过期：' . implode('，', $staleMsg) . '，超出 30 分钟定位窗口',
+        "这不是代码问题，是夹具过期 —— 注入后约 12 分钟内有效。请重新注入再跑：\n"
+      . "        SIM_USER=sim_admin SIM_PASS=... php tests/sim/inject_live.php");
+    goto finish;
+}
+
 $rows30 = $pos->findRecentByTable('30', 30, 20);
 is_(count($rows30) >= 1, '桌号 30 能定位到活单');
 $agg30 = PointsEngine::aggregateCandidates($rows30);
@@ -229,9 +268,15 @@ $rows23 = $pos->findRecentByTable('23', 30, 20);
 $agg23  = PointsEngine::aggregateCandidates($rows23);
 eq_(4, count($rows23), '桌号 23 取回 4 行 head（4 张 check）');
 eq_(1, count($agg23),  '★ 4 张 check 聚合为 1 张订单（AA 分单不会被当成 4 单）');
-$o23 = reset($agg23);
-eq_(4, count($o23['check_ids']), '聚合结果保留了全部 4 个 check_id');
-eq_('75.86', Money::toStr($o23['actual_cents']), '★ 分单金额按 check 累加 = 75.86');
+// 上一条断言失败时 reset() 会返回 false —— 直接下标取值会抛 TypeError，
+// 把后面几十条断言全打断，反而看不出问题范围。取不到就跳过这两条。
+$o23 = $agg23 ? reset($agg23) : null;
+if ($o23 === null) {
+    bad_('桌号 23 聚合结果为空，跳过其明细断言');
+} else {
+    eq_(4, count($o23['check_ids']), '聚合结果保留了全部 4 个 check_id');
+    eq_('75.86', Money::toStr($o23['actual_cents']), '★ 分单金额按 check 累加 = 75.86');
+}
 
 // 同桌翻台：两张不同订单必须分开
 $rows15 = $pos->findRecentByTable('15', 30, 20);

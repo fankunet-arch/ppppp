@@ -242,7 +242,15 @@ CREATE TABLE `coupon` (
 `idx_member_status (store_code, member_id, status)` 供 Pad 每次选中会员时
 快速查「有几张可用券」,这是高频查询。
 
-### 5.2 过期不靠定时任务
+### 5.2 `valid_to` 是快照，不是派生值
+
+发券当刻按当时的 `coupon_valid_days` 算好写进这一行。改配置**只影响以后发的券**，
+已发的一律不动；`expireStale()` 也只比较券上的 `valid_to`。
+
+因此 `coupon` 表里绝不该出现「按当前配置批量改写 valid_to」的语句 ——
+那会让老客人手里的券凭空缩水或延长。测试里有断言守着这一点。
+
+### 5.3 过期不靠定时任务
 
 `expireStale()` 在每次查券时顺手把 `valid_to < 今天` 的置为已过期。
 不单开 Cron 任务 —— 券的过期不需要即时性，查的时候顺带处理即可。
