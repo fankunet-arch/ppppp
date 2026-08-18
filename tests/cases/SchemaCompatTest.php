@@ -451,7 +451,14 @@ foreach ($itLib as $fi) {
         $badCase[] = $fi->getBasename() . ' 里是 ' . $m[1];
     }
     // 命名空间要对应目录
-    if (preg_match('/^namespace\s+([\w\\]+);/m', $src, $nm)) {
+    /**
+     * ★ 这里必须写四个反斜杠。
+     *   单引号串里 '\\' 只是【一个】反斜杠，正则会变成 ([\w\]+) ——
+     *   \] 把右括号转义掉，字符类永不闭合，preg_match 直接编译失败返回 false。
+     *   于是这段命名空间检查一直在空跑，谁都没发现（Linux 上 display_errors
+     *   关着，警告都看不到；在 Windows 上跑才把它暴露出来）。
+     */
+    if (preg_match('/^namespace\s+([\w\\\\]+);/m', $src, $nm)) {
         $relDir = trim(str_replace([$libDir, '\\'], ['', '/'], $fi->getPath()), '/');
         $expect = 'Vip' . ($relDir !== '' ? '\\' . str_replace('/', '\\', $relDir) : '');
         if ($nm[1] !== $expect) { $badCase[] = $fi->getBasename() . " namespace={$nm[1]} 期望={$expect}"; }
