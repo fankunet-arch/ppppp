@@ -20,7 +20,9 @@ final class AlertRepo
             [
                 $this->storeCode, $type, $opt['severity'] ?? 1,
                 $opt['ref_type'] ?? null, $opt['ref_id'] ?? null,
-                mb_substr($message, 0, 500),
+                // 不用 mb_substr：缺 mbstring 时会直接抛 Error 而不是少截几个字。
+                // 500 是列宽上限，按字节截断即可（utf8mb4 下最多浪费几个字节）。
+                function_exists('mb_substr') ? mb_substr($message, 0, 500) : substr($message, 0, 500),
                 isset($opt['detail']) ? json_encode($opt['detail'], JSON_UNESCAPED_UNICODE) : null,
                 $this->db->now(),
             ]

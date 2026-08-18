@@ -47,7 +47,7 @@ GRANT ALL ON sim_coolroid.* TO 'sim_admin'@'127.0.0.1';
 
 ### 2.4 灌真实数据
 
-主库结构取自 `pdb/192_168_2_40 (1).sql`（190 张表，剥掉
+主库结构取自 `pdb/pos_schema.sql`（190 张表，剥掉
 `DROP/CREATE DATABASE`、`USE` 三行后导入 `sim_coolroid`）。
 数据只取 `INSERT` 语句，**保留主库的权威表结构**（已核对：
 导出件与主库的 `history_order_head` / `history_order_detail` 定义逐字节相同）。
@@ -118,11 +118,11 @@ php tests/sim/inject_live.php --clean     # 清除克隆件
 php bin/init.php check          # 环境自检（含主库时钟偏差）
 php bin/init.php migrate        # 增量迁移，已应用的不重跑
 php bin/init.php seed
-php bin/init.php admin admin 管理员
+php bin/init.php repair         # 或分步：migrate + seed（含默认账号）
 
-php tests/run.php               # 纯逻辑，208 项断言，不需要数据库
-php tests/smoke.php --fresh     # 真本地库 + FakePos，100 项断言
-php tests/e2e_pos.php           # 真 POS + 真本地库，75 项断言
+php tests/run.php               # 纯逻辑，512 项断言，不需要数据库
+php tests/smoke.php --fresh     # 真本地库 + FakePos，146 项断言
+php tests/e2e_pos.php           # 真 POS + 真本地库，95 项断言
 php bin/cron.php nightly -v     # 夜间全套跑在真实数据上
 ```
 

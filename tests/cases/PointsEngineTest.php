@@ -386,3 +386,34 @@ T::eq(2, PE::redeemedPortions(2380, [1190, 2380]),
 // ④ 向上取整的方向必须是「免费份数变多」
 T::true(PE::redeemedPortions(2400, [2390]) >= 1,
     '★ 略高于一份的核销额至少算 1 份免费，不能算 0 份');
+
+T::group('核销识别不依赖 mbstring');
+
+/**
+ * 现场事故：Windows 上没开 mbstring，于是每张带折扣行的单
+ * 一查就抛 "Call to undefined function Vip\mb_strtoupper()"，
+ * 界面只显示「系统内部错误」，查了好几轮才定位到。
+ *
+ * 核销模式全是 ASCII，本来就不需要多字节转换。
+ * 积分算得对不对，不该取决于某个可选扩展装没装。
+ */
+// 按 token 扫，不能按字符串找 —— 上面那段说明里就写着 mb_strtoupper，
+// 用 preg_match 会把注释当成调用（这个坑本项目已经踩过一次）。
+$peCalls = [];
+foreach (token_get_all((string)file_get_contents(__DIR__ . '/../../app/lib/PointsEngine.php')) as $tk) {
+    if (is_array($tk) && $tk[0] === T_STRING && str_starts_with($tk[1], 'mb_')) {
+        $peCalls[] = $tk[1];
+    }
+}
+T::eq([], $peCalls,
+    '★ PointsEngine 里不出现任何 mb_* 调用（缺扩展时会直接抛 Error）'
+    . ($peCalls ? '，实际有：' . implode('、', $peCalls) : ''));
+T::true(PE::isRedeemLine('TARJETA 10+1'), 'TARJETA 10+1 是核销');
+T::true(PE::isRedeemLine('tarjeta 10+1'), '大小写不敏感');
+T::false(PE::isRedeemLine('CUPON DE 5 EUROS'), '★ 满50减5 纸质券不是核销');
+T::false(PE::isRedeemLine('Dto. -15%'), '普通折扣不是核销');
+T::false(PE::isRedeemLine('MENÚ INFINITY NOCHE'), '带多字节字符不误判也不报错');
+
+// 业务路径上的其它 mb_* 也要有回落
+T::true(str_contains((string)file_get_contents(__DIR__ . '/../../app/lib/Repo/AlertRepo.php'), "function_exists('mb_substr')"),
+    'AlertRepo 的截断有 mb_substr 缺失回落（告警写入在业务路径上）');

@@ -341,7 +341,16 @@ function doRepair(App $app, array $config): void
 
     // ── 1. PHP 扩展 ──────────────────────────────────────
     head('1/5 PHP 扩展');
-    foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读'] as $ext => $why) {
+    /**
+     * ★ 必须把【全部】必需扩展列全。
+     *   实测踩过：这里原先只查 pdo_mysql 与 mysqli，漏了 mbstring，
+     *   于是 repair 报「全部就绪」，而现场每张带折扣行的单一查就抛
+     *   Call to undefined function mb_strtoupper() —— 界面只显示
+     *   「系统内部错误」，查了好几轮。自检漏一项，等于把故障推到线上。
+     */
+    foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读',
+              'mbstring'  => '多字节字符串', 'json' => 'JSON',
+              'openssl'   => '登录令牌'] as $ext => $why) {
         if (extension_loaded($ext)) {
             ok("{$ext}（{$why}）");
         } else {
