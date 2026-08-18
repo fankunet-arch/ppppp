@@ -92,7 +92,8 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 明细里 menu_item_id = -2 的折扣行，名称命中这些子串（忽略大小写）
   -- 即判定为「十送一核销」，该单不计次不积分。逗号分隔，留空用内置默认。
   -- 实测 -2 折扣行共 4 种名称，只有 TARJETA 10+1 是核销；
-  -- Dto. -20% / CUPON DE 5 EUROS / Dto% 是普通折扣，绝不能误判。
+  -- CUPON DE 5 EUROS（满50减5 纸质券）/ Dto% / Dto. -15% 都是普通折扣，绝不能误判。
+  -- 名称会随店家调整而变（Dto. -20% 已被 Dto. -15% 取代），所以做成可配置。
 
 ON DUPLICATE KEY UPDATE
   `config_value` = VALUES(`config_value`),

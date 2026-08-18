@@ -118,7 +118,7 @@ CREATE TABLE `point_ledger` (
   `amount`          DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '本次计入的消费金额（冲正为负）',
   `points`          INT NOT NULL DEFAULT 0           COMMENT '本次积分变动（冲正为负）',
   `counted_visit`   SMALLINT NOT NULL DEFAULT 0      COMMENT '本条计入的次数（冲正为负值）',
-  `portions_counted`   SMALLINT NOT NULL DEFAULT 0   COMMENT '份数快照：counts_visit=1 菜品的 SUM(quantity)',
+  `portions_counted`   SMALLINT NOT NULL DEFAULT 0   COMMENT '份数快照：counts_visit=1 的 SUM(quantity)，已扣除券抵掉的份数',
   `portions_uncounted` SMALLINT NOT NULL DEFAULT 0   COMMENT '份数快照：counts_visit=0 的套餐份数（DEL DIA / 儿童套餐等）',
   `excluded_amount` DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT 'earns_points=0 的项被扣除的金额',
 
@@ -192,6 +192,15 @@ id=102  member=A  serial_id=2608130080  entry_type=2  amount=-53.70  points=-53 
 | 只点单品无套餐 | 0 | 0 | **0**（金额照常积分） |
 
 `portions_counted` / `portions_uncounted` 为快照字段，用于事后审计与口径切换时的重算。
+
+🔴 **`portions_counted` 存的是【净】份数，不是明细里的原始份数。**
+含十送一核销的订单，被券抵掉的那几份已经在写库前扣除
+（抵掉几份从核销额反推，见 `03` §5.5）。这样设计的好处是
+分配上限与计次口径天然一致 —— `validateAllocations` 直接用这个数就对了，
+不必在每个调用点重复减一次。
+
+举例：一桌 4 份、券抵 1 份 → 本字段存 **3**，明细里的 4 份不再出现在本表。
+需要原始份数时看 POS 明细，或看 locate 返回的 `portions_total`。
 
 > 📌 **已确认采用 `by_portion`**：整单记一人时 3 份套餐 = +3 次，3 人同行来 4 次即可换 1 份免费餐，此商业影响已知悉并接受。备用口径 `by_ledger`（每笔流水最多 1 次）保留在配置中，`portions_counted` 快照支持切换后重算历史数据。
 
