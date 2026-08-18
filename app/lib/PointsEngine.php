@@ -397,10 +397,23 @@ final class PointsEngine
 
     public static function isRedeemLine(string $name, array $patterns = self::REDEEM_PATTERNS): bool
     {
-        $n = mb_strtoupper(trim($name));
+        /**
+         * ★ 用 stripos 而不是 mb_strtoupper + str_contains。
+         *
+         *   核销模式全是 ASCII（TARJETA 10+1），不需要多字节大小写转换；
+         *   UTF-8 的多字节序列里也绝不会出现 ASCII 字节，所以按字节找子串
+         *   不会误命中。
+         *
+         *   更要紧的是【不能依赖 mbstring】：现场 Windows 上没开这个扩展，
+         *   于是每张带折扣行的单一查就抛
+         *   「Call to undefined function Vip\mb_strtoupper()」——
+         *   界面只显示「系统内部错误」。积分算得对不对，不该取决于
+         *   某个可选扩展装没装。
+         */
+        $n = trim($name);
         foreach ($patterns as $p) {
-            $p = mb_strtoupper(trim((string)$p));
-            if ($p !== '' && str_contains($n, $p)) {
+            $p = trim((string)$p);
+            if ($p !== '' && stripos($n, $p) !== false) {
                 return true;
             }
         }
