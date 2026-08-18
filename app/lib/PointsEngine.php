@@ -341,25 +341,50 @@ final class PointsEngine
     /**
      * 核销额抵掉了几份计次套餐。
      *
+     * ★ 不能假设「核销额恒为本单套餐单价的整数倍」。
+     *   39 天样本里 25 张核销单，只有 21 张能整除：
+     *     · 90216  9 份全是 25.90，核销 47.80 = 23.90 × 2
+     *     · 91095  5 份全是 23.90，核销 25.90
+     *   —— 券是按【当初攒够时的价位】计的，与本次用餐价位可以不同
+     *   （平日 23.90 / 周末 25.90 / 午市 18.90 …）。
+     *     · 91863  核销 11.00，任何套餐价都除不尽。
+     *
+     * 所以分两级：
+     *   ① 能被本单某一个单价整除，且只有一个单价能整除 → 就用它（高置信）
+     *   ② 否则按【本单最低单价】向上取整 —— 把免费份数往多了算，
+     *      也就是把计次往少了给。宁可少给也不能多给：多给等于白送一顿饭。
+     *
+     * 向上取整为什么安全：真实免费份数 = 核销额 ÷ 券的价位。
+     * 券价位低于本单价位时，ceil 得到的份数 ≥ 真实份数；
+     * 券价位高于本单价位时更是如此。两个方向都不会少算免费份数。
+     *
      * @param int   $redeemCents 核销折扣额（正数，分）
      * @param int[] $unitPrices  本单计次套餐出现过的单价（分）
-     * @return int|null 份数；无法可靠判定时返回 null（上层按保守口径处理）
+     * @return int|null 份数；完全无从判断时返回 null（上层按整单不计次处理）
      */
     public static function redeemedPortions(int $redeemCents, array $unitPrices): ?int
     {
         if ($redeemCents <= 0) {
             return 0;
         }
-        // 单价不唯一 → 不知道券抵的是哪一种套餐，不猜
-        if (count($unitPrices) !== 1) {
-            return null;
+        $units = array_values(array_filter(array_map('intval', $unitPrices), fn(int $u): bool => $u > 0));
+        if (!$units) {
+            return null;   // 本单没有任何带价的计次套餐，无从判断
         }
-        $unit = (int)$unitPrices[0];
-        if ($unit <= 0 || $redeemCents % $unit !== 0) {
-            // 不能整除 → 不是「整份免单」，可能是别的折扣被误判成核销，不猜
-            return null;
+
+        // ① 精确整除：只有一个单价能整除时才采信，多个都能整除说明有歧义
+        $exact = [];
+        foreach ($units as $u) {
+            if ($redeemCents % $u === 0) {
+                $exact[] = intdiv($redeemCents, $u);
+            }
         }
-        return intdiv($redeemCents, $unit);
+        if (count(array_unique($exact)) === 1) {
+            return $exact[0];
+        }
+
+        // ② 保守回落：按最低单价向上取整，免费份数只多不少
+        return (int)ceil($redeemCents / min($units));
     }
 
     public static function isRedeemLine(string $name, array $patterns = self::REDEEM_PATTERNS): bool
