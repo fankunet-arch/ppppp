@@ -245,8 +245,15 @@ $fakeSrc = file_get_contents(__DIR__ . '/../../tests/FakePosSource.php');
 T::true(str_contains($fakeSrc, 'findByInvoice'), 'FakePosSource 实现了 findByInvoice（否则冒烟测试无法注入）');
 
 $entrySrc = file_get_contents(__DIR__ . '/../../wwwroot/api.php');
-T::true((bool)preg_match('/catch\s*\(\s*\\\\?PDOException/', $entrySrc),
-    '入口顶层捕获 PDOException → 返回 db_unavailable 而非空响应体');
+/**
+ * 守的是【行为】不是写法：路由注册阶段抛异常时也必须产出 JSON，
+ * 且本地库不可达要给 db_unavailable 而非空响应体。
+ * 现在统一走 Api::bootFail()，由它区分 PDOException 并带上错误代码。
+ */
+T::true((bool)preg_match('/catch\s*\(\s*\\\\?Throwable/', $entrySrc),
+    '入口顶层兜底捕获（否则客户端只收到空响应体，无从排障）');
+T::true(str_contains($entrySrc, 'bootFail'),
+    '入口走 Api::bootFail —— 带分类码与事件号，且本地库不可达仍给 db_unavailable');
 T::true((bool)preg_match('/catch\s*\(\s*\\\\?Throwable/', $entrySrc),
     '入口顶层捕获 Throwable → 任何异常都产出 JSON');
 
@@ -509,8 +516,8 @@ foreach (['/rules/save', '/config/save', '/members/erase', '/operators/create', 
 }
 
 $cpEntry = file_get_contents(__DIR__ . '/../../wwwroot/cp/api.php');
-T::true((bool)preg_match('/catch\s*\(\s*\\\\?PDOException/', $cpEntry),
-    'CP 入口捕获 PDOException');
+T::true((bool)preg_match('/catch\s*\(\s*\\\\?Throwable/', $cpEntry), 'CP 入口顶层兜底捕获');
+T::true(str_contains($cpEntry, 'bootFail'), 'CP 入口同样走 Api::bootFail');
 
 // CP 不得直接查 POS 主库 —— 后台的数据一律来自本地镜像
 T::false((bool)preg_match('/posReader\(\)|history_order_head|history_order_detail/', $cpSrc),
@@ -587,6 +594,43 @@ foreach ($smokeToks as $tk) {
 T::true($sapiLine > 0 && $argvLine > 0 && $sapiLine < $argvLine,
     "★ smoke.php 的 CLI 守卫在读 \$argv 之前（守卫 L{$sapiLine} / 首次读取 L{$argvLine}）");
 
+/**
+ * ★ 明细读取必须能回落到活单表 order_detail。
+ *
+ * 实测该店 history_order_detail 明显落后于 history_order_head
+ * （订单头到 2026-08-17，历史明细只到 08-13），刚结账的单因此
+ * 「有头无明细」，套餐份数恒为 0 —— 桌号查与小票查都一样，
+ * 因为两条路都走 buildContext() 读同一张表。
+ * 去掉回落就会让最近的单永远算不出份数。
+ */
+$prSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/PosReader.php');
+T::true(str_contains($prSrc, "str_replace('FROM history_order_detail', 'FROM order_detail'"),
+    '★ fetchDetail 在历史表查不到时回落读活单表 order_detail');
+T::true((bool)preg_match('/if\s*\(\s*\$rows\s*!==\s*\[\]\s*\)/', $prSrc),
+    '回落只在历史表【真的没有】时触发，不是每次都查两张表');
+T::true(str_contains($prSrc, 'detailFallback'),
+    '回落可通过 pos_detail_fallback 关掉（活单表无索引，POS 变慢时要能立刻停）');
+
+$exCfg = (string)file_get_contents(__DIR__ . '/../../app/config/config.example.php');
+T::true(str_contains($exCfg, 'pos_detail_fallback'),
+    'config.example.php 里有 pos_detail_fallback 说明（否则现场不知道有这个开关）');
+
+/**
+ * ★ 假对象的明细过滤必须与 PosReader 一致 —— 否则测试会「假通过」。
+ *
+ * 实测踩过：PosReader 改成 (menu_item_id > 0 OR menu_item_id = -2) 之后，
+ * FakePosSource 仍按 menu_item_id <= 0 一刀切，把 -2 折扣伪行全丢掉。
+ * 后果不是少测一点，而是【十送一核销识别在冒烟测试里永远走不到】，
+ * 连「纸质券不得被误判成核销」这种断言都会因为行被丢掉而假通过 ——
+ * 比没有测试更糟：它给出的是虚假的安全感。
+ */
+$fakeSrc = (string)file_get_contents(__DIR__ . '/../FakePosSource.php');
+T::true(str_contains($fakeSrc, 'PSEUDO_DISCOUNT'),
+    '★ FakePosSource 保留 -2 折扣伪行（与 PosReader 的 SQL 过滤一致）');
+$readerSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/PosReader.php');
+T::true(str_contains($readerSrc, 'menu_item_id = {$pseudoDiscount}'),
+    'PosReader 的明细 SQL 确实保留 -2 行（假对象照的就是它）');
+
 // ── 回归：数值参数不能直接取 $argv[2] ────────────────────────────
 // 用法是 `cron.php <任务> [天数] [-v]`，直接取 $argv[2] 会把 "-v"
 // 当天数，(int)"-v" = 0 → 完整性监控一天都不查却报成功（静默失效）。
@@ -613,3 +657,68 @@ if (is_file(__DIR__ . '/../../app/config/config.php')) {
     T::eq($d3, $d3v,  '天数在 -v 之前可用');
     T::eq($d3, $d3r,  '天数在 -v 之后同样可用');
 }
+
+T::group('错误代码分类 —— 收银员能念出来、日志能对上');
+
+/**
+ * 现场只能看到一句话时，排查方向全靠这个分类码。
+ * 分类粒度按【该去查哪里】定，不是按异常类名：
+ *   E1xx 本地库   E2xx POS 主库   E3xx 代码/参数
+ *
+ * PDOException 那几档需要真实的 errorInfo，放在 tests/smoke.php 用真库验；
+ * 这里覆盖能直接构造的分支。
+ */
+class_exists('Vip\\PosDb');   // PosUnavailable 定义在 PosDb.php 里，先触发加载
+
+/**
+ * ★ 连接类故障不能只看 SQLSTATE —— 实测端口不通 / 主机不可达 / 库不存在 /
+ *   口令错，四种需要完全不同修法的故障，SQLSTATE 全是 HY000。
+ *   只有驱动错误码能区分，都归一个码等于没分类。
+ *   （现场 E101 那次就是这么发现的。）
+ */
+$pdo = static function (string $msg, ?array $info = null): PDOException {
+    $e = new PDOException($msg);
+    return $e;   // errorInfo 为空时，classify 会从消息里取 [nnnn]
+};
+T::eq('E101', \Vip\Http\Api::classify($pdo('SQLSTATE[HY000] [2002] Connection refused')),
+    '★ 2002 连不上 → E101（服务没起 / 端口错 / 主机不可达）');
+T::eq('E105', \Vip\Http\Api::classify($pdo("SQLSTATE[HY000] [1045] Access denied for user 'u'@'h'")),
+    '★ 1045 口令错或来源主机没授权 → E105（与 E101 分开，修法完全不同）');
+T::eq('E107', \Vip\Http\Api::classify($pdo("SQLSTATE[HY000] [1044] Access denied for user 'u' to database 'x'")),
+    '★ 1044 库不存在或无权限 → E107');
+T::eq('E108', \Vip\Http\Api::classify($pdo('SQLSTATE[HY000] [1040] Too many connections')),
+    '1040 连接数打满 → E108');
+T::eq('E106', \Vip\Http\Api::classify($pdo('could not find driver')),
+    '★ pdo_mysql 没装 → E106（现场早先真踩过这个）');
+T::true(str_contains((string)file_get_contents(__DIR__ . '/../../app/lib/Http/Api.php'),
+    "preg_match('/\\[(\\d{4})\\]/'"),
+    '★ errorInfo 为空时从消息里取驱动码（连接阶段的异常常常没有 errorInfo）');
+
+T::eq('E201', \Vip\Http\Api::classify(new \Vip\PosUnavailable('POS 主库连接失败: timeout')),
+    'POS 不可达 → E201');
+T::eq('E203', \Vip\Http\Api::classify(new LogicException('POS 查询必须带 LIMIT（铁律 2）')),
+    'POS 护栏拦截 → E203');
+T::eq('E202', \Vip\Http\Api::classify(new RuntimeException('POS 查询 prepare 失败: Unknown column')),
+    '★ POS prepare 失败 → E202（SQL 引用了主库上没有的列，最难猜的一种）');
+T::eq('E209', \Vip\Http\Api::classify(new RuntimeException('别的运行时错误')),
+    '非 POS 的 RuntimeException → E209');
+T::eq('E301', \Vip\Http\Api::classify(new TypeError('must be of type string, null given')),
+    '类型错误 → E301');
+T::eq('E301', \Vip\Http\Api::classify(new ValueError('bad value')), '取值错误 → E301');
+T::eq('E309', \Vip\Http\Api::classify(new Exception('boom')), '未归类 → E309');
+
+/**
+ * ★ PosUnavailable 继承 RuntimeException，判断顺序必须在它之前 ——
+ *   顺序反了的话 POS 掉线会被归成 E202，方向指错。
+ */
+$apiSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/Http/Api.php');
+T::true(strpos($apiSrc, 'PosUnavailable') < strpos($apiSrc, 'instanceof \\RuntimeException'),
+    '★ PosUnavailable 的判断在 RuntimeException 之前（它是子类，顺序反了会归错档）');
+T::true(str_contains($apiSrc, '错误代码'),
+    '错误代码直接拼进给收银员看的提示语（拍照就能带出来）');
+T::true(str_contains($apiSrc, 'bin2hex(random_bytes(3))'),
+    '每次故障有独立事件号，日志里能精确定位到那一次');
+T::eq(3, substr_count($apiSrc, "instanceof \\PDOException"),
+    '★ classify / dispatch / bootFail 三处都区分 PDOException（本地库不可达要给 503 db_unavailable）');
+T::false(str_contains($apiSrc, 'getTraceAsString'),
+    '★ 绝不把堆栈吐给客户端 —— 只给代码，细节留在服务器日志里');

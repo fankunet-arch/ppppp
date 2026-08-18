@@ -1,0 +1,416 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * ════════════════════════════════════════════════════════════════
+ * 「为什么 Pad 上找不到这张单」——现场诊断
+ *
+ * 用法：
+ *   php bin/why.php 30              查桌号 30
+ *   php bin/why.php 30 240          把回溯范围放宽到 240 分钟再看
+ *   php bin/why.php --invoice 92610 按小票上的 Factura Simplificada 号查
+ *                                   （与 Pad 上输小票号完全同一条路）
+ *   php bin/why.php --ref E202-7F3A21  按界面上的错误代码翻日志，
+ *                                   直接捞出那一次的完整异常
+ *
+ * Pad 的定位条件有四条，任何一条不满足就查不到，而界面上一律显示
+ * 「未找到」，看不出是被哪一条挡的。本脚本逐条检验并直说结论：
+ *
+ *   ① 单必须已经【结账】—— 未结账的活单在 order_head，不在 history_order_head
+ *   ② order_end_time 必须落在时间窗内（order_lookup_window_min，默认 30 分钟）
+ *   ③ eat_type 必须是 0（堂食）—— 外带/自取按设计就不该在 Pad 上发分
+ *   ④ table_name 必须完全相等 —— 大小写、空格、前缀都算数
+ *
+ * ★ 全程只读，只发 SELECT，且都带 LIMIT。
+ * ════════════════════════════════════════════════════════════════
+ */
+
+if (PHP_SAPI !== 'cli') {
+    http_response_code(404);
+    exit;
+}
+
+$args    = array_slice($argv, 1);
+$invoice = 0;
+foreach ($args as $i => $a) {
+    if ($a === '--invoice' || $a === '-i') {
+        $invoice = (int)($args[$i + 1] ?? 0);
+        unset($args[$i], $args[$i + 1]);
+        break;
+    }
+}
+$args = array_values($args);
+
+/**
+ * ── 按错误代码翻日志 ──────────────────────────────────
+ * 收银员报来 E202-7F3A21，这里直接把那一次的完整异常捞出来。
+ * 单独做一个入口是因为 Windows 上没有 grep，而现场多半就是 Windows。
+ */
+$ref = '';
+foreach ($args as $i => $a) {
+    if ($a === '--ref' || $a === '-r') {
+        $ref = strtoupper((string)($args[$i + 1] ?? ''));
+        break;
+    }
+}
+if ($ref !== '') {
+    $cfg = require __DIR__ . '/../app/bootstrap.php';
+    $log = rtrim((string)ini_get('error_log'));
+    if ($log === '' || !is_file($log)) {
+        exit("找不到日志文件（error_log = " . ($log ?: '未设置') . "）\n");
+    }
+    echo "在 {$log} 里找 {$ref}\n\n";
+    $hit = 0;
+    foreach (file($log) ?: [] as $line) {
+        if (stripos($line, $ref) !== false) {
+            echo '  ' . rtrim($line) . "\n";
+            $hit++;
+        }
+    }
+    if ($hit === 0) {
+        echo "  没找到。日志可能已轮转，或代码抄错了（形如 E202-7F3A21）。\n";
+        echo "  最近 3 条故障记录：\n";
+        $all = array_values(array_filter(file($log) ?: [],
+            static fn(string $l): bool => (bool)preg_match('/\b[BE]\d{3}-[0-9A-F]{6}\b/', $l)));
+        foreach (array_slice($all, -3) as $l) {
+            echo '  ' . rtrim($l) . "\n";
+        }
+    }
+    exit(0);
+}
+
+$table = $args[0] ?? '';
+if ($table === '' && $invoice <= 0) {
+    exit("用法：php bin/why.php <桌号> [回溯分钟数]\n"
+       . "     php bin/why.php --invoice <小票号>   按 Factura Simplificada 查\n"
+       . "例：php bin/why.php 30\n     php bin/why.php --invoice 92610\n");
+}
+$look = isset($args[1]) && ctype_digit($args[1]) ? (int)$args[1] : 0;
+
+$config = require __DIR__ . '/../app/bootstrap.php';
+
+use Vip\App;
+
+$app = new App($config);
+$db  = $app->posDb();
+// 时间窗取自后台配置；本地库连不上时回落到默认值，不让诊断本身挂掉
+try {
+    $win = $look > 0 ? $look : $app->cfg()->int('order_lookup_window_min', 30);
+} catch (Throwable $e) {
+    $win = $look > 0 ? $look : 30;
+    echo "\033[33m（读不到后台配置，时间窗按默认 30 分钟算：{$e->getMessage()}）\033[0m\n";
+}
+
+function h(string $t): void { echo "\n\033[1m{$t}\033[0m\n"; }
+function ok_(string $m): void { echo "  \033[32m✓\033[0m {$m}\n"; }
+function no_(string $m): void { echo "  \033[31m✗\033[0m {$m}\n"; }
+function tip(string $m): void { echo "    \033[33m→ {$m}\033[0m\n"; }
+
+try {
+    // ── 时钟 ─────────────────────────────────────────────
+    h('时钟');
+    $t = $db->select('SELECT NOW() AS n, @@global.time_zone AS gz, @@session.time_zone AS sz LIMIT 1')[0];
+    printf("  POS 服务器时间 %s（时区 %s / 会话 %s）\n", $t['n'], $t['gz'], $t['sz']);
+    printf("  本机 PHP 时间   %s（%s）\n", date('Y-m-d H:i:s'), date_default_timezone_get());
+    $skew = abs(strtotime($t['n']) - time());
+    if ($skew > 120) {
+        no_(sprintf('两边相差 %d 分钟', (int)round($skew / 60)));
+        tip('定位比的是 POS 服务器自己的 NOW() 与它自己存的 order_end_time，本机时间不参与，');
+        tip('所以这个差本身不一定致命 —— 但它说明有一台机器时间没校准，值得顺手修。');
+    } else {
+        ok_('两边时间一致（相差 ' . $skew . ' 秒内）');
+    }
+
+    /**
+     * ★ 真正会让「最近的单查不到」的，是 POS 库内部的时间不自洽：
+     *   NOW() 比 POS 应用写进 order_end_time 的时间【跑得快】。
+     *   那样刚结的账看起来就像很久以前，直接落到时间窗外面。
+     *   （反过来 NOW() 慢则只是窗口变宽，会多查出来，不会少。）
+     *   拿库里最新一单和 NOW() 比一下就知道。
+     */
+    $newest = $db->select(
+        'SELECT MAX(order_end_time) AS t FROM history_order_head
+          WHERE order_end_time >= NOW() - INTERVAL 1440 MINUTE LIMIT 1')[0]['t'] ?? null;
+    if ($newest !== null) {
+        $lag = (int)round((strtotime($t['n']) - strtotime((string)$newest)) / 60);
+        printf("  库里最新一单 %s（%d 分钟前）\n", $newest, $lag);
+        if ($lag < 0) {
+            no_('最新订单的时间比 NOW() 还晚 —— POS 库内部时间不自洽');
+            tip('这种情况下时间窗会算错，最近的单可能整批查不到');
+        }
+    } else {
+        no_('近 24 小时库里一张单都没有 —— 要么今天没营业，要么连错了库');
+    }
+
+    // ── ① 活单还是历史单 ──────────────────────────────────
+if ($table !== '') {
+    h("① 这张单结账了吗（桌号 {$table}）");
+    /**
+     * order_head 是活单表，只存【未结账】的单。
+     *
+     * 实测（2026-08-18 导出）：该表 0 行，且索引只有
+     * PRIMARY(order_head_id, check_id) 与 KEY(table_id) ——
+     * 【没有 table_name 索引】，所以下面按桌名查是全表扫。
+     * 之所以可接受：该表行数天然被「店里桌子数」封顶（约 60），
+     * 且只在人工诊断时才跑，不在收银热路径上。
+     */
+    $live = $db->select(
+        'SELECT order_head_id, check_id, table_name, order_start_time
+           FROM order_head WHERE table_name = ? LIMIT 20', [$table], 's');
+    if ($live) {
+        no_(sprintf('桌 %s 有 %d 张【未结账】的活单', $table, count($live)));
+        foreach ($live as $l) {
+            printf("      单号 %s · check %s · %s 开台\n",
+                $l['order_head_id'], $l['check_id'], $l['order_start_time'] ?? '-');
+        }
+        tip('未结账的单不会出现在 Pad 上 —— 发分要按最终金额，必须等客人结完账');
+    } else {
+        ok_("桌 {$table} 没有未结账的活单");
+    }
+
+    // ── ②③④ 历史单逐条过筛 ───────────────────────────────
+    h("② 最近的历史单（不加任何过滤，先看有没有）");
+    $rows = $db->select(
+        'SELECT order_head_id, check_id, table_name, eat_type, order_end_time, actual_amount
+           FROM history_order_head
+          WHERE table_name = ? AND order_end_time >= NOW() - INTERVAL ? MINUTE
+          ORDER BY order_end_time DESC LIMIT 20',
+        [$table, max($win, 1440)], 'si');
+
+    if (!$rows) {
+        no_(sprintf('近 %d 分钟内，桌 %s 一张历史单都没有', max($win, 1440), $table));
+        tip('桌号必须完全相等。下面列出近期真实出现过的桌号，对照看是不是写法不一样');
+        $names = $db->select(
+            'SELECT table_name, COUNT(*) n, MAX(order_end_time) t
+               FROM history_order_head
+              WHERE order_end_time >= NOW() - INTERVAL 1440 MINUTE
+              GROUP BY table_name ORDER BY t DESC LIMIT 20');
+        foreach ($names as $n) {
+            printf("      「%s」 %s 单，最近 %s\n", $n['table_name'], $n['n'], $n['t']);
+        }
+    } else {
+        ok_(sprintf('找到 %d 张历史单，逐张看为什么没进 Pad：', count($rows)));
+        $nowRow = $db->select('SELECT NOW() AS n LIMIT 1')[0]['n'];
+        foreach ($rows as $r) {
+            $age  = (int)round((strtotime($nowRow) - strtotime((string)$r['order_end_time'])) / 60);
+            $bad  = [];
+            if ($age > $win)               { $bad[] = "超出时间窗（{$age} 分钟前 > {$win} 分钟）"; }
+            if ((int)$r['eat_type'] !== 0) { $bad[] = '不是堂食（eat_type=' . $r['eat_type'] . '）'; }
+            printf("      单号 %-8s %s  € %-8s %s\n",
+                $r['order_head_id'], $r['order_end_time'], $r['actual_amount'],
+                $bad ? "\033[31m✗ " . implode('；', $bad) . "\033[0m" : "\033[32m✓ 应该能查到\033[0m");
+        }
+        $tooOld = array_filter($rows, static fn($r) =>
+            (strtotime($nowRow) - strtotime((string)$r['order_end_time'])) / 60 > $win);
+        if (count($tooOld) === count($rows)) {
+            tip("全部超出时间窗。要么现在就发分，要么到后台把「订单查找 → 回溯时间窗」从 {$win} 分钟调大");
+            tip('也可以让收银员改用小票上的 Factura Simplificada 号查单 —— 那条路不受时间窗限制');
+        }
+    }
+
+}   // end if ($table !== '')
+
+    // ── ③ 真跑一遍 Pad 的调用链 ────────────────────────────
+    h('③ 按 Pad 的真实路径查一次（把被「系统内部错误」盖住的异常挖出来）');
+    echo $invoice > 0
+        ? "  按【小票号 {$invoice}】查（Factura Simplificada），与 Pad 上输小票号同一条路。\n"
+        : "  按【桌号 {$table}】查。\n";
+    echo "  这一步和 Pad 上点查询做的事完全一样，会把订单写进本地镜像。\n";
+    try {
+        $r = $invoice > 0
+            ? $app->points()->locateByInvoice($invoice)   // 小票号：和 Pad 上输小票号完全同一条路
+            : $app->points()->locate($table, $win);
+        if (($r['ok'] ?? false) === false) {
+            no_('查询失败：' . ($r['reason'] ?? '未知'));
+        } elseif (!$r['candidates']) {
+            no_('查询成功但没有候选单（reason=' . ($r['reason'] ?? '-') . '）');
+        } else {
+            ok_(sprintf('查到 %d 张，Pad 上应该正常显示', count($r['candidates'])));
+            foreach ($r['candidates'] as $c) {
+                printf("      流水号 %s · %s · € %s · %s 份 · %s\n",
+                    $c['serial_id'], $c['order_end_time'], $c['total'],
+                    $c['portions_counted'], $c['eligible'] ? '可发分' : ('不可发分：' . $c['ineligible_reason']));
+            }
+        }
+    } catch (Throwable $e) {
+        no_('★ 抛异常了 —— 这就是 Pad 上「系统内部错误」的真实原因：');
+        echo "\n      \033[31m" . get_class($e) . ': ' . $e->getMessage() . "\033[0m\n";
+        echo "      位置 " . $e->getFile() . ':' . $e->getLine() . "\n\n";
+        foreach (array_slice(explode("\n", $e->getTraceAsString()), 0, 6) as $l) {
+            echo "      {$l}\n";
+        }
+        /**
+         * ★ 界面上那两句提示对应完全不同的原因，别搞混：
+         *
+         *   「本地数据库暂时不可用」= db_unavailable
+         *       Api::dispatch 单独捕获 PDOException 给的码。
+         *       本地库连不上、缺表缺列（迁移漏跑）都落这里。
+         *
+         *   「系统内部错误，请稍后重试」= server_error
+         *       其余一切 Throwable。所以看到这句，就【不是】本地库的 SQL 问题 ——
+         *       常见的是 POS 侧：PosDb 的 RuntimeException（prepare 失败，
+         *       多半是 SQL 引用了 POS 上不存在的列）、LogicException（护栏：
+         *       非 SELECT / 带分号 / 没有 LIMIT），或者纯 PHP 的 TypeError。
+         */
+        $cls = get_class($e);
+        if ($e instanceof \PDOException) {
+            tip('这是 PDOException → 界面会显示「本地数据库暂时不可用」而非「系统内部错误」');
+            tip('若现场看到的是「系统内部错误」，那就不是这一个，再往下看 ⑤');
+        } else {
+            tip("这是 {$cls}（非 PDOException）→ 界面显示的正是「系统内部错误」");
+        }
+        tip('把上面这段发出来即可定位；同样的内容也在 PHP 错误日志里，前缀 [api]');
+    }
+
+    /**
+     * ── ③bis 明细到底在哪张表 ─────────────────────────────
+     *
+     * 份数是数明细行数出来的，明细没有 → 份数必然是 0。
+     * 而这家 POS 有两套表：order_detail 是活单明细，
+     * history_order_detail 是归档后的。如果归档有延迟，
+     * 刚结账的单在历史表里就是「有头无明细」——
+     * 表现正是「订单查得到、套餐 0 份」。
+     */
+    h('③bis 这几张单的明细在哪张表');
+    $ids = [];
+    foreach ($rows ?? [] as $r) { $ids[(int)$r['order_head_id']] = true; }
+    $ids = array_slice(array_keys($ids), 0, 5);
+    if (!$ids) {
+        echo "  （上面没查到单，跳过）\n";
+    } else {
+        printf("  %-10s %-22s %s\n", '订单号', 'history_order_detail', 'order_detail（活单）');
+        foreach ($ids as $id) {
+            $h1 = $db->select('SELECT COUNT(*) AS c FROM history_order_detail WHERE order_head_id = ? LIMIT 1',
+                [$id], 'i')[0]['c'] ?? 0;
+            $l1 = $db->select('SELECT COUNT(*) AS c FROM order_detail WHERE order_head_id = ? LIMIT 1',
+                [$id], 'i')[0]['c'] ?? 0;
+            $fb = (bool)($config['pos_detail_fallback'] ?? true);
+            $note = '';
+            if ((int)$h1 === 0) {
+                $note = (int)$l1 > 0
+                    ? ($fb ? "   \033[32m← 归档未完成，已回落读活单表\033[0m"
+                           : "   \033[31m← 明细还在活单表，但回落被关闭 → 份数为 0\033[0m")
+                    : "   \033[31m← 两张表都没有明细，份数必然为 0\033[0m";
+            }
+            printf("  %-10s %-22s %s%s\n", $id, $h1, $l1, $note);
+        }
+        $none = array_filter($ids, static fn($id) =>
+            (int)($db->select('SELECT COUNT(*) AS c FROM history_order_detail WHERE order_head_id = ? LIMIT 1',
+                [$id], 'i')[0]['c'] ?? 0) === 0);
+        if ($none) {
+            no_('有订单在 history_order_detail 里没有任何明细行');
+            if ((bool)($config['pos_detail_fallback'] ?? true)) {
+                tip('已开启 pos_detail_fallback，会自动回落读活单表 order_detail —— 上面若显示绿色即已生效');
+            } else {
+                tip('pos_detail_fallback 当前是关闭的。若明细还在活单表，把它设为 true 即可正常算份数');
+            }
+        }
+    }
+
+    // ── ④ 套餐规则是否对得上门店码 ────────────────────────
+    h('④ 套餐规则表 —— 「套餐 0 份」几乎都是这里出的问题');
+    try {
+        $ldb   = $app->localDb();
+        $store = $app->storeCode();
+        $mine  = (int)$ldb->value('SELECT COUNT(*) FROM meal_item_rule WHERE store_code = ?', [$store]);
+        $all   = (int)$ldb->value('SELECT COUNT(*) FROM meal_item_rule');
+        printf("  当前门店码 %s：%d 条规则（全表共 %d 条）\n", $store, $mine, $all);
+
+        if ($mine === 0 && $all > 0) {
+            no_('规则表里有数据，但【没有一条属于当前门店码】');
+            $others = $ldb->all('SELECT store_code, COUNT(*) n FROM meal_item_rule GROUP BY store_code');
+            foreach ($others as $o) {
+                printf("      门店码「%s」下有 %d 条\n", $o['store_code'], $o['n']);
+            }
+            /**
+             * 这是最容易踩的部署坑：db/seeds/*.sql 里门店码写死成 S001，
+             * 用 phpMyAdmin 手工导入就会原样落成 S001；而应用读的是
+             * config.php 的 store_code。两者不一致 → 一条规则都读不到
+             * → countsVisit() 全部回落 false → 所有订单都显示「套餐 0 份」。
+             * php bin/init.php seed 会按当前门店码替换后再灌，是幂等的。
+             */
+            tip('种子文件里门店码写死为 S001，手工导入 SQL 就会落成 S001。');
+            tip('改用 php bin/init.php seed 重灌（幂等，会自动替换成当前门店码）');
+        } elseif ($mine === 0) {
+            no_('规则表是空的 —— 所有菜品都会按安全默认「不计次」处理，份数恒为 0');
+            tip('跑 php bin/init.php seed');
+        } else {
+            ok_("规则表已覆盖当前门店（{$mine} 条）");
+            $cv = (int)$ldb->value(
+                'SELECT COUNT(*) FROM meal_item_rule WHERE store_code = ? AND counts_visit = 1', [$store]);
+            if ($cv === 0) {
+                no_('但没有任何一条 counts_visit = 1 —— 份数照样恒为 0');
+                tip('到后台「套餐规则」页把套餐项的「计次」打开');
+            } else {
+                ok_("其中 {$cv} 条参与计次");
+            }
+        }
+    } catch (Throwable $e) {
+        no_('读不到本地库的规则表：' . $e->getMessage());
+    }
+
+    /**
+     * ── ⑤ 本地库结构是否跟上了迁移 ─────────────────────────
+     *
+     * 用 phpMyAdmin 手工导 SQL 时很容易只导了 001，后面的 002~005 漏掉。
+     * 漏掉的后果不是「少个功能」，而是 buildContext() 往 pos_order 写镜像时
+     * 报 Unknown column，整个查询 500 —— 界面上只显示「系统内部错误」，
+     * 看不出是缺列。这一步直接把缺的列点出来。
+     */
+    h('⑤ 本地库结构 —— 迁移有没有漏跑');
+    try {
+        $ldb = $app->localDb();
+        // 各迁移新增的关键列：缺任何一个都会让相关写入直接抛异常
+        $need = [
+            'pos_order' => ['tax_amount' => '005_tax.sql'],
+            'member'    => ['rewards_issued' => '004_reward.sql'],
+            'coupon'    => ['source' => '004_reward.sql', 'amount_cents' => '004_reward.sql',
+                            'progress_at_grant' => '004_reward.sql', 'note' => '004_reward.sql'],
+        ];
+        $missing = [];
+        foreach ($need as $tbl => $cols) {
+            $have = [];
+            foreach ($ldb->all("SHOW COLUMNS FROM `{$tbl}`") as $c) {
+                $have[(string)$c['Field']] = true;
+            }
+            foreach ($cols as $col => $mig) {
+                if (!isset($have[$col])) {
+                    $missing[] = "{$tbl}.{$col}（来自 {$mig}）";
+                }
+            }
+        }
+        if ($missing) {
+            no_('缺少这些列 —— 相关写入会直接抛异常，表现就是「系统内部错误」：');
+            foreach ($missing as $m) {
+                echo "      {$m}\n";
+            }
+            tip('跑 php bin/init.php migrate 补齐（只跑没跑过的，不碰已有数据）');
+        } else {
+            ok_('迁移新增的列都在');
+        }
+
+        $applied = [];
+        foreach ($ldb->all('SELECT filename FROM schema_migration') as $r) {
+            $applied[(string)$r['filename']] = true;
+        }
+        $files = array_map('basename', glob(__DIR__ . '/../db/migrations/*.sql') ?: []);
+        $notRun = array_values(array_diff($files, array_keys($applied)));
+        if ($notRun) {
+            no_('schema_migration 里没有登记：' . implode('、', $notRun));
+            tip('若是手工导过 SQL，结构可能已经对了但没登记 —— 那样下次 migrate 会重复执行并失败');
+        } else {
+            ok_('全部 ' . count($files) . ' 个迁移均已登记');
+        }
+    } catch (Throwable $e) {
+        no_('读不到本地库结构：' . $e->getMessage());
+    }
+
+    h('结论');
+    echo "  Pad 只显示【已结账 + 堂食 + 在时间窗内 + 桌号完全相等】的单。\n";
+    echo "  上面哪一条打了 ✗，就是它；③ 若抛异常，异常本身就是答案。\n";
+
+} catch (Throwable $e) {
+    fwrite(STDERR, "诊断失败：" . $e->getMessage() . "\n");
+    fwrite(STDERR, "若是连不上 POS，先跑 php bin/diag.php\n");
+    exit(1);
+}

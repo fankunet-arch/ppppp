@@ -103,10 +103,21 @@ final class FakePosSource implements PosSource
     public function fetchDetail(int $orderHeadId, int $checkId, int $limit = 100): array
     {
         $rows = $this->details["{$orderHeadId}:{$checkId}"] ?? [];
-        // 照搬 PosReader 的 SQL 层过滤：menu_item_id > 0 且 condiment_belong_item = 0
+        /**
+         * 照搬 PosReader 的 SQL 层过滤，必须【逐字对齐】：
+         *   AND (menu_item_id > 0 OR menu_item_id = -2)
+         *   AND condiment_belong_item = 0
+         *
+         * ★ -2 折扣伪行必须保留 —— 十送一核销（TARJETA 10+1）就是这么一行，
+         *   PointsEngine 靠读它的名称来判定核销。
+         *   这里若按 menu_item_id <= 0 一刀切，假对象就比真实现少喂一类行：
+         *   核销识别在冒烟测试里【永远走不到】，连「纸质券不得被误判成核销」
+         *   这种断言都会因为行被丢掉而假通过 —— 比没有测试更糟。
+         */
         $out = [];
         foreach ($rows as $r) {
-            if ((int)$r['menu_item_id'] <= 0) {
+            $mid = (int)$r['menu_item_id'];
+            if ($mid <= 0 && $mid !== \Vip\PointsEngine::PSEUDO_DISCOUNT) {
                 continue;
             }
             if ((int)($r['condiment_belong_item'] ?? 0) !== 0) {

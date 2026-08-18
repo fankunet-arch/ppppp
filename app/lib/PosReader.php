@@ -16,7 +16,14 @@ namespace Vip;
  */
 final class PosReader implements PosSource
 {
-    public function __construct(private PosDb $db)
+    /**
+     * @param bool $detailFallback 历史明细读不到时是否回落读活单表 order_detail。
+     *        【默认关闭】—— 实测该店 history_order_detail 是及时的
+     *        （2026-08-17 23:27 结的账，明细当场就在），所以正常情况用不上。
+     *        留着是给「归档确实延迟」的情况兜底，由 why.php ③bis 判定后再开。
+     *        代价见 fetchDetail() 里的说明（活单表无 order_head_id 索引）。
+     */
+    public function __construct(private PosDb $db, private bool $detailFallback = false)
     {
     }
 
@@ -145,7 +152,46 @@ final class PosReader implements PosSource
                   AND (menu_item_id > 0 OR menu_item_id = {$pseudoDiscount})
                   AND condiment_belong_item = 0
                 LIMIT {$limit}";
-        return $this->db->select($sql, [$orderHeadId, $checkId], 'ii');
+        $rows = $this->db->select($sql, [$orderHeadId, $checkId], 'ii');
+        if ($rows !== []) {
+            return $rows;
+        }
+
+        /**
+         * ★ 回落读活单表 order_detail。
+         *
+         * 用途：万一 POS 归档滞后，刚结账的单会「有头无明细」，份数恒为 0
+         * （桌号查和小票查都一样，因为两条路读的是同一张表）。
+         * 那种情况下明细还在活单表里，字段布局与历史表一致，直接可用。
+         *
+         * ★ 但【默认关闭】：实测该店归档是及时的 —— 2026-08-17 23:27 结的账，
+         *   当天导出的 history_order_detail 里就有它的明细。
+         *   先前一版曾据「明细落后 4 天」默认开启，那个判断来自被截断的导出，
+         *   是错的。没有证据就不该往 POS 热路径上加全表扫。
+         *
+         * ⚠ 代价要说清楚：实测 order_detail 只有 PRIMARY(order_detail_id)，
+         *   【没有 order_head_id 索引】，所以这是一次全表扫。
+         *   之所以仍可接受：
+         *     · 只在历史表查不到时才走（即只针对最近的单）；
+         *     · 实测（2026-08-18 导出）活单明细表只有 2 行，远小于历史表；
+         *     · 仍带 LIMIT，步长可控。
+         *
+         *   ⚠ 另一个不开的理由：活单表会留【孤儿行】。实测那 2 行属于
+         *     order_head_id=54421，时间是 2025-07-14 —— 一年多前没归档干净的单。
+         *     开启回落后，若正好查到这类订单，读到的是过期明细。
+         *   若门店发现 POS 变慢，把 pos_detail_fallback 关掉即可，
+         *   代价是最近的单份数显示 0（Pad 会提示「明细还没同步」）。
+         */
+        if (!$this->detailFallback) {
+            return [];
+        }
+        $sqlLive = str_replace('FROM history_order_detail', 'FROM order_detail', $sql);
+        try {
+            return $this->db->select($sqlLive, [$orderHeadId, $checkId], 'ii');
+        } catch (\Throwable $e) {
+            // 活单表读不到不该影响主流程：金额仍按订单头算，份数交人工确认
+            return [];
+        }
     }
 
     /**

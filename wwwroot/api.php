@@ -32,10 +32,7 @@ try {
     /** @var Api $api */
     $api = require __DIR__ . '/../app/api/routes.php';
     $api->dispatch((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'), $path);
-} catch (\PDOException $e) {
-    error_log('[api:boot] db: ' . $e->getMessage());
-    Api::fail('db_unavailable', 503);
 } catch (\Throwable $e) {
-    error_log('[api:boot] ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
-    Api::fail('server_error', 500);
+    // 统一走 bootFail：带分类码与事件号，日志与界面对得上
+    Api::bootFail($e, 'api');
 }

@@ -210,7 +210,21 @@ function doSeed(App $app): void
     head('执行 seeds（幂等，可重复执行）');
     $db    = $app->localDb();
     $store = $app->storeCode();
-    foreach (glob(__DIR__ . '/../db/seeds/*.sql') ?: [] as $f) {
+    $seedFiles = glob(__DIR__ . '/../db/seeds/*.sql') ?: [];
+    /**
+     * ★ 一个种子文件都没有时必须明说。
+     *   实测现场踩过：部署时只拷了 wwwroot/app/bin，db 目录没传，
+     *   于是这里静默跑完、只报「规则表 0 条」，看起来像门店码配错，
+     *   实际是文件根本不在。少这一句，方向就指反了。
+     */
+    if (!$seedFiles) {
+        bad('db/seeds/ 下一个 .sql 都没有 —— 种子文件没部署到服务器上');
+        echo "      期望位置：" . realpath(__DIR__ . '/..') . DIRECTORY_SEPARATOR
+           . 'db' . DIRECTORY_SEPARATOR . "seeds\n";
+        echo "      把项目的 db 目录整个拷过来（migrations 与 seeds 都要），再跑一次\n";
+        return;
+    }
+    foreach ($seedFiles as $f) {
         $sql = file_get_contents($f);
         // 种子里门店码写死为 S001，按当前配置替换
         if ($store !== 'S001') {
@@ -310,6 +324,141 @@ function doPasswd(App $app, ?string $login): void
     }
 }
 
+/**
+ * ════════════════════════════════════════════════════════════
+ * repair —— 一条命令跑完「诊断 + 能修的直接修 + 说清还差什么」
+ *
+ * 做这个是因为现场排一次故障要来回三趟：先 diag、再 migrate、再 seed，
+ * 中间还要等人回话。三步都是幂等的，没有理由不合成一步。
+ *
+ * 只做安全动作：建表（含 DROP 的迁移在有数据时仍拒绝）、灌种子（幂等）。
+ * 不删数据、不动 POS。
+ * ════════════════════════════════════════════════════════════
+ */
+function doRepair(App $app, array $config): void
+{
+    $problems = [];
+
+    // ── 1. PHP 扩展 ──────────────────────────────────────
+    head('1/5 PHP 扩展');
+    foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读'] as $ext => $why) {
+        if (extension_loaded($ext)) {
+            ok("{$ext}（{$why}）");
+        } else {
+            bad("缺少 {$ext}（{$why}）");
+            $problems[] = "装/开启 PHP 扩展 {$ext}"
+                . "（Windows：php.ini 里去掉 extension={$ext} 前的分号，然后重启 Web 服务）";
+        }
+    }
+
+    // ── 2. 本地库连通性 ──────────────────────────────────
+    head('2/5 本地库连接');
+    $d = $config['local_db'] ?? [];
+    printf("  目标 %s@%s:%s/%s\n", $d['user'] ?? '?', $d['host'] ?? '?',
+        $d['port'] ?? '?', $d['database'] ?? '?');
+    try {
+        $app->localDb()->value('SELECT 1');
+        ok('连接正常');
+    } catch (Throwable $e) {
+        // 驱动码才能区分原因，SQLSTATE 一律是 HY000
+        $drv = 0;
+        if (preg_match('/\[(\d{4})\]/', $e->getMessage(), $m)) {
+            $drv = (int)$m[1];
+        }
+        $why = match ($drv) {
+            2002, 2003 => 'MySQL 服务没起，或端口/主机不对',
+            1045       => '口令错，或这个来源主机没被授权'
+                        . "（'u'@'localhost' 与 'u'@'127.0.0.1' 是两条不同授权）",
+            1044, 1049 => '库不存在，或该用户对这个库没权限',
+            1040       => '连接数打满',
+            default    => str_contains($e->getMessage(), 'could not find driver')
+                        ? 'pdo_mysql 扩展没装/没开' : '未知',
+        };
+        bad("连不上：{$why}");
+        echo '      原文：' . mb_substr($e->getMessage(), 0, 100) . "\n";
+        echo "\n\033[31m本地库连不上，后面几步没法做。先解决这一条。\033[0m\n";
+        if ($drv === 2002 || $drv === 2003) {
+            echo "  Windows：服务管理器里启动 MySQL/MariaDB，或在宝塔/XAMPP 面板里启动\n";
+            echo "  Linux：  sudo service mysql start\n";
+        }
+        exit(1);
+    }
+
+    // ── 3. 表结构 ────────────────────────────────────────
+    head('3/5 表结构（缺就补，幂等）');
+    try {
+        doMigrate($app);
+    } catch (Throwable $e) {
+        bad('建表失败：' . $e->getMessage());
+        $problems[] = '手工处理建表：' . $e->getMessage();
+    }
+
+    // ── 4. 配置与套餐规则 ────────────────────────────────
+    head('4/5 配置与套餐规则（按当前门店码重灌，幂等）');
+    $store = $app->storeCode();
+    try {
+        doSeed($app);
+    } catch (Throwable $e) {
+        bad('灌种子失败：' . $e->getMessage());
+        $problems[] = '手工处理种子：' . $e->getMessage();
+    }
+
+    // ── 5. 结果核验 —— 直接回答「套餐会不会显示 0 份」 ────
+    head('5/5 核验：套餐份数能不能算出来');
+    $db = $app->localDb();
+    $mine = (int)$db->value('SELECT COUNT(*) FROM meal_item_rule WHERE store_code = ?', [$store]);
+    $cv   = (int)$db->value(
+        'SELECT COUNT(*) FROM meal_item_rule WHERE store_code = ? AND counts_visit = 1', [$store]);
+    printf("  当前门店码 %s\n", $store);
+    if ($mine === 0) {
+        bad('规则表里没有本门店的规则 → 所有订单都会显示「套餐 0 份」');
+        $others = $db->all('SELECT store_code, COUNT(*) n FROM meal_item_rule GROUP BY store_code');
+        // ★ 必须区分这两种，修法完全不同：
+        //   表里有别的门店码 → 门店码配错
+        //   表整个是空的     → 种子压根没灌进来（多半是 db 目录没部署）
+        if ($others) {
+            foreach ($others as $o) {
+                printf("      门店码「%s」下有 %d 条\n", $o['store_code'], $o['n']);
+            }
+            $problems[] = "规则表门店码对不上：把 config.php 的 store_code 改成上面那个，"
+                        . '或重新跑 php bin/init.php seed';
+        } else {
+            echo "      整张表是空的（不是门店码的问题）—— 种子没灌进来\n";
+            $seedDir = realpath(__DIR__ . '/..') . DIRECTORY_SEPARATOR . 'db'
+                     . DIRECTORY_SEPARATOR . 'seeds';
+            $n = count(glob($seedDir . DIRECTORY_SEPARATOR . '*.sql') ?: []);
+            echo "      {$seedDir} 下有 {$n} 个 .sql 文件\n";
+            $problems[] = $n === 0
+                ? "把项目的 db 目录整个拷到服务器（现在 {$seedDir} 是空的或不存在），再跑一次"
+                : '种子文件在但没灌进去，看上面 4/5 的报错';
+        }
+    } elseif ($cv === 0) {
+        bad("有 {$mine} 条规则，但没有一条 counts_visit=1 → 份数照样恒为 0");
+        $problems[] = '到后台「套餐规则」页把套餐项的「计次」打开';
+    } else {
+        ok("规则 {$mine} 条，其中 {$cv} 条参与计次 —— 份数可以正常算出来");
+    }
+
+    $ops = (int)$db->value('SELECT COUNT(*) FROM operator WHERE store_code = ? AND enabled = 1', [$store]);
+    $ops > 0 ? ok("可用账号 {$ops} 个")
+             : bad('一个可用账号都没有 → 登不进后台，跑 php bin/init.php admin admin 系统管理员');
+    if ($ops === 0) {
+        $problems[] = '建管理员：php bin/init.php admin admin 系统管理员';
+    }
+
+    // ── 汇总 ─────────────────────────────────────────────
+    head('结论');
+    if (!$problems) {
+        ok('全部就绪 —— 后台应该能进，套餐份数应该能算出来');
+        echo "  若 Pad 上仍有问题，跑：php bin/why.php <桌号>  或  php bin/why.php --invoice <小票号>\n";
+        return;
+    }
+    echo "\033[31m还差这些（按顺序处理）：\033[0m\n";
+    foreach ($problems as $i => $p) {
+        printf("  %d) %s\n", $i + 1, $p);
+    }
+}
+
 // ════════════════════════════════════════════════════════════
 try {
     switch ($task) {
@@ -319,6 +468,7 @@ try {
         case 'admin':   doAdmin($app, $argv[2] ?? null, $argv[3] ?? null); break;
         case 'passwd':  doPasswd($app, $argv[2] ?? null); break;
         case 'all':     doCheck($app, $config); doSeed($app); break;
+        case 'repair':  doRepair($app, $config); break;
         default:
             fwrite(STDERR, "未知任务：{$task}\n");
             exit(1);

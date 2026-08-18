@@ -77,15 +77,106 @@ final class Api
 
         try {
             $this->routes[$key]();
-        } catch (\PDOException $e) {
-            // 本地库不可达单独给码，前端才能提示得准确
-            error_log('[api] db: ' . $e->getMessage());
-            self::fail('db_unavailable', 503);
         } catch (\Throwable $e) {
-            error_log('[api] ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
-            // 绝不把堆栈或连接串吐给客户端
-            self::fail('server_error', 500);
+            /**
+             * ★ 给收银员一个能念出来的错误代码，形如 E202-7F3A21。
+             *
+             *   前半段 E2xx  是【分类】：一眼看出坏在哪一层（见 classify()）
+             *   后半段 7F3A21 是【事件号】：随机 6 位，同时写进日志。
+             *
+             * 为什么两段都要：只有分类码，能知道「是 POS 侧」却不知道具体哪一句；
+             * 只有事件号，则必须能翻日志才有意义。两段一起，收银员拍张照发过来，
+             * 排查的人立刻知道方向，再按事件号在日志里精确捞到那一次的完整异常。
+             *
+             * 客户端只拿到这个代码 —— 堆栈、SQL、连接串一律不外传。
+             */
+            $code     = self::classify($e);
+            $incident = strtoupper(bin2hex(random_bytes(3)));
+            $ref      = $code . '-' . $incident;
+
+            error_log(sprintf('[api] %s %s | %s: %s @ %s:%d',
+                $ref, $key, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
+
+            // 本地库不可达单独给 503，前端才能提示得准确（其余一律 500）
+            $isDb = $e instanceof \PDOException;
+            self::fail($isDb ? 'db_unavailable' : 'server_error', $isDb ? 503 : 500, [], $ref);
         }
+    }
+
+    /**
+     * 把异常归到一个分类码。分类的粒度按【该去查哪里】来定，不是按异常类名。
+     *
+     *   E1xx 本地库    E2xx POS 主库    E3xx 代码/参数
+     *
+     * 实测教训：早先只有「本地数据库暂时不可用」与「系统内部错误」两句话，
+     * 现场拍照发过来也判断不出方向 —— 缺表、POS 掉线、SQL 引用了不存在的列，
+     * 三种完全不同的故障在界面上长得一模一样。
+     */
+    public static function classify(\Throwable $e): string
+    {
+        if ($e instanceof \PDOException) {
+            $state = (string)($e->errorInfo[0] ?? '');
+            if ($state === '42S02') { return 'E102'; }   // 表不存在 → 迁移没跑
+            if ($state === '42S22') { return 'E103'; }   // 列不存在 → 迁移漏跑一个
+            if ($state === '23000') { return 'E104'; }   // 唯一键/外键冲突
+
+            /**
+             * ★ 连接类故障【不能只看 SQLSTATE】。
+             *
+             *   实测：端口不通、主机不可达、库不存在、口令错 —— 四种需要完全
+             *   不同修法的故障，SQLSTATE 全是 HY000，只有驱动错误码能区分。
+             *   都归成一个码等于没分类，现场还是得挨个试。
+             *
+             *   驱动错误码在 errorInfo[1]；连接阶段失败时 errorInfo 可能为空，
+             *   那就回落到 getCode()（PDO 连接异常会把它设成驱动码）。
+             */
+            $drv = (int)($e->errorInfo[1] ?? 0);
+            // errorInfo 在连接阶段可能为空；驱动码在消息里一定有，形如 [1045]
+            if ($drv === 0 && preg_match('/\[(\d{4})\]/', $e->getMessage(), $m)) {
+                $drv = (int)$m[1];
+            }
+            if ($drv === 0) {
+                $drv = (int)$e->getCode();
+            }
+            if (str_contains($e->getMessage(), 'could not find driver')) {
+                return 'E106';   // pdo_mysql 扩展没装/没开
+            }
+            return match ($drv) {
+                2002, 2003, 2006 => 'E101',   // 连不上：服务没起 / 端口错 / 主机不可达
+                1045             => 'E105',   // 口令错，或该来源主机没被授权
+                1044, 1049       => 'E107',   // 库不存在，或该用户对这个库没权限
+                1040, 1203       => 'E108',   // 连接数打满
+                default          => str_starts_with($state, '08') ? 'E101' : 'E109',
+            };
+        }
+        // POS 侧：PosUnavailable 继承 RuntimeException，必须先判
+        if ($e instanceof \Vip\PosUnavailable) {
+            return 'E201';   // 连不上 / 查询超时
+        }
+        if ($e instanceof \LogicException) {
+            return 'E203';   // PosDb 护栏：非 SELECT / 带分号 / 没有 LIMIT
+        }
+        if ($e instanceof \RuntimeException) {
+            // PosDb 的 prepare 失败走这里 —— 多半是 SQL 引用了 POS 上没有的列
+            return str_contains($e->getMessage(), 'POS') ? 'E202' : 'E209';
+        }
+        if ($e instanceof \TypeError || $e instanceof \ValueError) {
+            return 'E301';   // 参数类型/取值不对，纯代码问题
+        }
+        return 'E309';
+    }
+
+    /**
+     * 启动期（路由注册阶段）的兜底 —— 那时还没进 dispatch。
+     * 分类码前缀改成 B，一眼看出是「连路由都没挂上」而不是某个接口出错。
+     */
+    public static function bootFail(\Throwable $e, string $where = 'api'): never
+    {
+        $ref = 'B' . substr(self::classify($e), 1) . '-' . strtoupper(bin2hex(random_bytes(3)));
+        error_log(sprintf('[%s:boot] %s | %s: %s @ %s:%d',
+            $where, $ref, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
+        $isDb = $e instanceof \PDOException;
+        self::fail($isDb ? 'db_unavailable' : 'server_error', $isDb ? 503 : 500, [], $ref);
     }
 
     /** 解析 JSON 请求体 */
@@ -115,9 +206,17 @@ final class Api
         self::emit(200, ['ok' => true, 'data' => $data]);
     }
 
-    public static function fail(string $code, int $status = 400, array $detail = []): never
+    public static function fail(string $code, int $status = 400, array $detail = [], string $ref = ''): never
     {
-        $p = ['ok' => false, 'error' => $code, 'message' => self::MESSAGES[$code] ?? $code];
+        $msg = self::MESSAGES[$code] ?? $code;
+        if ($ref !== '') {
+            // 代码直接拼进提示语 —— 收银员拍照就能把它带出来，不用再教怎么找
+            $msg .= "（错误代码 {$ref}）";
+        }
+        $p = ['ok' => false, 'error' => $code, 'message' => $msg];
+        if ($ref !== '') {
+            $p['ref'] = $ref;
+        }
         if ($detail) {
             $p['detail'] = $detail;
         }
