@@ -695,6 +695,62 @@ ok($ctxNd['eligible'], '仍可发分（金额是准的，只是份数要人工�
 // 对照：有明细时不得误报
 ok($ctx6['detail_missing'] === false, '对照：有明细的订单不会被误标为「明细缺失」');
 
+// ── 12sexies. 纸质券（满50抵5）不得被当成十送一核销 ──────────
+step('⑫sexies 满50抵5 纸质券 —— 照常计次积分，不是十送一');
+
+/**
+ * 店家另有「满 50 抵 5」活动：发纸质券，【在 POS 上直接核销】，
+ * Pad 端不参与。但那张券在 POS 明细里同样是一条 menu_item_id = -2
+ * 的折扣伪行，名称 CUPON DE 5 EUROS —— 与十送一的 TARJETA 10+1 同型。
+ *
+ * ★ 绝不能把它当成十送一核销：那样客人正常付费吃饭却不计次不积分。
+ *   实测该活动远比十送一常见（一份样本里 16 张 vs 5 张），
+ *   误判的代价是天天在发生。
+ *
+ * 实测口径（真实订单 92087 / 92157 验证）：
+ *   · 券额进订单头的 discount_amount，original + discount = should；
+ *   · 积分基数取 min(should, actual) = 券后金额，客人按实付得分；
+ *   · 券按 50 叠加，实测有 -5 / -10 / -15 / -30 四种额度；
+ *   · 份数只看套餐行，与折扣行无关。
+ */
+$pos->addHead([
+    'serial_id' => '2608130094', 'order_head_id' => 92394, 'check_id' => 1,
+    'table_name' => '54', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '53.70', 'should_amount' => '48.70',
+    'actual_amount' => '48.70', 'order_end_time' => '2026-08-13 23:28:00',
+]);
+$pos->addDetail(92394, 1, [
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2),
+    FakePosSource::line(431,  'Agua',                '2.95',  '5.90',  2),
+    // 纸质券的折扣伪行 —— 与十送一同型，只有名称不同
+    FakePosSource::line(PE::PSEUDO_DISCOUNT, 'CUPON DE 5 EUROS', '0.00', '-5.00', 0),
+]);
+
+$locCp = $svcL->points()->locate('54');
+$ctxCp = $locCp['candidates'][0];
+ok(!$ctxCp['is_redeemed'], '★ 纸质券【不】被判定为十送一核销（否则客人白吃两次）');
+eq([], $ctxCp['redeem_lines'], '核销行清单为空');
+eq(2, $ctxCp['portions_counted'], '份数照常算 2（折扣行不影响份数）');
+eq('48.70', $ctxCp['total'], '★ 积分基数是券后金额 48.70，客人按实付得分');
+ok($ctxCp['eligible'], '订单可正常发分');
+
+// 对照：真正的十送一核销必须仍能认出来
+$pos->addHead([
+    'serial_id' => '2608130095', 'order_head_id' => 92395, 'check_id' => 1,
+    'table_name' => '55', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '53.70', 'should_amount' => '29.80',
+    'actual_amount' => '29.80', 'order_end_time' => '2026-08-13 23:29:00',
+]);
+$pos->addDetail(92395, 1, [
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2),
+    FakePosSource::line(431,  'Agua',                '2.95',  '5.90',  2),
+    FakePosSource::line(PE::PSEUDO_DISCOUNT, 'TARJETA 10+1', '0.00', '-23.90', 0),
+]);
+$locRd = $svcL->points()->locate('55');
+$ctxRd = $locRd['candidates'][0];
+ok($ctxRd['is_redeemed'], '对照：TARJETA 10+1 仍被认成十送一核销');
+eq('23.90', $ctxRd['redeem_amount'], '核销额 23.90 = 一份套餐');
+
 // ── 13. 不变量总校验 ─────────────────────────────────────────
 step('⑬ 不变量总校验');
 

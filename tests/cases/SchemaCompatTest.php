@@ -608,6 +608,22 @@ $exCfg = (string)file_get_contents(__DIR__ . '/../../app/config/config.example.p
 T::true(str_contains($exCfg, 'pos_detail_fallback'),
     'config.example.php 里有 pos_detail_fallback 说明（否则现场不知道有这个开关）');
 
+/**
+ * ★ 假对象的明细过滤必须与 PosReader 一致 —— 否则测试会「假通过」。
+ *
+ * 实测踩过：PosReader 改成 (menu_item_id > 0 OR menu_item_id = -2) 之后，
+ * FakePosSource 仍按 menu_item_id <= 0 一刀切，把 -2 折扣伪行全丢掉。
+ * 后果不是少测一点，而是【十送一核销识别在冒烟测试里永远走不到】，
+ * 连「纸质券不得被误判成核销」这种断言都会因为行被丢掉而假通过 ——
+ * 比没有测试更糟：它给出的是虚假的安全感。
+ */
+$fakeSrc = (string)file_get_contents(__DIR__ . '/../FakePosSource.php');
+T::true(str_contains($fakeSrc, 'PSEUDO_DISCOUNT'),
+    '★ FakePosSource 保留 -2 折扣伪行（与 PosReader 的 SQL 过滤一致）');
+$readerSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/PosReader.php');
+T::true(str_contains($readerSrc, 'menu_item_id = {$pseudoDiscount}'),
+    'PosReader 的明细 SQL 确实保留 -2 行（假对象照的就是它）');
+
 // ── 回归：数值参数不能直接取 $argv[2] ────────────────────────────
 // 用法是 `cron.php <任务> [天数] [-v]`，直接取 $argv[2] 会把 "-v"
 // 当天数，(int)"-v" = 0 → 完整性监控一天都不查却报成功（静默失效）。
