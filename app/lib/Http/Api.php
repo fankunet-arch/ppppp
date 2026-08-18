@@ -115,13 +115,38 @@ final class Api
     public static function classify(\Throwable $e): string
     {
         if ($e instanceof \PDOException) {
-            $state = (string)($e->errorInfo[0] ?? $e->getCode());
-            return match (true) {
-                $state === '42S02'                          => 'E102',  // 表不存在 → 迁移没跑
-                $state === '42S22'                          => 'E103',  // 列不存在 → 迁移漏跑一个
-                str_starts_with($state, '08'), $state === 'HY000' => 'E101',  // 连不上
-                $state === '23000'                          => 'E104',  // 唯一键/外键冲突
-                default                                     => 'E109',
+            $state = (string)($e->errorInfo[0] ?? '');
+            if ($state === '42S02') { return 'E102'; }   // 表不存在 → 迁移没跑
+            if ($state === '42S22') { return 'E103'; }   // 列不存在 → 迁移漏跑一个
+            if ($state === '23000') { return 'E104'; }   // 唯一键/外键冲突
+
+            /**
+             * ★ 连接类故障【不能只看 SQLSTATE】。
+             *
+             *   实测：端口不通、主机不可达、库不存在、口令错 —— 四种需要完全
+             *   不同修法的故障，SQLSTATE 全是 HY000，只有驱动错误码能区分。
+             *   都归成一个码等于没分类，现场还是得挨个试。
+             *
+             *   驱动错误码在 errorInfo[1]；连接阶段失败时 errorInfo 可能为空，
+             *   那就回落到 getCode()（PDO 连接异常会把它设成驱动码）。
+             */
+            $drv = (int)($e->errorInfo[1] ?? 0);
+            // errorInfo 在连接阶段可能为空；驱动码在消息里一定有，形如 [1045]
+            if ($drv === 0 && preg_match('/\[(\d{4})\]/', $e->getMessage(), $m)) {
+                $drv = (int)$m[1];
+            }
+            if ($drv === 0) {
+                $drv = (int)$e->getCode();
+            }
+            if (str_contains($e->getMessage(), 'could not find driver')) {
+                return 'E106';   // pdo_mysql 扩展没装/没开
+            }
+            return match ($drv) {
+                2002, 2003, 2006 => 'E101',   // 连不上：服务没起 / 端口错 / 主机不可达
+                1045             => 'E105',   // 口令错，或该来源主机没被授权
+                1044, 1049       => 'E107',   // 库不存在，或该用户对这个库没权限
+                1040, 1203       => 'E108',   // 连接数打满
+                default          => str_starts_with($state, '08') ? 'E101' : 'E109',
             };
         }
         // POS 侧：PosUnavailable 继承 RuntimeException，必须先判

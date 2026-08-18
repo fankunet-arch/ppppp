@@ -670,6 +670,30 @@ T::group('错误代码分类 —— 收银员能念出来、日志能对上');
  */
 class_exists('Vip\\PosDb');   // PosUnavailable 定义在 PosDb.php 里，先触发加载
 
+/**
+ * ★ 连接类故障不能只看 SQLSTATE —— 实测端口不通 / 主机不可达 / 库不存在 /
+ *   口令错，四种需要完全不同修法的故障，SQLSTATE 全是 HY000。
+ *   只有驱动错误码能区分，都归一个码等于没分类。
+ *   （现场 E101 那次就是这么发现的。）
+ */
+$pdo = static function (string $msg, ?array $info = null): PDOException {
+    $e = new PDOException($msg);
+    return $e;   // errorInfo 为空时，classify 会从消息里取 [nnnn]
+};
+T::eq('E101', \Vip\Http\Api::classify($pdo('SQLSTATE[HY000] [2002] Connection refused')),
+    '★ 2002 连不上 → E101（服务没起 / 端口错 / 主机不可达）');
+T::eq('E105', \Vip\Http\Api::classify($pdo("SQLSTATE[HY000] [1045] Access denied for user 'u'@'h'")),
+    '★ 1045 口令错或来源主机没授权 → E105（与 E101 分开，修法完全不同）');
+T::eq('E107', \Vip\Http\Api::classify($pdo("SQLSTATE[HY000] [1044] Access denied for user 'u' to database 'x'")),
+    '★ 1044 库不存在或无权限 → E107');
+T::eq('E108', \Vip\Http\Api::classify($pdo('SQLSTATE[HY000] [1040] Too many connections')),
+    '1040 连接数打满 → E108');
+T::eq('E106', \Vip\Http\Api::classify($pdo('could not find driver')),
+    '★ pdo_mysql 没装 → E106（现场早先真踩过这个）');
+T::true(str_contains((string)file_get_contents(__DIR__ . '/../../app/lib/Http/Api.php'),
+    "preg_match('/\\[(\\d{4})\\]/'"),
+    '★ errorInfo 为空时从消息里取驱动码（连接阶段的异常常常没有 errorInfo）');
+
 T::eq('E201', \Vip\Http\Api::classify(new \Vip\PosUnavailable('POS 主库连接失败: timeout')),
     'POS 不可达 → E201');
 T::eq('E203', \Vip\Http\Api::classify(new LogicException('POS 查询必须带 LIMIT（铁律 2）')),
