@@ -6,8 +6,10 @@ declare(strict_types=1);
  * 「为什么 Pad 上找不到这张单」——现场诊断
  *
  * 用法：
- *   php bin/why.php 30           查桌号 30
- *   php bin/why.php 30 240       把回溯范围放宽到 240 分钟再看
+ *   php bin/why.php 30              查桌号 30
+ *   php bin/why.php 30 240          把回溯范围放宽到 240 分钟再看
+ *   php bin/why.php --invoice 92610 按小票上的 Factura Simplificada 号查
+ *                                   （与 Pad 上输小票号完全同一条路）
  *
  * Pad 的定位条件有四条，任何一条不满足就查不到，而界面上一律显示
  * 「未找到」，看不出是被哪一条挡的。本脚本逐条检验并直说结论：
@@ -26,11 +28,23 @@ if (PHP_SAPI !== 'cli') {
     exit;
 }
 
-$table = $argv[1] ?? '';
-if ($table === '') {
-    exit("用法：php bin/why.php <桌号> [回溯分钟数]\n例：php bin/why.php 30\n");
+$args    = array_slice($argv, 1);
+$invoice = 0;
+foreach ($args as $i => $a) {
+    if ($a === '--invoice' || $a === '-i') {
+        $invoice = (int)($args[$i + 1] ?? 0);
+        unset($args[$i], $args[$i + 1]);
+        break;
+    }
 }
-$look = isset($argv[2]) && ctype_digit($argv[2]) ? (int)$argv[2] : 0;
+$args  = array_values($args);
+$table = $args[0] ?? '';
+if ($table === '' && $invoice <= 0) {
+    exit("用法：php bin/why.php <桌号> [回溯分钟数]\n"
+       . "     php bin/why.php --invoice <小票号>   按 Factura Simplificada 查\n"
+       . "例：php bin/why.php 30\n     php bin/why.php --invoice 92610\n");
+}
+$look = isset($args[1]) && ctype_digit($args[1]) ? (int)$args[1] : 0;
 
 $config = require __DIR__ . '/../app/bootstrap.php';
 
@@ -88,6 +102,7 @@ try {
     }
 
     // ── ① 活单还是历史单 ──────────────────────────────────
+if ($table !== '') {
     h("① 这张单结账了吗（桌号 {$table}）");
     /**
      * order_head 是活单表，只存【未结账】的单。
@@ -152,11 +167,18 @@ try {
         }
     }
 
+}   // end if ($table !== '')
+
     // ── ③ 真跑一遍 Pad 的调用链 ────────────────────────────
     h('③ 按 Pad 的真实路径查一次（把被「系统内部错误」盖住的异常挖出来）');
-    echo "  注意：这一步和 Pad 上点查询做的事完全一样，会把订单写进本地镜像。\n";
+    echo $invoice > 0
+        ? "  按【小票号 {$invoice}】查（Factura Simplificada），与 Pad 上输小票号同一条路。\n"
+        : "  按【桌号 {$table}】查。\n";
+    echo "  这一步和 Pad 上点查询做的事完全一样，会把订单写进本地镜像。\n";
     try {
-        $r = $app->points()->locate($table, $win);
+        $r = $invoice > 0
+            ? $app->points()->locateByInvoice($invoice)   // 小票号：和 Pad 上输小票号完全同一条路
+            : $app->points()->locate($table, $win);
         if (($r['ok'] ?? false) === false) {
             no_('查询失败：' . ($r['reason'] ?? '未知'));
         } elseif (!$r['candidates']) {
@@ -175,6 +197,26 @@ try {
         echo "      位置 " . $e->getFile() . ':' . $e->getLine() . "\n\n";
         foreach (array_slice(explode("\n", $e->getTraceAsString()), 0, 6) as $l) {
             echo "      {$l}\n";
+        }
+        /**
+         * ★ 界面上那两句提示对应完全不同的原因，别搞混：
+         *
+         *   「本地数据库暂时不可用」= db_unavailable
+         *       Api::dispatch 单独捕获 PDOException 给的码。
+         *       本地库连不上、缺表缺列（迁移漏跑）都落这里。
+         *
+         *   「系统内部错误，请稍后重试」= server_error
+         *       其余一切 Throwable。所以看到这句，就【不是】本地库的 SQL 问题 ——
+         *       常见的是 POS 侧：PosDb 的 RuntimeException（prepare 失败，
+         *       多半是 SQL 引用了 POS 上不存在的列）、LogicException（护栏：
+         *       非 SELECT / 带分号 / 没有 LIMIT），或者纯 PHP 的 TypeError。
+         */
+        $cls = get_class($e);
+        if ($e instanceof \PDOException) {
+            tip('这是 PDOException → 界面会显示「本地数据库暂时不可用」而非「系统内部错误」');
+            tip('若现场看到的是「系统内部错误」，那就不是这一个，再往下看 ⑤');
+        } else {
+            tip("这是 {$cls}（非 PDOException）→ 界面显示的正是「系统内部错误」");
         }
         tip('把上面这段发出来即可定位；同样的内容也在 PHP 错误日志里，前缀 [api]');
     }
@@ -264,6 +306,62 @@ try {
         }
     } catch (Throwable $e) {
         no_('读不到本地库的规则表：' . $e->getMessage());
+    }
+
+    /**
+     * ── ⑤ 本地库结构是否跟上了迁移 ─────────────────────────
+     *
+     * 用 phpMyAdmin 手工导 SQL 时很容易只导了 001，后面的 002~005 漏掉。
+     * 漏掉的后果不是「少个功能」，而是 buildContext() 往 pos_order 写镜像时
+     * 报 Unknown column，整个查询 500 —— 界面上只显示「系统内部错误」，
+     * 看不出是缺列。这一步直接把缺的列点出来。
+     */
+    h('⑤ 本地库结构 —— 迁移有没有漏跑');
+    try {
+        $ldb = $app->localDb();
+        // 各迁移新增的关键列：缺任何一个都会让相关写入直接抛异常
+        $need = [
+            'pos_order' => ['tax_amount' => '005_tax.sql'],
+            'member'    => ['rewards_issued' => '004_reward.sql'],
+            'coupon'    => ['source' => '004_reward.sql', 'amount_cents' => '004_reward.sql',
+                            'progress_at_grant' => '004_reward.sql', 'note' => '004_reward.sql'],
+        ];
+        $missing = [];
+        foreach ($need as $tbl => $cols) {
+            $have = [];
+            foreach ($ldb->all("SHOW COLUMNS FROM `{$tbl}`") as $c) {
+                $have[(string)$c['Field']] = true;
+            }
+            foreach ($cols as $col => $mig) {
+                if (!isset($have[$col])) {
+                    $missing[] = "{$tbl}.{$col}（来自 {$mig}）";
+                }
+            }
+        }
+        if ($missing) {
+            no_('缺少这些列 —— 相关写入会直接抛异常，表现就是「系统内部错误」：');
+            foreach ($missing as $m) {
+                echo "      {$m}\n";
+            }
+            tip('跑 php bin/init.php migrate 补齐（只跑没跑过的，不碰已有数据）');
+        } else {
+            ok_('迁移新增的列都在');
+        }
+
+        $applied = [];
+        foreach ($ldb->all('SELECT filename FROM schema_migration') as $r) {
+            $applied[(string)$r['filename']] = true;
+        }
+        $files = array_map('basename', glob(__DIR__ . '/../db/migrations/*.sql') ?: []);
+        $notRun = array_values(array_diff($files, array_keys($applied)));
+        if ($notRun) {
+            no_('schema_migration 里没有登记：' . implode('、', $notRun));
+            tip('若是手工导过 SQL，结构可能已经对了但没登记 —— 那样下次 migrate 会重复执行并失败');
+        } else {
+            ok_('全部 ' . count($files) . ' 个迁移均已登记');
+        }
+    } catch (Throwable $e) {
+        no_('读不到本地库结构：' . $e->getMessage());
     }
 
     h('结论');
