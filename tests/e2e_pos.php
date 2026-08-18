@@ -488,15 +488,30 @@ if ($cRedeem === null) {
     is_($cRedeem['is_redeemed'] === true, '★ 识别出十送一核销行');
     eq_('95.60', $cRedeem['redeem_amount'], '核销额取自 -2 行的绝对值');
     is_(in_array('TARJETA 10+1', $cRedeem['redeem_lines'], true), '记录了命中的核销行名称');
-    is_($cRedeem['eligible'] === false, '★ 核销单不可积分');
-    eq_('redeemed', $cRedeem['ineligible_reason'], '原因与人工标记的免费餐区分开');
+
+    /**
+     * ★ 这张真实单（92293）本身就是【混合单】：
+     *   5 份 MENÚ @ 23.90 = 119.50，券抵 95.60 = 4 份，还剩 1 份是付费的。
+     *
+     * 本处断言原先写的是「核销单一律拒绝发分」——那是错的口径，
+     * 等于让那位付了钱的客人白吃。店家口径已确认：
+     * 免的那几份不算，付费的那几份照常计次。
+     * 所以这里改成断言「抵掉 4 份、可计次 1 份、可以发分」。
+     */
+    eq_(5, $cRedeem['portions_total'],    '明细里共 5 份套餐');
+    eq_(4, $cRedeem['portions_redeemed'], '★ 券抵掉 4 份（95.60 ÷ 23.90）');
+    eq_(1, $cRedeem['portions_counted'],  '★ 可计次 1 份 —— 付费的那位不该被吞掉');
+    is_($cRedeem['eligible'] === true,    '★ 混合单可以发分');
 
     $mR = $app->members()->create('600300001', null, null);
     $gR = $points->grant((string)$cRedeem['serial_id'],
-        [['member_id' => (int)$mR['id'], 'amount_cents' => 100]],
+        [['member_id' => (int)$mR['id'], 'amount_cents' => 100, 'portions' => 1]],
         PointsEngine::MODE_WHOLE, ['id' => 1, 'name' => 'e2e', 'role' => 'admin']);
-    is_(($gR['ok'] ?? true) === false, '★ 核销单发分被拒绝（不计次不计分）');
-    eq_('redeemed', $gR['error'] ?? '', '返回 redeemed 错误码');
+    is_(($gR['ok'] ?? false) === true, '★ 混合核销单可以正常发分');
+    eq_(1, (int)($gR['entries'][0]['visits'] ?? -1), '★ 计 1 次（不是 0，也不是 5）');
+    // 原先此处断言「返回 redeemed 错误码」—— 那是整单拒绝时代的产物。
+    // 混合单现在会正常发分，不该再有错误码。
+    eq_('', $gR['error'] ?? '', '混合单不返回错误码');
 
     $rowR = $db->one('SELECT is_redeemed, redeem_amount FROM pos_order WHERE store_code=? AND serial_id=?',
         [$E2E_STORE, (string)$cRedeem['serial_id']]);

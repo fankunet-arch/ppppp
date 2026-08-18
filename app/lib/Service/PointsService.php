@@ -187,7 +187,34 @@ final class PointsService
         //   1        套餐部分不计分，但酒水甜点等【额外消费】照常计分
         //            （计次仍然不给 —— 那一餐是兑换来的，不该再攒一次）
         $extraEarns = $this->cfg->get('free_meal_extra_earns', '0') === '1';
-        $isFreeish  = $isFree || $isRedeemed;
+
+        /**
+         * ★ 混合单：一桌里只有部分人用券免单，其余人正常付费。
+         *
+         * 店家口径（已确认）：4 人同桌、1 人用十送一券、其余 3 人照付
+         * （哪怕他们用了满50减5 的纸质券），这一单就算【3 份】——
+         * 可以 AA 给 3 个人，也可以整单记给一人算 3 次。
+         *
+         * 早先的写法是「只要有核销行就整单不计次不积分」，
+         * 实测 5 张核销单里有 2 张是混合单（92089 2 份抵 1、92147 4 份抵 1），
+         * 那 3 位付了钱的客人一次都没计上 —— 静默少给，客人也发现不了。
+         *
+         * 抵掉几份由 analyzeDetail 反推（核销额 ÷ 套餐单价，实测恒为整数）。
+         * 反推不出来时（单价不唯一 / 不能整除）退回保守口径：整单不计次。
+         * 宁可少给也不能多给 —— 多给等于白送一顿饭。
+         */
+        $portionsRedeemed = $analysis['portions_redeemed'];   // int|null
+        $fullyRedeemed    = $isRedeemed
+            && ($portionsRedeemed === null || $portionsRedeemed >= $analysis['portions_counted']);
+        $isFreeish        = $isFree || $fullyRedeemed;
+
+        // 本单实际可计次的份数：整单免费 → 0；部分核销 → 总份数 − 抵掉份数
+        $netPortions = $isFree ? 0
+            : ($isRedeemed
+                ? ($portionsRedeemed === null
+                    ? 0
+                    : max(0, $analysis['portions_counted'] - $portionsRedeemed))
+                : $analysis['portions_counted']);
 
         if ($isFreeish && $extraEarns) {
             // 只把餐费项从基数里剔掉，剩下的额外消费仍可积分
@@ -225,7 +252,9 @@ final class PointsService
             'tax_cents'          => $o['tax_cents'] ?? 0,
             'total_cents'        => $baseCents,
             'excluded_cents'     => $excluded,
-            'portions_counted'   => $analysis['portions_counted'],
+            // ★ 存【净】份数：被券抵掉的那几份本来就不该计次，
+            //   存净值后 validateAllocations 天然把分配上限卡对。
+            'portions_counted'   => $netPortions,
             'portions_uncounted' => $analysis['portions_uncounted'],
             'is_redeemed'        => $isRedeemed,
             'redeem_cents'       => $analysis['redeem_cents'],
@@ -264,9 +293,12 @@ final class PointsService
             'allocated'          => Money::toStr($allocated),
             'remaining_cents'    => max(0, $baseCents - $allocated),
             'remaining'          => Money::toStr(max(0, $baseCents - $allocated)),
-            'portions_counted'   => $analysis['portions_counted'],
+            'portions_counted'   => $netPortions,
             'allocated_portions' => $allocPort,
-            'remaining_portions' => max(0, $analysis['portions_counted'] - $allocPort),
+            'remaining_portions' => max(0, $netPortions - $allocPort),
+            // 排查用：明细里的原始份数，以及券抵掉了几份
+            'portions_total'     => $analysis['portions_counted'],
+            'portions_redeemed'  => $portionsRedeemed,
             // 份数拆档，Pad 直接显示，收银员不用自己数：
             //   付费套餐几份、免费套餐几份、买单人数（POS 的 customer_num）
             'portions_paid'      => $analysis['portions_paid'],
@@ -325,12 +357,25 @@ final class PointsService
             //   开        放行，但 total_amount 里餐费项已被剔除，
             //             且下面会把计次强制归零 —— 兑换来的那餐不该再攒一次
             $extraEarns = $this->cfg->get('free_meal_extra_earns', '0') === '1';
-            $freeish    = (int)$order['is_free_meal'] === 1 || (int)($order['is_redeemed'] ?? 0) === 1;
+            /**
+             * ★ 核销单要区分「整单免」与「混合单」。
+             *
+             * pos_order.portions_counted 存的是【净】份数（buildContext 已扣掉
+             * 券抵的份数）。所以：
+             *   净份数 = 0 → 整桌都是兑换来的，整单不计次不积分（原有口径）
+             *   净份数 > 0 → 混合单，那几位付了钱的客人照常计次积分
+             *
+             * 早先不分这两种，只要有核销行就整单拒绝发分 ——
+             * 实测 5 张核销单里 2 张是混合单，那些付费客人一次都没计上。
+             */
+            $fullyRedeemed = (int)($order['is_redeemed'] ?? 0) === 1
+                          && (int)$order['portions_counted'] === 0;
+            $freeish       = (int)$order['is_free_meal'] === 1 || $fullyRedeemed;
 
             if ((int)$order['is_free_meal'] === 1 && !$extraEarns) {
                 return ['ok' => false, 'error' => 'free_meal'];
             }
-            if ((int)($order['is_redeemed'] ?? 0) === 1 && !$extraEarns) {
+            if ($fullyRedeemed && !$extraEarns) {
                 return ['ok' => false, 'error' => 'redeemed'];
             }
 

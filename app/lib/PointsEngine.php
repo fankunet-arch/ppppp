@@ -200,6 +200,7 @@ final class PointsEngine
         $unknownItems      = [];
         $waivedCents       = 0;   // 「被免金额」：原价 - 实收
         $display           = [];
+        $countedUnitPrices = [];  // 计次套餐出现过的单价（分），用于反推核销份数
         $redeemCents       = 0;   // 十送一核销折扣额（正数）
         $redeemLines       = [];  // 命中的核销行名称
 
@@ -242,6 +243,10 @@ final class PointsEngine
                     $portionsPaid += $qty;
                 } else {
                     $portionsFree += $qty;
+                }
+                // 记下计次套餐的单价，用来反推核销抵掉了几份（见下方 portions_redeemed）
+                if ($prodC > 0) {
+                    $countedUnitPrices[$prodC] = true;
                 }
             } elseif (!$rules->isKnown($itemId) && $lineC > 0) {
                 /**
@@ -305,6 +310,23 @@ final class PointsEngine
             // 合并用的键只是内部产物，对外仍是顺序数组
             'display'             => array_values($display),
             'redeem_cents'        => $redeemCents,
+            /**
+             * ★ 核销抵掉了几份套餐 —— 用来把「混合单」算对。
+             *
+             * 店家口径（已确认）：4 人同桌、1 人用十送一券免单、其余 3 人正常付费
+             * （哪怕他们用了满50减5 的纸质券），这一单就算【3 份】：
+             * 可以 AA 给 3 个人，也可以整单记给一人算 3 次。
+             *
+             * 实测 5 张核销单，核销额 ÷ 套餐单价【全部是精确整数】：
+             *   92089 23.9÷23.9=1（共2份）  92147 18.9÷18.9=1（共4份）
+             *   92101 37.8÷18.9=2（共2份）  92223 47.8÷23.9=2（共2份）
+             *   92600 95.6÷23.9=4（共4份）
+             *
+             * 只在【计次套餐单价唯一且能整除】时才反推 —— 一单混点多种价位的
+             * 套餐时无法判断券抵的是哪一种，那种情况回落成 null，
+             * 由上层按保守口径处理（整单不计次），宁可少给也不能多给。
+             */
+            'portions_redeemed'   => self::redeemedPortions($redeemCents, array_keys($countedUnitPrices)),
             'redeem_lines'        => $redeemLines,
             'is_redeemed'         => $redeemCents > 0,
         ];
@@ -316,6 +338,30 @@ final class PointsEngine
      * 名称由店家在 POS 里自定义，故用【可配置的模式】而非硬编码全名。
      * 大小写与两侧空白都不敏感。
      */
+    /**
+     * 核销额抵掉了几份计次套餐。
+     *
+     * @param int   $redeemCents 核销折扣额（正数，分）
+     * @param int[] $unitPrices  本单计次套餐出现过的单价（分）
+     * @return int|null 份数；无法可靠判定时返回 null（上层按保守口径处理）
+     */
+    public static function redeemedPortions(int $redeemCents, array $unitPrices): ?int
+    {
+        if ($redeemCents <= 0) {
+            return 0;
+        }
+        // 单价不唯一 → 不知道券抵的是哪一种套餐，不猜
+        if (count($unitPrices) !== 1) {
+            return null;
+        }
+        $unit = (int)$unitPrices[0];
+        if ($unit <= 0 || $redeemCents % $unit !== 0) {
+            // 不能整除 → 不是「整份免单」，可能是别的折扣被误判成核销，不猜
+            return null;
+        }
+        return intdiv($redeemCents, $unit);
+    }
+
     public static function isRedeemLine(string $name, array $patterns = self::REDEEM_PATTERNS): bool
     {
         $n = mb_strtoupper(trim($name));

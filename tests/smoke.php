@@ -751,6 +751,70 @@ $ctxRd = $locRd['candidates'][0];
 ok($ctxRd['is_redeemed'], '对照：TARJETA 10+1 仍被认成十送一核销');
 eq('23.90', $ctxRd['redeem_amount'], '核销额 23.90 = 一份套餐');
 
+// ── 12septies. 混合核销单：免的不算，付费的照算 ───────────────
+step('⑫septies 混合单 —— 4 人 1 人用券，另外 3 人照常计次');
+
+/**
+ * 店家口径（已确认）：4 人同桌，1 人用十送一券免单，其余 3 人正常付费
+ * （哪怕他们用了满50减5 的纸质券），这一单就算【3 份】——
+ * 可以 AA 给 3 个人，也可以整单记给一人算 3 次。
+ *
+ * 真实订单 92147 就是这个形态：4 份 18.90 的午市套餐，
+ * 券抵 18.90（1 份），另有纸质券 -5.00，实付 63.50。
+ */
+$pos->addHead([
+    'serial_id' => '2608130096', 'order_head_id' => 92396, 'check_id' => 1,
+    'table_name' => '56', 'eat_type' => 0, 'customer_num' => 4,
+    'original_amount' => '95.60', 'should_amount' => '66.70',
+    'actual_amount' => '66.70', 'order_end_time' => '2026-08-13 23:30:00',
+]);
+$pos->addDetail(92396, 1, [
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '95.60', 4),
+    FakePosSource::line(PE::PSEUDO_DISCOUNT, 'TARJETA 10+1',     '0.00', '-23.90', 0),
+    FakePosSource::line(PE::PSEUDO_DISCOUNT, 'CUPON DE 5 EUROS', '0.00', '-5.00',  0),
+]);
+
+// ★ 必须新建 App：ConfigRepo 按实例缓存，$svcL 是在 ⑫ter 改过
+//   visit_count_mode 之后构造的，仍持有当时的旧值。
+$appMx = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$appMx->setLocalDb($db);
+$appMx->setPosSource($pos);
+
+$locMx = $appMx->points()->locate('56');
+$ctxMx = $locMx['candidates'][0];
+eq(4, $ctxMx['portions_total'],    '明细里共 4 份套餐');
+eq(1, $ctxMx['portions_redeemed'], '★ 券抵掉 1 份（23.90 ÷ 23.90，从核销额反推）');
+eq(3, $ctxMx['portions_counted'],  '★ 可计次 3 份 —— 付了钱的那 3 位不该被吞掉');
+eq(3, $ctxMx['remaining_portions'],'可分配份数 3');
+ok($ctxMx['eligible'], '★ 混合单可以发分（早先是整单拒绝，3 位客人白吃）');
+ok($ctxMx['is_redeemed'], '仍标记为含核销，审计能看出来');
+
+// 整单记给一人 → 应计 3 次
+$midMx = (int)$app->members()->create('+34600000012', null, null)['id'];
+$gMx = $appMx->points()->grant('2608130096',
+    [['member_id' => $midMx, 'amount_cents' => 6670, 'portions' => 3]],
+    PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
+ok($gMx['ok'], '发分成功');
+eq(3, (int)$gMx['entries'][0]['visits'], '★ 整单记给一人 → 计 3 次（不是 0，也不是 4）');
+eq(3, (int)$db->value('SELECT visit_count FROM member WHERE id=?', [$midMx]), '会员累计 3 次');
+
+// 对照：整桌都用券免单时，仍然一次都不给
+$pos->addHead([
+    'serial_id' => '2608130097', 'order_head_id' => 92397, 'check_id' => 1,
+    'table_name' => '57', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '0.00',
+    'actual_amount' => '0.00', 'order_end_time' => '2026-08-13 23:31:00',
+]);
+$pos->addDetail(92397, 1, [
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2),
+    FakePosSource::line(PE::PSEUDO_DISCOUNT, 'TARJETA 10+1', '0.00', '-47.80', 0),
+]);
+$locAll = $appMx->points()->locate('57');
+$ctxAll = $locAll['candidates'][0];
+eq(2, $ctxAll['portions_redeemed'], '对照：券抵掉 2 份 = 全部');
+eq(0, $ctxAll['portions_counted'],  '★ 整桌兑换 → 可计次 0 份');
+ok(!$ctxAll['eligible'], '★ 整单兑换仍不可发分（原有口径不变）');
+
 // ── 13. 不变量总校验 ─────────────────────────────────────────
 step('⑬ 不变量总校验');
 
