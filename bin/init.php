@@ -210,7 +210,21 @@ function doSeed(App $app): void
     head('执行 seeds（幂等，可重复执行）');
     $db    = $app->localDb();
     $store = $app->storeCode();
-    foreach (glob(__DIR__ . '/../db/seeds/*.sql') ?: [] as $f) {
+    $seedFiles = glob(__DIR__ . '/../db/seeds/*.sql') ?: [];
+    /**
+     * ★ 一个种子文件都没有时必须明说。
+     *   实测现场踩过：部署时只拷了 wwwroot/app/bin，db 目录没传，
+     *   于是这里静默跑完、只报「规则表 0 条」，看起来像门店码配错，
+     *   实际是文件根本不在。少这一句，方向就指反了。
+     */
+    if (!$seedFiles) {
+        bad('db/seeds/ 下一个 .sql 都没有 —— 种子文件没部署到服务器上');
+        echo "      期望位置：" . realpath(__DIR__ . '/..') . DIRECTORY_SEPARATOR
+           . 'db' . DIRECTORY_SEPARATOR . "seeds\n";
+        echo "      把项目的 db 目录整个拷过来（migrations 与 seeds 都要），再跑一次\n";
+        return;
+    }
+    foreach ($seedFiles as $f) {
         $sql = file_get_contents($f);
         // 种子里门店码写死为 S001，按当前配置替换
         if ($store !== 'S001') {
@@ -399,10 +413,25 @@ function doRepair(App $app, array $config): void
     if ($mine === 0) {
         bad('规则表里没有本门店的规则 → 所有订单都会显示「套餐 0 份」');
         $others = $db->all('SELECT store_code, COUNT(*) n FROM meal_item_rule GROUP BY store_code');
-        foreach ($others as $o) {
-            printf("      门店码「%s」下有 %d 条\n", $o['store_code'], $o['n']);
+        // ★ 必须区分这两种，修法完全不同：
+        //   表里有别的门店码 → 门店码配错
+        //   表整个是空的     → 种子压根没灌进来（多半是 db 目录没部署）
+        if ($others) {
+            foreach ($others as $o) {
+                printf("      门店码「%s」下有 %d 条\n", $o['store_code'], $o['n']);
+            }
+            $problems[] = "规则表门店码对不上：把 config.php 的 store_code 改成上面那个，"
+                        . '或重新跑 php bin/init.php seed';
+        } else {
+            echo "      整张表是空的（不是门店码的问题）—— 种子没灌进来\n";
+            $seedDir = realpath(__DIR__ . '/..') . DIRECTORY_SEPARATOR . 'db'
+                     . DIRECTORY_SEPARATOR . 'seeds';
+            $n = count(glob($seedDir . DIRECTORY_SEPARATOR . '*.sql') ?: []);
+            echo "      {$seedDir} 下有 {$n} 个 .sql 文件\n";
+            $problems[] = $n === 0
+                ? "把项目的 db 目录整个拷到服务器（现在 {$seedDir} 是空的或不存在），再跑一次"
+                : '种子文件在但没灌进去，看上面 4/5 的报错';
         }
-        $problems[] = '规则表门店码对不上：核对 config.php 的 store_code';
     } elseif ($cv === 0) {
         bad("有 {$mine} 条规则，但没有一条 counts_visit=1 → 份数照样恒为 0");
         $problems[] = '到后台「套餐规则」页把套餐项的「计次」打开';
