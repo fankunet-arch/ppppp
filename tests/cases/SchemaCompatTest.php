@@ -245,8 +245,15 @@ $fakeSrc = file_get_contents(__DIR__ . '/../../tests/FakePosSource.php');
 T::true(str_contains($fakeSrc, 'findByInvoice'), 'FakePosSource 实现了 findByInvoice（否则冒烟测试无法注入）');
 
 $entrySrc = file_get_contents(__DIR__ . '/../../wwwroot/api.php');
-T::true((bool)preg_match('/catch\s*\(\s*\\\\?PDOException/', $entrySrc),
-    '入口顶层捕获 PDOException → 返回 db_unavailable 而非空响应体');
+/**
+ * 守的是【行为】不是写法：路由注册阶段抛异常时也必须产出 JSON，
+ * 且本地库不可达要给 db_unavailable 而非空响应体。
+ * 现在统一走 Api::bootFail()，由它区分 PDOException 并带上错误代码。
+ */
+T::true((bool)preg_match('/catch\s*\(\s*\\\\?Throwable/', $entrySrc),
+    '入口顶层兜底捕获（否则客户端只收到空响应体，无从排障）');
+T::true(str_contains($entrySrc, 'bootFail'),
+    '入口走 Api::bootFail —— 带分类码与事件号，且本地库不可达仍给 db_unavailable');
 T::true((bool)preg_match('/catch\s*\(\s*\\\\?Throwable/', $entrySrc),
     '入口顶层捕获 Throwable → 任何异常都产出 JSON');
 
@@ -509,8 +516,8 @@ foreach (['/rules/save', '/config/save', '/members/erase', '/operators/create', 
 }
 
 $cpEntry = file_get_contents(__DIR__ . '/../../wwwroot/cp/api.php');
-T::true((bool)preg_match('/catch\s*\(\s*\\\\?PDOException/', $cpEntry),
-    'CP 入口捕获 PDOException');
+T::true((bool)preg_match('/catch\s*\(\s*\\\\?Throwable/', $cpEntry), 'CP 入口顶层兜底捕获');
+T::true(str_contains($cpEntry, 'bootFail'), 'CP 入口同样走 Api::bootFail');
 
 // CP 不得直接查 POS 主库 —— 后台的数据一律来自本地镜像
 T::false((bool)preg_match('/posReader\(\)|history_order_head|history_order_detail/', $cpSrc),
@@ -650,3 +657,44 @@ if (is_file(__DIR__ . '/../../app/config/config.php')) {
     T::eq($d3, $d3v,  '天数在 -v 之前可用');
     T::eq($d3, $d3r,  '天数在 -v 之后同样可用');
 }
+
+T::group('错误代码分类 —— 收银员能念出来、日志能对上');
+
+/**
+ * 现场只能看到一句话时，排查方向全靠这个分类码。
+ * 分类粒度按【该去查哪里】定，不是按异常类名：
+ *   E1xx 本地库   E2xx POS 主库   E3xx 代码/参数
+ *
+ * PDOException 那几档需要真实的 errorInfo，放在 tests/smoke.php 用真库验；
+ * 这里覆盖能直接构造的分支。
+ */
+class_exists('Vip\\PosDb');   // PosUnavailable 定义在 PosDb.php 里，先触发加载
+
+T::eq('E201', \Vip\Http\Api::classify(new \Vip\PosUnavailable('POS 主库连接失败: timeout')),
+    'POS 不可达 → E201');
+T::eq('E203', \Vip\Http\Api::classify(new LogicException('POS 查询必须带 LIMIT（铁律 2）')),
+    'POS 护栏拦截 → E203');
+T::eq('E202', \Vip\Http\Api::classify(new RuntimeException('POS 查询 prepare 失败: Unknown column')),
+    '★ POS prepare 失败 → E202（SQL 引用了主库上没有的列，最难猜的一种）');
+T::eq('E209', \Vip\Http\Api::classify(new RuntimeException('别的运行时错误')),
+    '非 POS 的 RuntimeException → E209');
+T::eq('E301', \Vip\Http\Api::classify(new TypeError('must be of type string, null given')),
+    '类型错误 → E301');
+T::eq('E301', \Vip\Http\Api::classify(new ValueError('bad value')), '取值错误 → E301');
+T::eq('E309', \Vip\Http\Api::classify(new Exception('boom')), '未归类 → E309');
+
+/**
+ * ★ PosUnavailable 继承 RuntimeException，判断顺序必须在它之前 ——
+ *   顺序反了的话 POS 掉线会被归成 E202，方向指错。
+ */
+$apiSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/Http/Api.php');
+T::true(strpos($apiSrc, 'PosUnavailable') < strpos($apiSrc, 'instanceof \\RuntimeException'),
+    '★ PosUnavailable 的判断在 RuntimeException 之前（它是子类，顺序反了会归错档）');
+T::true(str_contains($apiSrc, '错误代码'),
+    '错误代码直接拼进给收银员看的提示语（拍照就能带出来）');
+T::true(str_contains($apiSrc, 'bin2hex(random_bytes(3))'),
+    '每次故障有独立事件号，日志里能精确定位到那一次');
+T::eq(3, substr_count($apiSrc, "instanceof \\PDOException"),
+    '★ classify / dispatch / bootFail 三处都区分 PDOException（本地库不可达要给 503 db_unavailable）');
+T::false(str_contains($apiSrc, 'getTraceAsString'),
+    '★ 绝不把堆栈吐给客户端 —— 只给代码，细节留在服务器日志里');

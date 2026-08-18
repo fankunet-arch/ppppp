@@ -10,6 +10,8 @@ declare(strict_types=1);
  *   php bin/why.php 30 240          把回溯范围放宽到 240 分钟再看
  *   php bin/why.php --invoice 92610 按小票上的 Factura Simplificada 号查
  *                                   （与 Pad 上输小票号完全同一条路）
+ *   php bin/why.php --ref E202-7F3A21  按界面上的错误代码翻日志，
+ *                                   直接捞出那一次的完整异常
  *
  * Pad 的定位条件有四条，任何一条不满足就查不到，而界面上一律显示
  * 「未找到」，看不出是被哪一条挡的。本脚本逐条检验并直说结论：
@@ -37,7 +39,46 @@ foreach ($args as $i => $a) {
         break;
     }
 }
-$args  = array_values($args);
+$args = array_values($args);
+
+/**
+ * ── 按错误代码翻日志 ──────────────────────────────────
+ * 收银员报来 E202-7F3A21，这里直接把那一次的完整异常捞出来。
+ * 单独做一个入口是因为 Windows 上没有 grep，而现场多半就是 Windows。
+ */
+$ref = '';
+foreach ($args as $i => $a) {
+    if ($a === '--ref' || $a === '-r') {
+        $ref = strtoupper((string)($args[$i + 1] ?? ''));
+        break;
+    }
+}
+if ($ref !== '') {
+    $cfg = require __DIR__ . '/../app/bootstrap.php';
+    $log = rtrim((string)ini_get('error_log'));
+    if ($log === '' || !is_file($log)) {
+        exit("找不到日志文件（error_log = " . ($log ?: '未设置') . "）\n");
+    }
+    echo "在 {$log} 里找 {$ref}\n\n";
+    $hit = 0;
+    foreach (file($log) ?: [] as $line) {
+        if (stripos($line, $ref) !== false) {
+            echo '  ' . rtrim($line) . "\n";
+            $hit++;
+        }
+    }
+    if ($hit === 0) {
+        echo "  没找到。日志可能已轮转，或代码抄错了（形如 E202-7F3A21）。\n";
+        echo "  最近 3 条故障记录：\n";
+        $all = array_values(array_filter(file($log) ?: [],
+            static fn(string $l): bool => (bool)preg_match('/\b[BE]\d{3}-[0-9A-F]{6}\b/', $l)));
+        foreach (array_slice($all, -3) as $l) {
+            echo '  ' . rtrim($l) . "\n";
+        }
+    }
+    exit(0);
+}
+
 $table = $args[0] ?? '';
 if ($table === '' && $invoice <= 0) {
     exit("用法：php bin/why.php <桌号> [回溯分钟数]\n"
