@@ -89,7 +89,15 @@ try {
 
     // ── ① 活单还是历史单 ──────────────────────────────────
     h("① 这张单结账了吗（桌号 {$table}）");
-    // order_head 是活单表，只存未结账的单，行数极少，全扫无妨
+    /**
+     * order_head 是活单表，只存【未结账】的单。
+     *
+     * 实测（2026-08-18 导出）：该表 0 行，且索引只有
+     * PRIMARY(order_head_id, check_id) 与 KEY(table_id) ——
+     * 【没有 table_name 索引】，所以下面按桌名查是全表扫。
+     * 之所以可接受：该表行数天然被「店里桌子数」封顶（约 60），
+     * 且只在人工诊断时才跑，不在收银热路径上。
+     */
     $live = $db->select(
         'SELECT order_head_id, check_id, table_name, order_start_time
            FROM order_head WHERE table_name = ? LIMIT 20', [$table], 's');
