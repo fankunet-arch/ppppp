@@ -193,16 +193,26 @@ try {
                 [$id], 'i')[0]['c'] ?? 0;
             $l1 = $db->select('SELECT COUNT(*) AS c FROM order_detail WHERE order_head_id = ? LIMIT 1',
                 [$id], 'i')[0]['c'] ?? 0;
-            printf("  %-10s %-22s %s%s\n", $id, $h1, $l1,
-                (int)$h1 === 0 ? "   \033[31m← 历史表无明细，份数必然为 0\033[0m" : '');
+            $fb = (bool)($config['pos_detail_fallback'] ?? true);
+            $note = '';
+            if ((int)$h1 === 0) {
+                $note = (int)$l1 > 0
+                    ? ($fb ? "   \033[32m← 归档未完成，已回落读活单表\033[0m"
+                           : "   \033[31m← 明细还在活单表，但回落被关闭 → 份数为 0\033[0m")
+                    : "   \033[31m← 两张表都没有明细，份数必然为 0\033[0m";
+            }
+            printf("  %-10s %-22s %s%s\n", $id, $h1, $l1, $note);
         }
         $none = array_filter($ids, static fn($id) =>
             (int)($db->select('SELECT COUNT(*) AS c FROM history_order_detail WHERE order_head_id = ? LIMIT 1',
                 [$id], 'i')[0]['c'] ?? 0) === 0);
         if ($none) {
             no_('有订单在 history_order_detail 里没有任何明细行');
-            tip('若明细还在 order_detail（活单表），说明归档有延迟 —— 那就不是配置问题，');
-            tip('而是要等归档，或者改成也读活单明细。把这张表的数字发出来即可判断。');
+            if ((bool)($config['pos_detail_fallback'] ?? true)) {
+                tip('已开启 pos_detail_fallback，会自动回落读活单表 order_detail —— 上面若显示绿色即已生效');
+            } else {
+                tip('pos_detail_fallback 当前是关闭的。若明细还在活单表，把它设为 true 即可正常算份数');
+            }
         }
     }
 

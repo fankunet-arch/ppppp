@@ -587,6 +587,27 @@ foreach ($smokeToks as $tk) {
 T::true($sapiLine > 0 && $argvLine > 0 && $sapiLine < $argvLine,
     "★ smoke.php 的 CLI 守卫在读 \$argv 之前（守卫 L{$sapiLine} / 首次读取 L{$argvLine}）");
 
+/**
+ * ★ 明细读取必须能回落到活单表 order_detail。
+ *
+ * 实测该店 history_order_detail 明显落后于 history_order_head
+ * （订单头到 2026-08-17，历史明细只到 08-13），刚结账的单因此
+ * 「有头无明细」，套餐份数恒为 0 —— 桌号查与小票查都一样，
+ * 因为两条路都走 buildContext() 读同一张表。
+ * 去掉回落就会让最近的单永远算不出份数。
+ */
+$prSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/PosReader.php');
+T::true(str_contains($prSrc, "str_replace('FROM history_order_detail', 'FROM order_detail'"),
+    '★ fetchDetail 在历史表查不到时回落读活单表 order_detail');
+T::true((bool)preg_match('/if\s*\(\s*\$rows\s*!==\s*\[\]\s*\)/', $prSrc),
+    '回落只在历史表【真的没有】时触发，不是每次都查两张表');
+T::true(str_contains($prSrc, 'detailFallback'),
+    '回落可通过 pos_detail_fallback 关掉（活单表无索引，POS 变慢时要能立刻停）');
+
+$exCfg = (string)file_get_contents(__DIR__ . '/../../app/config/config.example.php');
+T::true(str_contains($exCfg, 'pos_detail_fallback'),
+    'config.example.php 里有 pos_detail_fallback 说明（否则现场不知道有这个开关）');
+
 // ── 回归：数值参数不能直接取 $argv[2] ────────────────────────────
 // 用法是 `cron.php <任务> [天数] [-v]`，直接取 $argv[2] 会把 "-v"
 // 当天数，(int)"-v" = 0 → 完整性监控一天都不查却报成功（静默失效）。

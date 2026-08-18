@@ -57,7 +57,12 @@ final class App
 
     public function posReader(): PosSource
     {
-        return $this->once('posReader', fn() => new PosReader($this->posDb()));
+        // 明细回落开关放 config.php 而不是 sys_config：
+        // 它关系到 POS 主机负载，出问题时要能在本地库都连不上的情况下改掉。
+        return $this->once('posReader', fn() => new PosReader(
+            $this->posDb(),
+            (bool)($this->config['pos_detail_fallback'] ?? false)
+        ));
     }
 
     /**

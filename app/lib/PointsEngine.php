@@ -243,10 +243,17 @@ final class PointsEngine
                 } else {
                     $portionsFree += $qty;
                 }
-            } elseif (!$rules->isKnown($itemId)) {
-                // 规则表没收录 → countsVisit 回落成 false（安全默认，宁可少算）。
-                // 但「少算」和「本来就不该算」在界面上看起来一模一样，都是 0，
-                // 收银员没法判断该不该手工补。所以把这些菜品名带出去，让前台明说。
+            } elseif (!$rules->isKnown($itemId) && $lineC > 0) {
+                /**
+                 * 规则表没收录 → countsVisit 回落成 false（安全默认，宁可少算）。
+                 * 「少算」和「本来就不该算」在界面上都是 0，收银员没法判断
+                 * 该不该手工补，所以要把菜品名带出去让前台明说。
+                 *
+                 * ★ 但只报【行合计 > 0】的。实测一张自助单里有 17~25 个 0 元
+                 *   单品（自助内含的寿司、天妇罗……），它们本来就不该计次，
+                 *   全列出来会让提示变成一屏噪音，真正该处理的漏配反而被淹掉。
+                 *   0 元行也不可能是漏配的付费套餐，漏报没有代价。
+                 */
                 $unknownItems[$itemId] = (string)($row['menu_item_name'] ?? ('#' . $itemId));
             }
 
