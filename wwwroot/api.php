@@ -11,6 +11,12 @@ declare(strict_types=1);
  * 若 Web 服务器配置了重写，也可用 /api/order/locate。
  */
 
+// ★ 这一行在顶层 try 的【外面】—— 读不到 /app 就会 fatal 成 HTML 页，
+//   客户端解析不出 JSON，界面上表现为「无法连接服务」，害人去查网线。
+//   先零依赖地确认一次，读不到就产出带错误码的 JSON。
+require __DIR__ . '/_boot.php';
+vip_boot_require_or_json(__DIR__ . '/../app/bootstrap.php', 'api');
+
 $config = require __DIR__ . '/../app/bootstrap.php';
 
 use Vip\App;

@@ -5,11 +5,36 @@ const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
 const API = '/api.php';
-const DEVICE = (() => {
+/**
+ * 设备标识 —— 优先取原生容器的 ANDROID_ID。
+ *
+ * 落到 operator_session 里做审计与「踢下线」，所以要尽量稳定。
+ * localStorage 那份一清应用数据就变，换台平板更是全新的；
+ * 原生 ID 至少在同一台设备 + 同一签名下是稳定的。
+ *
+ * ⚠️ ANDROID_ID 按「应用签名 + 用户 + 设备」派生 —— debug 包与 release 包
+ *    在同一台平板上取到的值不同。正式建档必须用 release 包采集。
+ *
+ * 只接受 source === 'native'：桥接自带的浏览器兜底（web- 前缀）在这里没有
+ * 额外价值，反而会让本机已有的 vip_device 换一个值、把历史会话记录割裂。
+ * 桥接不在时（PC 浏览器调试）沿用原来的 PAD- 随机串，前缀一望即知不是设备身份。
+ */
+const DEV = (() => {
+  const b = window.SushiVIP;
+  if (b && typeof b.getDeviceId === 'function') {
+    try {
+      const r = b.getDeviceId();
+      if (r && r.id && r.source === 'native') return { id: String(r.id), source: 'native' };
+    } catch (e) {
+      // 桥接在但调用失败：不能让登录页整个崩掉，继续走兜底
+      console.warn('[pad] 原生设备 ID 获取失败，回落本地标识', e);
+    }
+  }
   let d = localStorage.getItem('vip_device');
   if (!d) { d = 'PAD-' + Math.random().toString(36).slice(2, 7).toUpperCase(); localStorage.setItem('vip_device', d); }
-  return d;
+  return { id: d, source: 'browser' };
 })();
+const DEVICE = DEV.id;
 
 /* ── 状态 ────────────────────────────────────────── */
 const S = {
@@ -53,13 +78,32 @@ function step(id) {
 async function api(path, body, method = 'POST') {
   const opt = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' };
   if (body !== undefined && method !== 'GET') opt.body = JSON.stringify(body);
-  let res, json;
+  /**
+   * ★ 必须把「连不上」和「连上了但没回 JSON」分开报。
+   *
+   * 早先两者共用一句「无法连接本机服务，请检查 Pad 的网络」——
+   * 而实际上服务器往往好好地答了，只是吐的是 PHP 致命错误页（HTML），
+   * res.json() 一解析就抛，掉进同一个 catch。
+   * 结果是去查网线和路由器，真正的原因（服务端 fatal）却看不见。
+   *
+   * 现在：fetch 抛 → 真的连不上；json 解析失败 → 带上 HTTP 状态码与
+   * 响应正文开头，那几十个字符通常就写着 Fatal error: ... 在哪一行。
+   */
+  let res, json, raw = '';
   try {
     res = await fetch(API + path, opt);
-    json = await res.json();
   } catch (e) {
-    // 网络层失败：本地服务不可达。与「POS 不可达」是两回事，文案要分清。
-    throw { error: 'network', message: '无法连接本机服务，请检查 Pad 的网络' };
+    throw { error: 'network', message: '无法连接本机服务，请检查 Pad 的网络与 Web 服务是否在运行' };
+  }
+  try {
+    raw  = await res.text();
+    json = JSON.parse(raw);
+  } catch (e) {
+    const head = raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    throw {
+      error: 'bad_response',
+      message: `服务器返回的不是 JSON（HTTP ${res.status}）\n${head || '（响应为空）'}`,
+    };
   }
   if (!res.ok || json.ok === false) {
     throw { error: json.error || 'server_error', message: json.message || '操作失败', detail: json.detail };
@@ -81,6 +125,12 @@ $('#btn-login').onclick = async () => {
   }
 };
 $('#login-pin').addEventListener('keydown', e => { if (e.key === 'Enter') $('#btn-login').click(); });
+
+/* 容器是沉浸式全屏，没有地址栏、没有刷新按钮 —— 页面卡住时
+   收银员唯一的办法是杀进程重启，所以必须自己提供入口 */
+$$('#btn-refresh, #btn-refresh-login').forEach(b => {
+  b.onclick = () => location.reload();
+});
 
 $('#btn-logout').onclick = async () => {
   try { await api('/auth/logout', {}); } catch {}
@@ -269,7 +319,9 @@ function selectOrder(o) {
 
 /* ── 撤销 ────────────────────────────────────────── */
 async function doReverse(ledgerId) {
-  const reason = prompt('撤销原因（会记入审计日志）', '客人要求改记');
+  const reason = await UI.input('撤销原因（会记入审计日志）', {
+    value: '客人要求改记', okText: '确认撤销', danger: true,
+  });
   if (reason === null) return;
   try {
     await api('/points/reverse', { ledger_id: ledgerId, reason });
@@ -288,7 +340,8 @@ $$('.mode').forEach(b => b.onclick = () => {
 });
 
 $('#btn-free-meal').onclick = async () => {
-  if (!confirm('确认把本单标记为免费餐（10送1 核销）？标记后本单不积分、不计次。')) return;
+  if (!await UI.confirm('确认把本单标记为免费餐（10送1 核销）？\n标记后本单不积分、不计次。',
+                        { okText: '标记为免费餐', danger: true })) return;
   try {
     await api('/order/free-meal', { serial_id: S.order.serial_id, is_free_meal: true });
     toast('已标记为免费餐', 'ok');
@@ -514,10 +567,11 @@ async function redeemCoupon(personIndex, memberId) {
   const list = (slot && slot._coupons) || [];
   if (!list.length) return;
   const c = list[0];   // 最早到期的那张（服务端已排好序）
-  if (!confirm(
+  if (!await UI.confirm(
     `核销券 ${c.code}？\n\n` +
     `有效期至 ${c.valid_to || '永久'}\n\n` +
-    `★ 核销后请记得在 POS 上打对应的折扣，两边才对得上账。`
+    `★ 核销后请记得在 POS 上打对应的折扣，两边才对得上账。`,
+    { okText: '确认核销' }
   )) return;
   try {
     await api('/coupon/redeem', { coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null });

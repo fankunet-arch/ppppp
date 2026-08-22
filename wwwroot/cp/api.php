@@ -6,6 +6,10 @@ declare(strict_types=1);
  * 与 Pad 的 /api.php 同构：只做引导、取路径、派发，业务逻辑全在 /app。
  */
 
+// 同 /api.php：引导失败必须是 JSON，不能是 HTML 致命错误页
+require __DIR__ . '/../_boot.php';
+vip_boot_require_or_json(__DIR__ . '/../../app/bootstrap.php', 'cp');
+
 $config = require __DIR__ . '/../../app/bootstrap.php';
 
 use Vip\App;

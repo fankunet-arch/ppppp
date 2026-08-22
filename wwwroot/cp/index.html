@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="same-origin">
 <title>会员积分 · 管理后台</title>
 <link rel="stylesheet" href="/cp/cp.css">
@@ -17,6 +17,7 @@
     <label>PIN<input id="login-pin" type="password" autocomplete="current-password"></label>
     <button id="btn-login" class="primary big">登录</button>
     <p id="login-err" class="err" hidden></p>
+    <button id="btn-refresh-login" class="link">刷新页面</button>
   </div>
 </section>
 
@@ -36,6 +37,7 @@
       <button class="tab" data-tab="audit">审计</button>
     </nav>
     <span id="op-name" class="muted"></span>
+    <button id="btn-refresh" class="link" title="重新加载页面">刷新</button>
     <button id="btn-logout" class="link">退出</button>
   </header>
 
@@ -173,6 +175,8 @@
 </section>
 
 <div id="toast" class="toast" hidden></div>
+<!-- 顺序即依赖：ui.js 必须先于 cp.js 加载 -->
+<script src="/assets/ui.js"></script>
 <script src="/cp/cp.js"></script>
 </body>
 </html>
