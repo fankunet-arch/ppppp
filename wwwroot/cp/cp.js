@@ -16,9 +16,30 @@ function toast(m, k = '') {
 async function api(path, body, method = 'POST') {
   const opt = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' };
   if (body !== undefined && method !== 'GET') opt.body = JSON.stringify(body);
-  let res, j;
-  try { res = await fetch(API + path, opt); j = await res.json(); }
-  catch { throw { error: 'network', message: '无法连接服务' }; }
+  /**
+   * ★ 「连不上」与「连上了但没回 JSON」必须分开报。
+   *
+   * 早先两者共用一句「无法连接服务」，而实测下来这一句至少对应三种
+   * 完全不同的故障：服务真没起来、API 路径不对（Web 服务器把 index.html
+   * 当成响应回了 200）、以及服务端 PHP 致命错误吐 HTML。
+   * 只有第一种才是网络问题，另外两种去查网线永远查不到。
+   */
+  let res, j, raw = '';
+  try {
+    res = await fetch(API + path, opt);
+  } catch (e) {
+    throw { error: 'network', message: '无法连接服务，请检查 Web 服务是否在运行' };
+  }
+  try {
+    raw = await res.text();
+    j   = JSON.parse(raw);
+  } catch (e) {
+    const head = raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    throw {
+      error: 'bad_response',
+      message: `服务器返回的不是 JSON（HTTP ${res.status}）\n${head || '（响应为空）'}`,
+    };
+  }
   if (!res.ok || j.ok === false) throw { error: j.error, message: j.message || '操作失败', detail: j.detail };
   return j.data;
 }

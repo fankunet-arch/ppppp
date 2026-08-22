@@ -53,13 +53,32 @@ function step(id) {
 async function api(path, body, method = 'POST') {
   const opt = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' };
   if (body !== undefined && method !== 'GET') opt.body = JSON.stringify(body);
-  let res, json;
+  /**
+   * ★ 必须把「连不上」和「连上了但没回 JSON」分开报。
+   *
+   * 早先两者共用一句「无法连接本机服务，请检查 Pad 的网络」——
+   * 而实际上服务器往往好好地答了，只是吐的是 PHP 致命错误页（HTML），
+   * res.json() 一解析就抛，掉进同一个 catch。
+   * 结果是去查网线和路由器，真正的原因（服务端 fatal）却看不见。
+   *
+   * 现在：fetch 抛 → 真的连不上；json 解析失败 → 带上 HTTP 状态码与
+   * 响应正文开头，那几十个字符通常就写着 Fatal error: ... 在哪一行。
+   */
+  let res, json, raw = '';
   try {
     res = await fetch(API + path, opt);
-    json = await res.json();
   } catch (e) {
-    // 网络层失败：本地服务不可达。与「POS 不可达」是两回事，文案要分清。
-    throw { error: 'network', message: '无法连接本机服务，请检查 Pad 的网络' };
+    throw { error: 'network', message: '无法连接本机服务，请检查 Pad 的网络与 Web 服务是否在运行' };
+  }
+  try {
+    raw  = await res.text();
+    json = JSON.parse(raw);
+  } catch (e) {
+    const head = raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    throw {
+      error: 'bad_response',
+      message: `服务器返回的不是 JSON（HTTP ${res.status}）\n${head || '（响应为空）'}`,
+    };
   }
   if (!res.ok || json.ok === false) {
     throw { error: json.error || 'server_error', message: json.message || '操作失败', detail: json.detail };
