@@ -109,6 +109,7 @@
     var r = current.resolve;
     current = null;
     host.hidden = true;
+    setTimeout(sync, 0);      // 弹层关了，可能已回到最外层
     // confirm 取消给 false，input 取消给 null —— 与原生 confirm/prompt 语义一致，
     // 调用点的 `=== null` / `if (!ok)` 判断都不用改写法
     r(value);
@@ -144,6 +145,7 @@
         required: kind === 'input' && opts.required !== false
       };
       host.hidden = false;
+      sync();                 // 弹层打开 = 进入深层，放哨兵接住返回键
 
       if (kind === 'input') {
         setTimeout(function () { input.focus(); input.select(); }, 0);
@@ -181,5 +183,65 @@
     }, 300);
   });
 
-  global.UI = { confirm: askConfirm, input: askInput };
+  /* ── 物理返回键 ────────────────────────────────────────
+   * 容器的返回键走 WebView.canGoBack()：有历史就后退，没有就弹「确认退出」。
+   * 而这两个页面都是单页状态机，从不写历史 —— 于是 canGoBack() 恒为 false，
+   * 收银员在记账任何一步按返回，得到的都是「要退出应用吗」，
+   * 而不是退回上一步。这是容器里才暴露的问题，浏览器上根本看不出来。
+   *
+   * 做法：处于「深层」（弹层打开、或不在第一步）时，往历史里放一条哨兵。
+   * 返回键消费掉它 → popstate → 关掉最上面那一层 → 若仍在深层就再放一条。
+   * 一路退到最外层后不再放哨兵，此时 canGoBack() 才是 false，
+   * 容器弹退出确认才是合理的。
+   *
+   * 只用一条哨兵而不是维护一个历史栈：栈要和 UI 状态两头对齐，
+   * 中途任何一次跳转（比如记完账直接回起点）都会让两边错位；
+   * 哨兵法每次都从「当前真实 UI 状态」重新判断，不存在对不齐的问题。
+   */
+  var armed = false;
+  var suppress = 0;          // 我们自己调 history.back() 时，跳过一次 popstate
+  var layers = [];           // 页面注册的层级：{ deep: ()=>bool, back: ()=>bool }
+
+  function isDeep() {
+    if (current) return true;                       // 本模块的弹层
+    for (var i = 0; i < layers.length; i++) {
+      try { if (layers[i].deep()) return true; } catch (e) { /* 忽略 */ }
+    }
+    return false;
+  }
+
+  /** 关掉最上面一层，返回是否真的处理了 */
+  function backOneLevel() {
+    if (current) { done(current.kind === 'input' ? null : false); return true; }
+    for (var i = layers.length - 1; i >= 0; i--) {
+      try { if (layers[i].back()) return true; } catch (e) { /* 忽略 */ }
+    }
+    return false;
+  }
+
+  function sync() {
+    if (isDeep()) {
+      if (!armed) { history.pushState({ uiBack: 1 }, ''); armed = true; }
+    } else if (armed) {
+      // 自己回到最外层了，把残留的哨兵收掉，
+      // 否则下一次按返回会「看起来没反应」（那一下只是在消费哨兵）
+      armed = false; suppress++; history.back();
+    }
+  }
+
+  global.addEventListener('popstate', function () {
+    if (suppress > 0) { suppress--; return; }
+    armed = false;                       // 这条哨兵已被消费
+    if (backOneLevel()) sync();          // 还在深层就补一条；到底了就什么都不做
+  });                                    // ——此时 canGoBack() 为 false，容器弹退出确认
+
+  global.UI = {
+    confirm: askConfirm,
+    input:   askInput,
+    /** 供页面注册自己的层级；ui.js 自己的弹层永远排在最上面 */
+    back: {
+      register: function (layer) { layers.push(layer); sync(); },
+      sync: sync
+    }
+  };
 })(window);

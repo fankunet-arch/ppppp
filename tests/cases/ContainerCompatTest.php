@@ -24,7 +24,7 @@ declare(strict_types=1);
  * 把 JS 源码里的注释去掉、字符串/模板/正则的内容清空，只留下代码骨架。
  * 保留 '.' 等结构字符，这样 UI.confirm 与裸 confirm 才能区分开。
  */
-function js_strip(string $src): string
+function js_strip(string $src, bool $blankStrings = true): string
 {
     $out = '';
     $n   = strlen($src);
@@ -49,14 +49,17 @@ function js_strip(string $src): string
         }
         // 字符串 / 模板
         if ($c === '"' || $c === "'" || $c === '`') {
-            $q = $c;
+            $q     = $c;
+            $start = $i;
             $i++;
             while ($i < $n) {
                 if ($src[$i] === '\\') { $i += 2; continue; }
                 if ($src[$i] === $q)   { $i++; break; }
                 $i++;
             }
-            $out .= $q . $q;          // 留一对空引号，保住语法形状
+            // 默认清空字符串内容（查「有没有裸 confirm(」时，字符串里的同名
+            // 文本不该算数）；查事件名这类只存在于字符串里的东西时保留原文。
+            $out .= $blankStrings ? ($q . $q) : substr($src, $start, $i - $start);
             $prevSignificant = $q;
             continue;
         }
@@ -106,6 +109,10 @@ T::false(str_contains($stripped, 'window.open'), '★ 注释与字符串里的 w
 T::false((bool)preg_match('/(?<![\w.$])prompt\s*\(/', $stripped), '★ 块注释里的 prompt( 不会被误判');
 T::false((bool)preg_match('/(?<![\w.$])confirm\s*\(/', $stripped), '★ UI.confirm 不会被当成裸 confirm');
 T::true(str_contains($stripped, 'UI.confirm'), '保留 . 结构，UI.confirm 仍可见');
+
+$keep = js_strip("// 注释里的 popstate 不算\naddEventListener('popstate', f);", false);
+T::false(str_contains($keep, '注释里的'), '★ 保留字符串模式下，注释仍然被剥掉');
+T::true(str_contains($keep, "'popstate'"), '★ 保留字符串模式下，字符串原文留着');
 
 $probe2 = js_strip("window.open('/x');\nif (confirm('y')) {}\nconst v = prompt('z');");
 T::true(str_contains($probe2, 'window.open'), '★ 真的 window.open 抓得到');
@@ -176,3 +183,31 @@ T::true(str_contains($padJs, 'SushiVIP'),
     '★ 设备 ID 走容器桥接，不再只靠 localStorage 随机串');
 T::true(str_contains($padJs, 'localStorage'),
     'PC 浏览器调试时仍有本地兜底（否则开发环境登录不了）');
+
+T::group('容器兼容 · 物理返回键');
+
+/**
+ * 容器的返回键先问 WebView.canGoBack()：有历史就后退，没有就弹「确认退出」。
+ * 两个页面都是单页状态机，不写历史的话 canGoBack() 恒为 false ——
+ * 收银员在记账任何一步按返回，得到的都是「要退出应用吗」。
+ * 这个问题只在容器里出现，浏览器上完全看不出来。
+ */
+$ui  = js_strip(file_get_contents($root . 'assets/ui.js'));
+$pad = js_strip(file_get_contents($root . 'assets/pad.js'));
+
+// 'popstate' 只出现在字符串里，且 ui.js 的注释里也写着这个词 ——
+// 所以既不能用清空字符串的模式，也不能直接读原文
+$uiNoComment = js_strip(file_get_contents($root . 'assets/ui.js'), false);
+T::true((bool)preg_match("/addEventListener\\(\\s*['\"]popstate['\"]/", $uiNoComment),
+    '★ ui.js 监听 popstate（否则返回键在容器里等于直接退出应用）');
+T::true(str_contains($ui, 'pushState'),
+    '★ 深层时往历史里放哨兵，让 canGoBack() 为真');
+T::true(str_contains($pad, 'UI.back.register'),
+    '★ Pad 注册了自己的步骤层级（弹层 → 步骤，逐级后退）');
+T::true(str_contains($pad, 'STEP_BACK'),
+    '每一步的上一步是显式写死的，不靠下标算');
+
+// 有 push 就必须有对应的收尾，否则回到起点后还残留哨兵，
+// 表现为「按了一下返回没反应」
+T::true(str_contains($ui, 'history.back'),
+    '★ 自行回到最外层时会把残留哨兵收掉');

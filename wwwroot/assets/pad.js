@@ -70,9 +70,27 @@ function showErr(el, msg) {
   e.hidden = false;
 }
 
+/**
+ * 步骤的「上一步」是什么 —— 显式写死，不用下标算。
+ * step-done 特意退回起点而不是重进分配：账已经记完了，
+ * 再回到分配界面只会让人以为还能改。
+ * step-manual 是从起点分出去的旁支。
+ */
+const STEP_BACK = {
+  'step-order':  'step-table',
+  'step-mode':   'step-order',
+  'step-assign': 'step-mode',
+  'step-done':   'step-table',
+  'step-manual': 'step-table',
+};
+
+let CURRENT_STEP = 'step-table';
+
 function step(id) {
   $$('.step').forEach(s => s.classList.toggle('active', s.id === id));
   window.scrollTo(0, 0);
+  CURRENT_STEP = id;
+  if (window.UI && UI.back) UI.back.sync();
 }
 
 async function api(path, body, method = 'POST') {
@@ -167,9 +185,10 @@ $('#btn-my-pin').onclick = () => {
   $('#pin-old').value = ''; $('#pin-new').value = ''; $('#pin-new2').value = '';
   showErr('#pin-err', '');
   $('#pin-modal').hidden = false;
+  UI.back.sync();
   setTimeout(() => $('#pin-old').focus(), 0);
 };
-$('#btn-pin-cancel').onclick = () => { $('#pin-modal').hidden = true; };
+$('#btn-pin-cancel').onclick = () => { $('#pin-modal').hidden = true; UI.back.sync(); };
 
 $('#btn-pin-submit').onclick = async () => {
   const oldPin = $('#pin-old').value, p1 = $('#pin-new').value, p2 = $('#pin-new2').value;
@@ -624,9 +643,10 @@ function openMemberModal(personIndex) {
   $('#member-result').innerHTML = '';
   showErr('#member-err', '');
   $('#member-modal').hidden = false;
+  UI.back.sync();
   setTimeout(() => $('#member-input').focus(), 50);
 }
-$('#btn-member-close').onclick = () => { $('#member-modal').hidden = true; };
+$('#btn-member-close').onclick = () => { $('#member-modal').hidden = true; UI.back.sync(); };
 
 $$('#search-type button').forEach(b => b.onclick = () => {
   $$('#search-type button').forEach(x => x.classList.toggle('on', x === b));
@@ -688,6 +708,7 @@ function useMember(m) {
     if (S.mode === 3) refreshPickSelects();
   }
   $('#member-modal').hidden = true;
+  UI.back.sync();
 }
 
 /* ── 手工录入 ────────────────────────────────────── */
@@ -733,3 +754,22 @@ function escapeHtml(s) {
     }
   }
 })();
+
+/* ── 物理返回键：注册 Pad 的层级 ────────────────────
+ * 容器的返回键先问 canGoBack()。Pad 是单页状态机，不写历史就恒为 false，
+ * 于是收银员在记账任何一步按返回，弹的都是「确认退出应用」。
+ * 注册之后：弹层 → 步骤 → 逐级后退，退到第一步才轮到容器弹退出确认。
+ * ui.js 自己的弹层永远排在最上面，这里只管步骤与两个模态框。
+ */
+UI.back.register({
+  deep: () => !$('#pin-modal').hidden
+            || !$('#member-modal').hidden
+            || CURRENT_STEP !== 'step-table',
+  back: () => {
+    if (!$('#member-modal').hidden) { $('#member-modal').hidden = true; return true; }
+    if (!$('#pin-modal').hidden)    { $('#pin-modal').hidden    = true; return true; }
+    const prev = STEP_BACK[CURRENT_STEP];
+    if (prev) { step(prev); return true; }
+    return false;
+  },
+});
