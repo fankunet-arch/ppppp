@@ -30,7 +30,10 @@
     s.id = STYLE_ID;
     s.textContent = [
       '.ui-ask{position:fixed;inset:0;z-index:100;display:flex;align-items:center;',
-      'justify-content:center;padding:20px;background:rgba(0,0,0,.45);overflow-y:auto}',
+      'justify-content:center;padding:20px;background:rgba(0,0,0,.45);overflow-y:auto;',
+      // 容器是边到边沉浸式，横屏下要避开挖孔/圆角
+      'padding-left:calc(20px + env(safe-area-inset-left,0px));',
+      'padding-right:calc(20px + env(safe-area-inset-right,0px))}',
       '.ui-ask[hidden]{display:none}',
       '.ui-ask-box{background:var(--card,#fff);color:var(--ink,#1c1f23);',
       'border-radius:var(--radius,10px);padding:22px;width:100%;max-width:460px;',

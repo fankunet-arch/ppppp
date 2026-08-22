@@ -104,6 +104,32 @@ const pw = await page.evaluate(async () => {
 ok(pw.t === 'password', 'PIN 输入是 password 型（不明文显示）');
 ok(pw.im === 'numeric', 'PIN 输入唤起数字键盘');
 
+console.log('\n【安全区避让】');
+// 容器是边到边沉浸式（setDecorFitsSystemWindows(false) + 隐藏系统栏），
+// 页面又声明了 viewport-fit=cover —— 内容会铺到屏幕物理边缘。
+// 平板若有挖孔/圆角，不做避让就会被压住。横屏关注 left/right。
+const padOf = () => page.evaluate(() => {
+  const c = getComputedStyle(document.querySelector('#view-main'));
+  return { l: c.paddingLeft, r: c.paddingRight };
+});
+const p0 = await padOf();
+ok(p0.l === '16px' && p0.r === '16px',
+   `无挖孔时退回普通内边距（${p0.l} / ${p0.r}）—— 不支持 env() 的浏览器也是这个值`);
+
+const cdp = await ctx.newCDPSession(page);
+try {
+  await cdp.send('Emulation.setSafeAreaInsetsOverride',
+                 { insets: { top: 0, left: 48, bottom: 0, right: 24 } });
+  await page.waitForTimeout(200);
+  const p1 = await padOf();
+  ok(p1.l === '64px' && p1.r === '40px',
+     `★ 模拟挖孔后自动避让（16+48=${p1.l} / 16+24=${p1.r}）`);
+  await cdp.send('Emulation.setSafeAreaInsetsOverride',
+                 { insets: { top: 0, left: 0, bottom: 0, right: 0 } });
+} catch (e) {
+  console.log('  – 跳过：本版 Chromium 不支持安全区模拟');
+}
+
 console.log('\n【后台】');
 const page2 = await ctx.newPage();
 page2.on('pageerror', e => errors.push('cp: ' + String(e)));

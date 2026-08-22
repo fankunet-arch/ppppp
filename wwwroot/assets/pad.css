@@ -32,7 +32,26 @@ html, body {
   -webkit-text-size-adjust: 100%;
 }
 
-.view { display: none; padding: 16px; max-width: 900px; margin: 0 auto; }
+
+/* ── 安全区避让 ────────────────────────────────────
+ * 容器是边到边沉浸式（setDecorFitsSystemWindows(false) + 隐藏系统栏），
+ * 页面又声明了 viewport-fit=cover —— 内容会一直铺到屏幕物理边缘。
+ * 平板若有挖孔或圆角，边缘的内容会被压在下面。
+ *
+ * 横屏要关注的是 left / right，不是 top / bottom（充电口朝右横放）。
+ *
+ * 写法上先给一个普通值再用 calc() 覆盖：不支持 env() 的浏览器会把
+ * 带 env() 的那条整体判为非法而丢弃，正好退回上面那个普通值 ——
+ * 渐进增强，不需要额外的 @supports。
+ */
+.view {
+  display: none;
+  padding: 16px;
+  padding-left:  calc(16px + env(safe-area-inset-left, 0px));
+  padding-right: calc(16px + env(safe-area-inset-right, 0px));
+  max-width: 900px;
+  margin: 0 auto;
+}
 .view.active { display: block; }
 .step { display: none; }
 .step.active { display: block; }
@@ -225,6 +244,8 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
   align-items: flex-start;
   justify-content: center;
   padding: 20px;
+  padding-left:  calc(20px + env(safe-area-inset-left, 0px));
+  padding-right: calc(20px + env(safe-area-inset-right, 0px));
   overflow-y: auto;
   z-index: 50;
 }
@@ -266,6 +287,7 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
   position: fixed;
   left: 50%;
   bottom: 26px;
+  bottom: calc(26px + env(safe-area-inset-bottom, 0px));
   transform: translateX(-50%);
   background: var(--ink);
   color: #fff;

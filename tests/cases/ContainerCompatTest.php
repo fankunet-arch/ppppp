@@ -211,3 +211,25 @@ T::true(str_contains($pad, 'STEP_BACK'),
 // 表现为「按了一下返回没反应」
 T::true(str_contains($ui, 'history.back'),
     '★ 自行回到最外层时会把残留哨兵收掉');
+
+T::group('容器兼容 · 安全区避让');
+
+/**
+ * 容器是边到边沉浸式（setDecorFitsSystemWindows(false) + 隐藏系统栏），
+ * 加上 viewport-fit=cover，内容会一直铺到屏幕物理边缘。
+ * 平板若有挖孔或圆角，不做避让就会被压住 —— 横屏关注 left/right。
+ *
+ * 这两件事必须成对存在：声明了 viewport-fit=cover 却不避让，
+ * 比两样都不做更糟（cover 正是让内容铺到边缘的那个开关）。
+ */
+foreach (['assets/pad.css', 'cp/cp.css'] as $rel) {
+    $css = file_get_contents($root . $rel);
+    T::true(str_contains($css, 'safe-area-inset-left'),
+        "$rel 做了左侧安全区避让（横屏挖孔多在左右）");
+    T::true(str_contains($css, 'safe-area-inset-right'),
+        "$rel 做了右侧安全区避让");
+    // 必须留一个不带 env() 的普通值兜底：不支持 env() 的浏览器会把
+    // 整条声明判为非法丢弃，没有兜底就完全没有内边距
+    T::true((bool)preg_match('/padding:\s*\d+px/', $css),
+        "$rel 保留了不带 env() 的普通 padding 作兜底");
+}
