@@ -22,6 +22,7 @@
     <button id="btn-login" class="primary big">登录</button>
     <p id="login-err" class="err" hidden></p>
     <p class="muted small" id="health-note"></p>
+    <button id="btn-refresh-login" class="link">刷新页面</button>
   </div>
 </section>
 
@@ -31,6 +32,7 @@
     <span id="op-name" class="op"></span>
     <span id="pos-status" class="pill" hidden></span>
     <button id="btn-my-pin" class="link">改 PIN</button>
+    <button id="btn-refresh" class="link" title="重新加载页面">刷新</button>
     <button id="btn-logout" class="link">退出</button>
   </header>
 
@@ -182,6 +184,9 @@
 
 <div id="toast" class="toast" hidden></div>
 
+<!-- 顺序即依赖：桥接与通用 UI 必须先于 pad.js 加载（都是同步脚本） -->
+<script src="/assets/sushivip-bridge.js"></script>
+<script src="/assets/ui.js"></script>
 <script src="/assets/pad.js"></script>
 </body>
 </html>

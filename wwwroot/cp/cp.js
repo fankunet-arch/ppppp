@@ -59,6 +59,11 @@ $('#btn-login').onclick = async () => {
 };
 $('#login-pin').addEventListener('keydown', e => { if (e.key === 'Enter') $('#btn-login').click(); });
 
+/* 容器无地址栏、无刷新按钮，卡住时只能杀进程 —— 自己提供入口 */
+$$('#btn-refresh, #btn-refresh-login').forEach(b => {
+  b.onclick = () => location.reload();
+});
+
 $('#btn-logout').onclick = async () => {
   try { await api('/auth/logout', {}); } catch {}
   $('#view-main').classList.remove('active');
@@ -157,7 +162,9 @@ async function loadReviews() {
     const accept = b.dataset.ac === '1';
     let reason = '';
     if (!accept) {
-      reason = prompt('驳回原因（会追加反向冲正流水，原流水保留）', '与小票核对不符');
+      reason = await UI.input('驳回原因（会追加反向冲正流水，原流水保留）', {
+        value: '与小票核对不符', okText: '驳回并冲正', danger: true,
+      });
       if (reason === null) return;
     }
     try {
@@ -248,7 +255,8 @@ async function doMemberSearch() {
       }</table>`;
     const eb = $('#btn-erase');
     if (eb) eb.onclick = async () => {
-      if (!confirm('确认执行删除请求？\n\nPII（手机号/邮箱/生日）将被抹除且不可恢复，\n积分流水按会计与税务留存义务保留。')) return;
+      if (!await UI.confirm('确认执行删除请求？\n\nPII（手机号/邮箱/生日）将被抹除且不可恢复，\n积分流水按会计与税务留存义务保留。',
+                            { okText: '确认删除', danger: true })) return;
       try {
         await api('/members/erase', { member_id: m.id, reason: '数据主体删除请求' });
         toast('已假名化，流水保留', 'ok');
@@ -373,7 +381,9 @@ async function loadCoupons() {
     }).join('')}</table>` : '<div class="empty">还没有发出任何券</div>';
 
   $$('[data-cv]').forEach(b => b.onclick = async () => {
-    const why = prompt(`作废券 ${b.dataset.cvc} 的原因：`);
+    const why = await UI.input(`作废券 ${b.dataset.cvc} 的原因：`, {
+      okText: '确认作废', danger: true,
+    });
     if (why === null || !why.trim()) return;
     try { await api('/coupons/void', { id: +b.dataset.cv, reason: why }); toast('已作废', 'ok'); loadCoupons(); }
     catch (e) { toast(e.message, 'err'); }
@@ -419,10 +429,13 @@ async function loadOperators() {
   // 管理员重置他人 PIN —— 不需要旧 PIN，同时解掉连续失败锁定
   $$('[data-rp]').forEach(b => b.onclick = async () => {
     const who = b.dataset.rpn;
-    const pin = prompt(`为「${who}」设置新 PIN（至少 6 位）：`);
+    const pin = await UI.input(`为「${who}」设置新 PIN（至少 6 位）：`, {
+      password: true, numeric: true, okText: '下一步',
+    });
     if (pin === null) return;
     if (pin.length < 6) return toast('PIN 至少 6 位', 'err');
-    if (!confirm(`确认重置「${who}」的 PIN？\n该账号所有已登录设备都会被踢下线。`)) return;
+    if (!await UI.confirm(`确认重置「${who}」的 PIN？\n该账号所有已登录设备都会被踢下线。`,
+                          { okText: '确认重置', danger: true })) return;
     try {
       await api('/operators/reset-pin', { id: +b.dataset.rp, new_pin: pin });
       toast('已重置，锁定一并解除', 'ok');

@@ -78,5 +78,6 @@ require __DIR__ . '/cases/BusinessDayTest.php';
 require __DIR__ . '/cases/AllocationTest.php';
 require __DIR__ . '/cases/SchemaCompatTest.php';
 require __DIR__ . '/cases/BootGuardTest.php';
+require __DIR__ . '/cases/ContainerCompatTest.php';
 
 exit(T::summary());
