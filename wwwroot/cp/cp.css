@@ -19,7 +19,26 @@ html, body {
 
 .view { display: none; }
 .view.active { display: block; }
-.panel { display: none; padding: 20px; max-width: 1200px; margin: 0 auto; }
+
+/* ── 安全区避让 ────────────────────────────────────
+ * 容器是边到边沉浸式（setDecorFitsSystemWindows(false) + 隐藏系统栏），
+ * 页面又声明了 viewport-fit=cover —— 内容会一直铺到屏幕物理边缘。
+ * 平板若有挖孔或圆角，边缘的内容会被压在下面。
+ *
+ * 横屏要关注的是 left / right，不是 top / bottom（充电口朝右横放）。
+ *
+ * 写法上先给一个普通值再用 calc() 覆盖：不支持 env() 的浏览器会把
+ * 带 env() 的那条整体判为非法而丢弃，正好退回上面那个普通值 ——
+ * 渐进增强，不需要额外的 @supports。
+ */
+.panel {
+  display: none;
+  padding: 20px;
+  padding-left:  calc(20px + env(safe-area-inset-left, 0px));
+  padding-right: calc(20px + env(safe-area-inset-right, 0px));
+  max-width: 1200px;
+  margin: 0 auto;
+}
 .panel.active { display: block; }
 
 h1 { font-size: 24px; margin: 0 0 6px; }
@@ -38,6 +57,8 @@ h3 { font-size: 16px; margin: 0 0 10px; }
 .topbar {
   display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
   padding: 10px 20px; background: var(--card); border-bottom: 1px solid var(--line);
+  padding-left:  calc(20px + env(safe-area-inset-left, 0px));
+  padding-right: calc(20px + env(safe-area-inset-right, 0px));
 }
 .tabs { display: flex; gap: 2px; flex-wrap: wrap; margin-left: 10px; }
 .tab {
@@ -100,6 +121,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .toast {
   position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  bottom: calc(24px + env(safe-area-inset-bottom, 0px));
   background: var(--ink); color: #fff; padding: 11px 20px; border-radius: 999px; z-index: 100;
 }
 .toast.err { background: var(--err); }
