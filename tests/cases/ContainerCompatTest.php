@@ -233,3 +233,30 @@ foreach (['assets/pad.css', 'cp/cp.css'] as $rel) {
     T::true((bool)preg_match('/padding:\s*\d+px/', $css),
         "$rel 保留了不带 env() 的普通 padding 作兜底");
 }
+
+T::group('容器兼容 · 桥接副本不能漂移');
+
+/**
+ * 桥接封装有两份：容器方维护的原件在 apk/doc/，我们部署的副本在
+ * wwwroot/assets/。两份必须逐字节相同 —— 它是 Web 与容器之间唯一的契约层，
+ * 一边改了另一边没跟上，表现是「功能悄悄退化但什么都不报错」。
+ *
+ * 实际发生过：容器方把 UA 正则从 [\d.]+ 改成 [\w.-]+ 以保留 "-debug" 后缀
+ * （debug 与 release 包的 ANDROID_ID 不同，必须能分辨），
+ * 而我们部署的那份还是旧的，diagnose() 里两种包看起来一模一样。
+ *
+ * apk/ 目录不部署到门店服务器，所以那里跑测试时这一组自动跳过。
+ */
+$apkBridge = __DIR__ . '/../../apk/doc/sushivip-bridge.js';
+$webBridge = $root . 'assets/sushivip-bridge.js';
+
+T::true(is_file($webBridge), '部署副本存在（缺了就取不到原生设备 ID）');
+
+if (!is_file($apkBridge)) {
+    echo "  \033[33m–\033[0m 跳过副本比对：apk/ 不在（门店服务器上属正常）\n";
+} else {
+    T::eq(md5_get($apkBridge), md5_get($webBridge),
+        '★ wwwroot 里的桥接与 apk/doc/ 的原件逐字节一致');
+}
+
+function md5_get(string $f): string { return md5((string)file_get_contents($f)); }
