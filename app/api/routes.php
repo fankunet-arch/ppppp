@@ -71,7 +71,21 @@ $api->on('GET', '/health', static function () use ($app): void {
 // 身份
 // ════════════════════════════════════════════════════════════
 
-$api->on('POST', '/auth/login', static function () use ($auth): void {
+/**
+ * Pad 需要知道的后台开关。
+ *
+ * 跟着登录与 /auth/me 一起下发，前端据此决定界面上出不出现某些东西。
+ * 界面隐藏只是体验层，真正的约束在服务端（见 /member/create 的拒收）——
+ * 两边都做才站得住。
+ */
+$padSettings = static function () use ($app): array {
+    return [
+        // 关闭时 Pad 完全不显示手机号/邮箱/生日输入框，后端也拒收
+        'collect_pii' => $app->cfg()->bool('member_collect_pii', false),
+    ];
+};
+
+$api->on('POST', '/auth/login', static function () use ($auth, $padSettings): void {
     $b     = Api::body();
     $login = Api::str($b, 'login_name', '');
     $pin   = Api::str($b, 'pin', '');
@@ -85,7 +99,7 @@ $api->on('POST', '/auth/login', static function () use ($auth): void {
         Api::fail((string)$r['error'], $r['error'] === 'locked' ? 423 : 401, $r['detail'] ?? []);
     }
     Api::setToken((string)$r['token'], 12 * 3600);
-    Api::ok(['operator' => $r['operator']]);
+    Api::ok(['operator' => $r['operator'], 'settings' => $padSettings()]);
 });
 
 /**
@@ -113,8 +127,8 @@ $api->on('POST', '/auth/logout', static function () use ($auth): void {
     Api::ok();
 });
 
-$api->on('GET', '/auth/me', static function () use ($requireOperator): void {
-    Api::ok(['operator' => $requireOperator()]);
+$api->on('GET', '/auth/me', static function () use ($requireOperator, $padSettings): void {
+    Api::ok(['operator' => $requireOperator(), 'settings' => $padSettings()]);
 });
 
 // ════════════════════════════════════════════════════════════
@@ -294,12 +308,25 @@ $api->on('POST', '/member/create', static function () use ($app, $requireOperato
     }
 
     /**
-     * 手机号与邮箱都是【选填】。
+     * 手机号与邮箱是否可收，由后台开关 member_collect_pii 决定。
      *
-     * 实体卡默认不实名：凭卡号 + 卡背 PIN 就能积分与兑换，系统里不存
-     * 任何可识别到人的数据，因此没有可同意的对象，积分直接生效。
-     * 客人自愿留联系方式时才走双重确认那一套（详见 MemberRepo::create）。
+     * ★ 关闭时后端【拒收】，不是悄悄丢掉。
+     *   光靠前端隐藏输入框是不够的：字段藏起来而接口照收，
+     *   面对合规检查一样说不清。拒收之后才能说「系统在关闭状态下
+     *   技术上就收不了个人信息」，这句话是站得住的。
+     *   悄悄丢掉也不行 —— 那样收银员以为存进去了，客人也以为留了，
+     *   等到丢卡来找回时才发现什么都没有。
+     *
+     * 开启时：留了联系方式的记录重新落入个人数据范畴，走双重确认
+     * （待确认 + 积分冻结），详见 MemberRepo::create。
      */
+    $collectPii = $app->cfg()->bool('member_collect_pii', false);
+    if (!$collectPii) {
+        $given = array_filter([$phone, $email, $bday], static fn($v) => $v !== null && trim((string)$v) !== '');
+        if ($given) {
+            Api::fail('pii_disabled', 400);
+        }
+    }
 
     $r = $app->cardService()->bindNewMember(
         $card, $phone ?: null, $email ?: null, $bday ?: null, $op

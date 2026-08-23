@@ -150,6 +150,14 @@ final class ConfigSchema
         ],
 
         // ── 合规 ────────────────────────────────────────────
+        'member_collect_pii' => [
+            'group' => 'compliance', 'type' => 'bool',
+            'label' => '允许收集客人联系方式',
+            'desc'  => '关闭后 Pad 上【完全看不到】手机号/邮箱/生日的输入框，'
+                     . '后端也会拒收 —— 系统在技术上就收不了个人信息。'
+                     . '关闭是默认值：卡片不实名，凭卡号与卡背 PIN 即可积分与兑换。'
+                     . '开启前必须先接通确认短信，否则客人收不到确认链接、积分会永久冻结',
+        ],
         'consent_expire_days' => [
             'group' => 'compliance', 'type' => 'int', 'unit' => '天',
             'label' => '未确认会员的保留期',

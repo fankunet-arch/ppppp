@@ -45,6 +45,7 @@ const S = {
   picks: {},         // 点选模式：itemIndex -> personIndex
   memberTarget: null,// 会员弹层回调
   pendingCard: null, // 扫到的库存卡，等着绑给新建的会员
+  settings: {},      // 后台开关，随登录下发
 };
 
 /* ── 工具 ────────────────────────────────────────── */
@@ -138,7 +139,7 @@ $('#btn-login').onclick = async () => {
   if (!name || !pin) return showErr('#login-err', '请填写工号与 PIN');
   try {
     const d = await api('/auth/login', { login_name: name, pin, device: DEVICE });
-    enterMain(d.operator);
+    enterMain(d.operator, d.settings);
   } catch (e) {
     showErr('#login-err', e.message);
   }
@@ -159,13 +160,33 @@ $('#btn-logout').onclick = async () => {
   $('#login-pin').value = '';
 };
 
-function enterMain(op) {
+function enterMain(op, settings) {
   S.operator = op;
+  S.settings = settings || {};
+  applySettings();
   $('#op-name').textContent = op.name + (op.is_manager ? '（经理）' : '');
   $('#view-login').classList.remove('active');
   $('#view-main').classList.add('active');
   resetFlow();
   checkHealth();
+}
+
+/**
+ * 把后台开关落到界面上。
+ *
+ * collect_pii 关闭时，联系方式那一栏【整块从 DOM 里移除】，
+ * 而不是 hidden —— 目的就是让它在界面上根本不存在：
+ * 既不给收银员向客人索要的机会，也不必为一个根本没在用的采集表单
+ * 去应付「你们收了个人信息，保护措施呢」这类检查。
+ *
+ * 服务端同时拒收（见 /member/create），两边都做才站得住 ——
+ * 只藏前端的话，字段还在、接口照收，说不清楚。
+ */
+function applySettings() {
+  const box = $('#new-contact');
+  if (!box) return;
+  if (S.settings.collect_pii) return;      // 开启时保持原样
+  box.remove();
 }
 
 async function checkHealth() {
@@ -793,16 +814,27 @@ $('#btn-member-create').onclick = async () => {
     // 没有卡就建不了会员 —— 与其让服务端报错，不如在这里说清楚该做什么
     return showErr('#member-err', '请先扫描或输入客人的实体卡号');
   }
-  // 手机号与邮箱都是选填 —— 卡片默认不实名，凭卡号 + 卡背 PIN 即可使用。
-  // 留了联系方式才走双重确认（积分先冻结），不留则当场生效。
-  const phone = $('#new-phone').value.trim();
-  const email = $('#new-email').value.trim();
+  /**
+   * 后台关闭「允许收集客人联系方式」时，这几个输入框已经从 DOM 里移除，
+   * 请求里也一个字段都不带 —— 服务端此时会拒收非空值。
+   * 开启时才走双重确认那一套（积分先冻结），不填则当场生效。
+   */
+  const body = { card_no: S.pendingCard };
+  if (S.settings.collect_pii) {
+    body.phone    = $('#new-phone').value.trim();
+    body.email    = $('#new-email').value.trim();
+    body.birthday = $('#new-birthday').value || null;
+  }
   try {
-    const d = await api('/member/create', {
-      card_no: S.pendingCard, phone, email, birthday: $('#new-birthday').value || null,
-    });
+    const d = await api('/member/create', body);
     toast(d.consent_pending ? '已绑卡，等客人确认后可兑换' : '已绑卡，当场即可使用', 'ok');
-    $('#new-phone').value = ''; $('#new-email').value = ''; $('#new-birthday').value = '';
+    // 这几个输入框在关闭收集时【已从 DOM 移除】，必须判空 ——
+    // 否则 null.value 抛异常，后面的 useMember 永远执行不到，
+    // 表现是「提示说成功了，但弹层不关、会员也没选中」
+    ['#new-phone', '#new-email', '#new-birthday'].forEach(sel => {
+      const el = $(sel);
+      if (el) { el.value = ''; }
+    });
     S.pendingCard = null;
     useMember(d.member);
   } catch (e) { showErr('#member-err', e.message); }
@@ -927,7 +959,7 @@ function escapeHtml(s) {
 (async () => {
   try {
     const d = await api('/auth/me', undefined, 'GET');
-    enterMain(d.operator);
+    enterMain(d.operator, d.settings);
   } catch {
     try {
       const h = await api('/health', undefined, 'GET');

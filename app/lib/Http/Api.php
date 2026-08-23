@@ -66,6 +66,7 @@ final class Api
         'pin_required'           => '请让客人刮开卡背并报出 PIN',
         'card_missing'           => '该会员当前没有绑定的卡，请先补发一张',
         'reason_required'        => '强制核销必须填写原因',
+        'pii_disabled'           => '本店未开启收集联系方式，请勿向客人索要',
         'server_error'           => '系统内部错误，请稍后重试',
     ];
 

@@ -63,6 +63,13 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 自由撤销时间窗，超出需经理权限
 
 -- ── 合规 ──────────────────────────────────────────────────
+(@store,'member_collect_pii','0',@now),
+  -- 默认【关闭】：卡片不实名，凭卡号 + 卡背 PIN 即可积分与兑换。
+  -- 关闭时 Pad 上完全看不到手机号/邮箱/生日的输入框，后端也拒收 ——
+  -- 系统在技术上就收不了个人信息，既不给收银员向客人索要的机会，
+  -- 也不必为一个根本没在用的采集表单去应付合规检查。
+  -- 注意：本种子是 ON DUPLICATE KEY UPDATE config_value，重跑 seed 会把它
+  -- 重置回 0。方向是安全的（回到不收集），但门店若已开启需重新打开。
 (@store,'consent_expire_days','30',@now),
   -- 未同意的会员：积分冻结 + PII 假名化的期限
 (@store,'pii_retention_years','3',@now),

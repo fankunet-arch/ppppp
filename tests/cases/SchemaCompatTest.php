@@ -729,3 +729,28 @@ T::eq(3, substr_count($apiSrc, "instanceof \\PDOException"),
     '★ classify / dispatch / bootFail 三处都区分 PDOException（本地库不可达要给 503 db_unavailable）');
 T::false(str_contains($apiSrc, 'getTraceAsString'),
     '★ 绝不把堆栈吐给客户端 —— 只给代码，细节留在服务器日志里');
+
+T::group('隐私开关 · member_collect_pii');
+
+/**
+ * 后台开关：关闭时 Pad 上完全看不到手机号/邮箱/生日输入框，后端也拒收。
+ *
+ * 只藏前端是不够的 —— 字段藏起来而接口照收，面对合规检查一样说不清。
+ * 两边都做，才说得出「系统在关闭状态下技术上就收不了个人信息」。
+ */
+$schema = \Vip\ConfigSchema::ITEMS;
+T::true(isset($schema['member_collect_pii']), '配置项已登记进 ConfigSchema（后台能看到）');
+T::eq('bool', $schema['member_collect_pii']['type'] ?? '', '是布尔开关');
+T::eq('compliance', $schema['member_collect_pii']['group'] ?? '', '归在「合规与隐私」组');
+
+$seed = (string)file_get_contents(__DIR__ . '/../../db/seeds/001_sys_config.sql');
+T::true(str_contains($seed, "'member_collect_pii','0'"),
+    '★ 种子里默认值是 0（关闭）—— 新装的店默认不收集个人信息');
+
+$routes = (string)file_get_contents(__DIR__ . '/../../app/api/routes.php');
+T::true(str_contains($routes, 'pii_disabled'),
+    '★ 后端在关闭时拒收，不是只靠前端隐藏');
+
+$pad = (string)file_get_contents(__DIR__ . '/../../wwwroot/assets/pad.js');
+T::true(str_contains($pad, 'box.remove()'),
+    '★ 前端是把那一栏从 DOM 移除，不是 hidden（隐藏的字段仍然存在）');

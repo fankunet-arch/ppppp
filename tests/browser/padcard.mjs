@@ -12,7 +12,7 @@ const out = execSync(
   ` echo $b[0]["display"]."|".$b[1]["display"];'`,
   { cwd: '/home/user/ppppp', encoding: 'utf8' }
 ).trim();
-const [CARD_A, CARD_B] = out.split('|');
+const [CARD_A] = out.split('|');   // 第二张备用，本用例只需一张
 
 const browser = await launch();
 const page = await (await browser.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
@@ -82,24 +82,15 @@ ok(hint.includes(CARD_A), `表单里带出卡号：「${hint.trim()}」`);
 ok((await page.locator('#member-err').getAttribute('hidden')) !== null, '没有报错');
 
 // 卡片不实名：什么都不填就能启用
-ok(await page.locator('#new-contact').evaluate(el => !el.open),
-   '联系方式默认收起（选填）');
+// 后台开关 member_collect_pii 默认关闭时，联系方式那一栏整块不在 DOM 里 ——
+// 不是 hidden。目的就是让收银员根本没有向客人索要的入口。
+ok(await page.locator('#new-contact').count() === 0,
+   '★ 关闭收集时联系方式整块从 DOM 移除（不是隐藏）');
+ok(await page.locator('#new-phone').count() === 0, '手机号输入框根本不存在');
 let t1 = '';
 await Promise.all([waitFreshToast(/已绑卡/).then(v => { t1 = v; }).catch(() => {}),
                    page.click('#btn-member-create')]);
 ok(/当场即可使用/.test(t1), `★ 不填任何个人信息即可启用，且当场生效（${t1}）`);
-await page.waitForSelector('#member-modal', { state: 'hidden', timeout: 5000 });
-
-// ── 留了联系方式的那条路仍走双重确认 ──
-await page.evaluate(() => openMemberModal('manual'));
-await page.waitForSelector('#member-modal:not([hidden])');
-await lookup(CARD_B);
-await page.click('#new-contact summary');
-await page.fill('#new-phone', '600555' + Math.floor(Math.random() * 900 + 100));
-let t2 = '';
-await Promise.all([waitFreshToast(/已绑卡/).then(v => { t2 = v; }).catch(() => {}),
-                   page.click('#btn-member-create')]);
-ok(/等客人确认/.test(t2), `★ 留了手机号则积分先冻结，等确认（${t2}）`);
 await page.waitForSelector('#member-modal', { state: 'hidden', timeout: 5000 });
 
 // ── 再扫同一张 → 认出会员 ──
