@@ -50,10 +50,18 @@ $requireAdmin = static function () use ($requireManager): array {
  * 目前只有一条：开了实名但确认短信还没接入。
  */
 $warnings = static function () use ($app): array {
-    return \Vip\Features::warnings($app->cfg()->bool('member_collect_pii', false));
+    return \Vip\Features::warnings(
+        $app->cfg()->bool('member_collect_pii', false),
+        $app->messaging()->readyChannels()
+    );
 };
 
-$api->on('POST', '/auth/login', static function () use ($auth, $warnings): void {
+/** 有没有配齐可用的发送渠道。前端据此决定开启实名前要不要先拦一下 */
+$smsReady = static function () use ($app): bool {
+    return (bool)$app->messaging()->readyChannels();
+};
+
+$api->on('POST', '/auth/login', static function () use ($auth, $warnings, $smsReady): void {
     $b = Api::body();
     $r = $auth()->login(
         Api::str($b, 'login_name', '') ?: '',
@@ -71,7 +79,7 @@ $api->on('POST', '/auth/login', static function () use ($auth, $warnings): void 
     }
     Api::setToken((string)$r['token'], 12 * 3600);
     Api::ok(['operator' => $r['operator'], 'warnings' => $warnings(),
-             'sms_ready' => \Vip\Features::OUTBOUND_MESSAGING]);
+             'sms_ready' => $smsReady()]);
 });
 
 $api->on('POST', '/auth/logout', static function () use ($auth): void {
@@ -80,9 +88,9 @@ $api->on('POST', '/auth/logout', static function () use ($auth): void {
     Api::ok();
 });
 
-$api->on('GET', '/auth/me', static function () use ($requireManager, $warnings): void {
+$api->on('GET', '/auth/me', static function () use ($requireManager, $warnings, $smsReady): void {
     Api::ok(['operator' => $requireManager(), 'warnings' => $warnings(),
-             'sms_ready' => \Vip\Features::OUTBOUND_MESSAGING]);
+             'sms_ready' => $smsReady()]);
 });
 
 // ════════════════════════════════════════════════════════════

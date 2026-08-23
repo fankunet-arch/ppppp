@@ -344,16 +344,64 @@ $api->on('POST', '/member/create', static function () use ($app, $requireOperato
                      'card_no' => $m['card_no']],
     ]);
 
-    // 留了联系方式的才需要双重确认；全匿名的卡当场就可用
-    // TODO(下一批)：留了联系方式时，出站调用短信/邮件服务商发送 double opt-in
+    /**
+     * 留了联系方式的才需要双重确认；全匿名的卡当场就可用。
+     *
+     * 确认走【现场输码】：短信/邮件只发一个 6 位码（纯出站），客人当场
+     * 报给收银员，Pad 里输入即完成。不用「点链接确认」是因为那需要一个
+     * 公网可达的端点接收点击，而门店网络是单向的 —— 这个矛盾原设计里没发现。
+     */
     $pending = (int)$m['consent_status'] !== 1;
+    $codeSent = null;
+    if ($pending) {
+        $sent = $app->consent()->sendCode((int)$m['id'], $op);
+        // 发失败不阻断建卡：卡已经绑好了，积分照常入账，
+        // 只是暂时冻结。收银员可以在会员那一栏重发。
+        $codeSent = $sent['ok']
+            ? ['channel' => $sent['channel'], 'expires_at' => $sent['expires_at']]
+            : ['error' => $sent['error']];
+    }
     Api::ok(['member' => [
         'id' => (int)$m['id'],
         'card_no' => $app->cardNumber()->format((string)$m['card_no']),
         'points_balance' => 0, 'visit_count' => 0,
         'consent_status' => (int)$m['consent_status'],
         'points_frozen'  => $pending,
-    ], 'consent_pending' => $pending]);
+    ], 'consent_pending' => $pending, 'consent_code' => $codeSent]);
+});
+
+/**
+ * 重发确认码。客人没收到、码过期、或连续输错锁住时用。
+ * 每次重发都换一个新码，旧码立即作废。
+ */
+$api->on('POST', '/consent/send', static function () use ($app, $requireOperator): void {
+    $op  = $requireOperator();
+    $mid = Api::int(Api::body(), 'member_id', 0);
+    if ($mid <= 0) {
+        Api::fail('bad_request');
+    }
+    $r = $app->consent()->sendCode($mid, $op);
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], 400);
+    }
+    Api::ok(['channel' => $r['channel'], 'expires_at' => $r['expires_at']]);
+});
+
+/** 校验确认码。通过则积分解冻。 */
+$api->on('POST', '/consent/verify', static function () use ($app, $requireOperator): void {
+    $op   = $requireOperator();
+    $b    = Api::body();
+    $mid  = Api::int($b, 'member_id', 0);
+    $code = Api::str($b, 'code', '') ?: '';
+    if ($mid <= 0 || trim($code) === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->consent()->verifyCode($mid, $code, $op, Api::clientIp());
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], 400,
+            isset($r['left']) ? ['left' => $r['left']] : []);
+    }
+    Api::ok(['consent_status' => 1, 'points_frozen' => false]);
 });
 
 // ════════════════════════════════════════════════════════════

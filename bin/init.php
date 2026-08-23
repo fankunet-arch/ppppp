@@ -56,7 +56,8 @@ function doCheck(App $app, array $config): void
         ? ok('PHP ' . PHP_VERSION)
         : bad('PHP ' . PHP_VERSION . '，需要 8.2 以上');
     foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读（需要 MYSQLI_OPT_READ_TIMEOUT）',
-              'mbstring' => '多字节字符串', 'json' => 'JSON', 'openssl' => '令牌与加密'] as $ext => $why) {
+              'mbstring' => '多字节字符串', 'json' => 'JSON', 'openssl' => '令牌与加密',
+              'curl' => '出站发送确认短信'] as $ext => $why) {
         extension_loaded($ext) ? ok("扩展 {$ext}（{$why}）") : bad("缺少扩展 {$ext}（{$why}）");
     }
 
@@ -359,7 +360,8 @@ function doRepair(App $app, array $config): void
      */
     foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读',
               'mbstring'  => '多字节字符串', 'json' => 'JSON',
-              'openssl'   => '登录令牌'] as $ext => $why) {
+              'openssl'   => '登录令牌',
+              'curl'      => '出站发送确认短信'] as $ext => $why) {
         if (extension_loaded($ext)) {
             ok("{$ext}（{$why}）");
         } else {

@@ -4,43 +4,56 @@ declare(strict_types=1);
 namespace Vip;
 
 /**
- * 尚未实现的能力开关。
+ * 后台需要长期挂出来的提醒。
  *
- * 这里放的不是「配置」，而是【代码写没写】—— 所以不能靠 config.php 判断。
- * 比如确认短信：就算把 Twilio 的凭据填齐，出站发送那段代码没写，
- * 一样一封都发不出去。用配置去判断会给出错误的安全感。
+ * 这里管的是「开了某个功能，但它依赖的东西还没就绪」这类状态 ——
+ * 它们不会自己暴露：客人收不到确认码，积分默默冻结着，
+ * 等有人来投诉才发现，而那时可能已经过去几个月。
  */
 final class Features
 {
     /**
-     * 确认短信/邮件的出站发送是否已实现。
+     * 确认码的出站发送是否已实现。
      *
-     * ★ 实现 app/api/routes.php 里那个 TODO(下一批) 之后，把这里改成 true。
-     *   改了之后后台那条红色提醒会自动消失，开启实名时的拦截弹窗也不再出现。
+     * 曾经这里是 false，因为 routes.php 里只有一个 TODO。现在
+     * Vip\Service\Messaging 已经实现（Twilio 短信 + SMTP 邮件），
+     * 所以是 true —— 剩下的是「配没配凭据」，那由 Messaging::ready() 判断。
      *
-     * 为什么要有这个常量：实名功能依赖确认消息才能闭环 ——
-     * 客人留了手机号却收不到确认链接，积分会永久冻结。
-     * 这种「开了但用不了」的状态时间一长就会被忘掉，所以让系统自己一直提醒。
+     * 保留这个常量是为了把两件事分开：代码写没写（这里），
+     * 与凭据配没配（config.php）。用配置去判断前者会给出错误的安全感 ——
+     * 早先就是这样：凭据填齐了，发送代码没写，一样一封发不出去。
      */
-    public const OUTBOUND_MESSAGING = false;
+    public const OUTBOUND_MESSAGING = true;
 
     /**
-     * 后台需要长期挂出来的提醒。
-     *
+     * @param bool  $collectPii     是否开启了收集联系方式
+     * @param array $readyChannels  已配齐凭据的渠道（Messaging::readyChannels()）
      * @return array<int, array{key:string, level:string, text:string}>
      */
-    public static function warnings(bool $collectPii): array
+    public static function warnings(bool $collectPii, array $readyChannels = []): array
     {
         $out = [];
+
         if ($collectPii && !self::OUTBOUND_MESSAGING) {
             $out[] = [
-                'key'   => 'sms_not_ready',
+                'key'   => 'sms_not_implemented',
                 'level' => 'error',
-                'text'  => '已开启「收集客人联系方式」，但确认短信/邮件尚未接入 —— '
-                         . '留了手机号或邮箱的客人收不到确认链接，积分会一直冻结、无法兑换。'
-                         . '请尽快接入，或先把该开关关闭。',
+                'text'  => '已开启「收集客人联系方式」，但确认码的发送功能尚未实现。',
+            ];
+            return $out;   // 代码都没写，再提凭据没意义
+        }
+
+        if ($collectPii && !$readyChannels) {
+            $out[] = [
+                'key'   => 'channel_not_configured',
+                'level' => 'error',
+                'text'  => '已开启「收集客人联系方式」，但短信与邮件都还没配置凭据 —— '
+                         . '客人收不到确认码，积分会一直冻结、无法兑换。'
+                         . '请在 app/config/config.php 里填好 sms 或 mail 的凭据，'
+                         . '或先把该开关关闭。',
             ];
         }
+
         return $out;
     }
 }

@@ -13,6 +13,8 @@ use Vip\Repo\MealRuleRepo;
 use Vip\Repo\MemberRepo;
 use Vip\Repo\OrderRepo;
 use Vip\Service\CardService;
+use Vip\Service\ConsentService;
+use Vip\Service\Messaging;
 use Vip\Service\AuthService;
 use Vip\Service\MaintenanceService;
 use Vip\Service\PointsService;
@@ -130,6 +132,23 @@ final class App
     {
         return $this->once('cards', fn() => new CardRepo(
             $this->localDb(), $this->storeCode(), $this->cardNumber()
+        ));
+    }
+
+    public function messaging(): Messaging
+    {
+        return $this->once('messaging', fn() => new Messaging([
+            'sms'  => $this->config['sms']  ?? [],
+            'mail' => $this->config['mail'] ?? [],
+        ]));
+    }
+
+    public function consent(): ConsentService
+    {
+        return $this->once('consent', fn() => new ConsentService(
+            $this->localDb(), $this->members(), $this->messaging(),
+            $this->cfg(), $this->audit(), $this->storeCode(),
+            (string)($this->config['store_name'] ?? '本店')
         ));
     }
 

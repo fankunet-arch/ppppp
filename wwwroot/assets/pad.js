@@ -836,9 +836,76 @@ $('#btn-member-create').onclick = async () => {
       if (el) { el.value = ''; }
     });
     S.pendingCard = null;
+    if (d.consent_pending) {
+      await runConsentFlow(d.member, d.consent_code);
+    }
     useMember(d.member);
   } catch (e) { showErr('#member-err', e.message); }
 };
+
+/**
+ * 现场确认码。
+ *
+ * 客人留了联系方式 → 系统发一个 6 位码到他手机/邮箱 → 他当场报给收银员
+ * → 这里输入即完成确认，积分解冻。
+ *
+ * 不用「点短信里的链接」是因为那需要一个公网可达的端点接收点击，
+ * 而门店网络是单向的（能出去、进不来）。
+ *
+ * 任何一步都可以跳过：卡已经绑好了，积分照常入账，只是暂时冻结不可兑换，
+ * 客人下次到店再补确认即可。绝不为了这一步卡住收银。
+ */
+async function runConsentFlow(member, sent) {
+  if (!sent || sent.error) {
+    toast('确认码没发出去，积分会先冻结（可稍后在会员处重发）', 'err');
+    return;
+  }
+
+  const where = sent.channel === 'sms' ? '手机短信' : '邮箱';
+  let tip = `确认码已发到客人的${where}。\n请让客人报出 6 位数字。`;
+
+  for (;;) {
+    const code = await UI.input(tip, {
+      numeric: true, okText: '确认', cancelText: '稍后再说',
+    });
+    if (code === null) {
+      toast('未确认，积分先冻结', 'err');
+      return;
+    }
+
+    try {
+      await api('/consent/verify', { member_id: member.id, code });
+      member.consent_status = 1;
+      member.points_frozen  = false;
+      toast('已确认，积分可以兑换了', 'ok');
+      return;
+    } catch (e) {
+      // 码错了还能再试；过期或锁死就只能重发
+      if (e.error === 'code_wrong') {
+        const left = e.detail && e.detail.left;
+        tip = `确认码不正确${left ? `（还可以试 ${left} 次）` : ''}。\n请客人再报一次。`;
+        continue;
+      }
+      if (e.error === 'code_expired' || e.error === 'code_locked') {
+        if (!await UI.confirm(`${e.message}\n\n要重新发一条吗？`, { okText: '重新发送' })) {
+          toast('未确认，积分先冻结', 'err');
+          return;
+        }
+        try {
+          const r = await api('/consent/send', { member_id: member.id });
+          const w = r.channel === 'sms' ? '手机短信' : '邮箱';
+          tip = `新的确认码已发到客人的${w}。\n请让客人报出 6 位数字。`;
+          continue;
+        } catch (e2) {
+          toast(e2.message, 'err');
+          return;
+        }
+      }
+      toast(e.message, 'err');
+      return;
+    }
+  }
+}
 
 /* ── 扫码 ─────────────────────────────────────────
  * 相机走容器桥接，二维码识别用 Chromium 自带的 BarcodeDetector ——

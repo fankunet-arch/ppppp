@@ -848,10 +848,10 @@ $cards  = $app->cards();
 $cardNo = $app->cardNumber();
 
 // ── 批次生成 ──
-$batch = $cards->generateBatch('SMOKEB1', 6);
-eq(6, count($batch), '生成 6 张卡');
-eq(6, count(array_unique(array_column($batch, 'card_no'))), '卡号互不重复');
-eq(6, count(array_unique(array_column($batch, 'serial'))), '顺序号互不重复');
+$batch = $cards->generateBatch('SMOKEB1', 8);
+eq(8, count($batch), '生成 8 张卡');
+eq(8, count(array_unique(array_column($batch, 'card_no'))), '卡号互不重复');
+eq(8, count(array_unique(array_column($batch, 'serial'))), '顺序号互不重复');
 
 $first = $batch[0];
 ok($cardNo->isWellFormed($first['card_no']), "卡号结构合法（{$first['display']}）");
@@ -996,8 +996,9 @@ ok(!$voidLook['ok'] && $voidLook['error'] === 'card_void', '扫已作废的旧�
 $b = null;
 foreach ($cards->batches() as $x) { if ($x['batch_no'] === 'SMOKEB1') { $b = $x; } }
 ok($b !== null, '批次能查到');
-eq(6, (int)$b['total'], '批次共 6 张');
-eq(3, (int)$b['active'], '其中 3 张已激活（换发的新卡 + 匿名卡 + 留了手机号的卡）');
+eq(8, (int)$b['total'], '批次共 8 张');
+eq(3, (int)$b['active'],
+   '其中 3 张已激活（换发的新卡 + 匿名卡 + 留了手机号的卡）——\n    这条断言在确认码那一段【之前】执行，后面还会再激活两张');
 eq(1, (int)$b['void_cnt'], '其中 1 张已作废（挂失的旧卡）');
 
 // ── 拒绝不合理的批次参数 ──
@@ -1095,6 +1096,111 @@ ok(!$r['ok'] && $r['error'] === 'card_missing',
 // 但经理仍可强制核销 —— 补卡之前不该卡住客人
 $r = $rw->redeem($couponId3, null, $manager, null, ['reason' => '卡已挂失待补发']);
 ok($r['ok'] && $r['forced'], '★ 没有卡时经理仍可强制核销');
+
+step('⑯ 现场确认码 —— 双重确认改成不依赖公网入口');
+
+/**
+ * 原方案是「客人点短信里的链接」，那需要一个公网可达的端点接收点击，
+ * 而门店网络是单向的（能出去、进不来）—— 这条路根本走不通，
+ * 而这个矛盾在原设计里没被发现。
+ *
+ * 改成现场输码：只发一个 6 位码（纯出站），客人当场报给收银员。
+ * 举证靠审计日志：发送时间、发到哪个渠道、校验通过时间、经手的操作员。
+ */
+
+/** 发送器替身 —— 不真发，只把最后一条消息记下来供断言 */
+$fakeMsg = new class([]) extends \Vip\Service\Messaging {
+    public array $sent = [];
+    public function ready(string $channel): bool { return true; }
+    public function readyChannels(): array { return ['sms', 'email']; }
+    public function send(string $channel, string $to, string $subject, string $text): array
+    {
+        $this->sent[] = compact('channel', 'to', 'subject', 'text');
+        return ['ok' => true];
+    }
+};
+
+$consent = new \Vip\Service\ConsentService(
+    $db, $app->members(), $fakeMsg, $app->cfg(), $app->audit(), SMOKE_STORE, '冒烟店'
+);
+$opC = ['id' => 7, 'name' => '收银员', 'device' => 'PAD-S'];
+
+// 备一位留了手机号的会员
+$cCard = $batch[4];
+$cBind = $svc->bindNewMember($cCard['card_no'], '600666555', null, null, $opStub);
+ok($cBind['ok'], '备一位留了手机号的会员');
+$cMid = (int)$cBind['member']['id'];
+eq(0, (int)$cBind['member']['consent_status'], '留了联系方式 → 待确认');
+
+// ── 发码 ──
+$r = $consent->sendCode($cMid, $opC);
+ok($r['ok'] && $r['channel'] === 'sms', '★ 有手机号 → 走短信');
+eq(1, count($fakeMsg->sent), '发出了一条');
+
+$msgText = $fakeMsg->sent[0]['text'];
+ok(preg_match('/\b(\d{6})\b/', $msgText, $mm) === 1, '消息里有 6 位码');
+$realCode = $mm[1];
+ok(str_contains($msgText, '冒烟店'), '消息里带店名（客人要知道是谁发的）');
+eq('600666555', $fakeMsg->sent[0]['to'], '发到客人留的手机号');
+
+$row = $db->one('SELECT * FROM member WHERE id = ?', [$cMid]);
+ok(!str_contains((string)$row['consent_code_hash'], $realCode),
+   '★ 库里存的是 hash，不含明文码');
+eq('sms', $row['consent_channel'], '记下走的哪个渠道（举证要说清发到哪里）');
+ok($row['consent_code_sent_at'] !== null, '记下发送时间');
+
+$log = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'consent_code_sent']);
+ok($log !== null, '发码留了审计');
+ok(!str_contains((string)$log['detail'], '600666555'),
+   '★ 审计里的收件人做了掩码 —— 日志本身不该成为一份联系方式清单');
+
+// ── 校验 ──
+$bad = $consent->verifyCode($cMid, '000000', $opC);
+ok(!$bad['ok'] && $bad['error'] === 'code_wrong', '码错了不给过');
+ok(($bad['left'] ?? null) !== null, '告诉还能试几次');
+
+$good = $consent->verifyCode($cMid, $realCode, $opC, '192.168.2.9');
+ok($good['ok'], '★ 正确的码通过');
+
+$row = $db->one('SELECT * FROM member WHERE id = ?', [$cMid]);
+eq(1, (int)$row['consent_status'], '★ 积分解冻（consent_status = 1）');
+eq(null, $row['consent_code_hash'], '通过后码立即作废，不留在库里');
+eq('192.168.2.9', $row['consent_ip'], '记下确认来源 IP，举证用');
+
+$log = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'consent_confirmed']);
+ok($log !== null, '★ 确认通过留了审计（这就是举证链条）');
+
+// 幂等：已确认的再确认一次不报错
+ok($consent->verifyCode($cMid, 'whatever', $opC)['ok'], '已确认的会员重复确认不报错');
+
+// ── 连错锁定 ──
+$cCard2 = $batch[5];
+$cBind2 = $svc->bindNewMember($cCard2['card_no'], '600666444', null, null, $opStub);
+$cMid2  = (int)$cBind2['member']['id'];
+$consent->sendCode($cMid2, $opC);
+
+$lockAt = null;
+for ($i = 1; $i <= 8; $i++) {
+    $rr = $consent->verifyCode($cMid2, '111111', $opC);
+    if (($rr['error'] ?? '') === 'code_locked') { $lockAt = $i; break; }
+}
+eq(\Vip\Service\ConsentService::MAX_FAIL + 1, $lockAt,
+   '★ 连错 ' . \Vip\Service\ConsentService::MAX_FAIL . ' 次后锁定（防穷举 6 位码）');
+
+// 重发换新码，并解掉锁
+$before = count($fakeMsg->sent);
+$r2 = $consent->sendCode($cMid2, $opC);
+ok($r2['ok'], '★ 锁住之后可以重发');
+eq($before + 1, count($fakeMsg->sent), '确实又发了一条');
+preg_match('/\b(\d{6})\b/', $fakeMsg->sent[count($fakeMsg->sent) - 1]['text'], $m2);
+ok($consent->verifyCode($cMid2, $m2[1], $opC)['ok'], '★ 新码可用（重发会重置失败计数）');
+
+// ── 匿名会员没有可确认的对象 ──
+$anonR = $consent->sendCode((int)$anon['member']['id'], $opC);
+ok(!$anonR['ok'] && $anonR['error'] === 'consent_already_done',
+   '★ 匿名卡本来就是已生效状态，不需要也不能再确认');
 
 step('⑬ 不变量总校验');
 

@@ -70,6 +70,10 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 也不必为一个根本没在用的采集表单去应付合规检查。
   -- 注意：本种子是 ON DUPLICATE KEY UPDATE config_value，重跑 seed 会把它
   -- 重置回 0。方向是安全的（回到不收集），但门店若已开启需重新打开。
+(@store,'consent_channel','auto',@now),
+  -- 确认码渠道：auto = 有手机号发短信，否则发邮件。凭据在 config.php
+(@store,'privacy_policy_url','',@now),
+  -- 附在确认码消息里的隐私政策网址。留空则不附，但现场仍须口头告知
 (@store,'consent_expire_days','30',@now),
   -- 未同意的会员：积分冻结 + PII 假名化的期限
 (@store,'pii_retention_years','3',@now),

@@ -158,6 +158,19 @@ final class ConfigSchema
                      . '关闭是默认值：卡片不实名，凭卡号与卡背 PIN 即可积分与兑换。'
                      . '开启前必须先接通确认短信，否则客人收不到确认链接、积分会永久冻结',
         ],
+        'consent_channel' => [
+            'group' => 'compliance', 'type' => 'select',
+            'label' => '确认码发送渠道',
+            'desc'  => '客人留了联系方式后，确认码从哪个渠道发出。'
+                     . '「自动」= 有手机号就发短信，否则发邮件。'
+                     . '凭据填在 config.php 里，这里只选用哪个',
+            'options' => ['auto' => '自动（优先短信）', 'sms' => '只发短信', 'email' => '只发邮件'],
+        ],
+        'privacy_policy_url' => [
+            'group' => 'compliance', 'type' => 'text',
+            'label' => '隐私政策网址',
+            'desc'  => '会附在确认码消息里。留空则不附 —— 但现场仍须口头告知',
+        ],
         'consent_expire_days' => [
             'group' => 'compliance', 'type' => 'int', 'unit' => '天',
             'label' => '未确认会员的保留期',

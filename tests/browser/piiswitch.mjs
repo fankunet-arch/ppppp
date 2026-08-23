@@ -33,7 +33,7 @@ await page.waitForSelector('[data-ck="member_collect_pii"]', { timeout: 5000 });
 await page.click('[data-ck="member_collect_pii"]');
 await page.waitForSelector('.ui-ask:not([hidden])', { timeout: 3000 });
 const msg = await page.locator('.ui-ask-msg').textContent();
-ok(/尚未接入/.test(msg), '★ 开启前弹窗告知短信未接入');
+ok(/尚未接入|未配置/.test(msg), '★ 开启前弹窗告知发送渠道未就绪');
 ok(/积分会一直冻结/.test(msg), '说清后果：客人积分会一直冻结');
 ok(await page.locator('.ui-ok').evaluate(el => el.classList.contains('ui-danger')), '按钮是危险色');
 
@@ -51,13 +51,13 @@ await page.click('.ui-ok');
 await page.waitForFunction(() => document.querySelectorAll('#cp-warnings .warnbar').length > 0,
                            null, { timeout: 5000 }).catch(() => {});
 const bar = await page.locator('#cp-warnings .warnbar').textContent().catch(() => '');
-ok(/确认短信/.test(bar), `★ 开启后立刻出现常驻红条：「${bar.trim().slice(0, 40)}…」`);
+ok(/积分会一直冻结/.test(bar), `★ 开启后立刻出现常驻红条：「${bar.trim().slice(0, 40)}…」`);
 
 // ── 重新登录，红条仍在（不是一次性提示）──
 await page.reload({ waitUntil: 'networkidle' });
 await page.waitForSelector('#view-main.active', { timeout: 5000 });
 const bar2 = await page.locator('#cp-warnings .warnbar').textContent().catch(() => '');
-ok(/确认短信/.test(bar2),
+ok(/积分会一直冻结/.test(bar2),
    '★ 刷新页面后红条仍在（走的是会话恢复那条路，只在登录处理里渲染会漏）');
 
 // ── 关掉开关 → 红条消失 ──

@@ -67,6 +67,15 @@ final class Api
         'card_missing'           => '该会员当前没有绑定的卡，请先补发一张',
         'reason_required'        => '强制核销必须填写原因',
         'pii_disabled'           => '本店未开启收集联系方式，请勿向客人索要',
+        'no_channel'             => '发不出确认码：短信/邮件未配置，或客人没留对应的联系方式',
+        'channel_not_configured' => '发送渠道未配置，请联系管理员',
+        'send_failed'            => '确认码发送失败，请稍后重试',
+        'no_recipient'           => '没有可用的手机号或邮箱',
+        'code_not_sent'          => '还没有发送过确认码',
+        'code_wrong'             => '确认码不正确',
+        'code_expired'           => '确认码已过期，请重新发送',
+        'code_locked'            => '确认码连续输错多次，请重新发送一条',
+        'consent_already_done'   => '该会员已完成确认',
         'server_error'           => '系统内部错误，请稍后重试',
     ];
 
