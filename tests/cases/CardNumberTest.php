@@ -4,99 +4,114 @@ declare(strict_types=1);
 use Vip\CardNumber;
 
 /**
- * 实体卡号 —— 顺序编号 + HMAC 校验位。
+ * 实体卡号 —— 前缀 + 顺序号 + 随机后缀。
  *
- * 这一组的重点不是「能生成」，而是几条安全性质：
- *   · 拿到一张卡，推算不出邻居卡号（顺序编号的固有风险，靠校验位挡）
- *   · 输错任何一位都能立刻发现（否则收银员会以为是卡的问题去翻库存）
- *   · 换了密钥，旧卡全部失效（所以密钥必须离线备份，测试里钉死这个事实）
+ * 卡号的「真伪」由 card 库存表说了算，这里只管两件事：
+ *   · 生成：顺序号 + 密码学随机后缀
+ *   · 结构：查库之前挡掉明显的垃圾输入，并容忍收银员的手输误差
  */
 
-$SECRET = 'test-secret-至少十六字节-abcdef';
-$cn = new CardNumber('TK', $SECRET);
+$cn = new CardNumber('TK');
 
 T::group('实体卡号 · 生成与格式');
 
-$c1 = $cn->make(1);
-$c2 = $cn->make(123);
-T::eq(14, strlen($c1), '长度 = 前缀2 + 顺序8 + 校验4 = 14');
-T::true(str_starts_with($c1, 'TK00000001'), "顺序号补零到 8 位（{$c1}）");
-T::eq('TK-00000123-' . substr($c2, -4), $cn->format($c2), "印刷分组形式（{$cn->format($c2)}）");
-T::eq(123, $cn->serialOf($c2), '能取回顺序号');
+$c = $cn->make(123, '4Q7');
+T::eq('TK000001234Q7', $c, '前缀 + 8位顺序号 + 3位随机');
+T::eq(13, $cn->length(), '总长 13 位');
+T::eq('TK-00000123-4Q7', $cn->format($c), '印刷分组形式');
+T::eq(123, $cn->serialOf($c), '能取回顺序号');
+T::eq('4Q7', $cn->suffixOf($c), '能取回随机后缀');
 
-// 校验位只用 Crockford Base32 的字符，卡片上不会出现 I/L/O/U
-$check = substr($c2, -4);
-T::true(strspn($check, CardNumber::ALPHABET) === 4,
-    "校验位只用无歧义字符集（{$check}）");
-
-T::group('实体卡号 · 校验位挡住伪造');
-
-T::true($cn->isValid($c2), '自己生成的卡号能通过校验');
-T::false($cn->isValid('TK000001234Q7X'), '瞎编的校验位过不了');
+T::group('实体卡号 · 随机后缀');
 
 /**
- * ★ 最要紧的一条：顺序编号意味着拿到一张真卡就知道邻居的顺序号，
- *   而那些卡确实在库存里（已印刷未发放）。校验位必须让人算不出来。
+ * 后缀是防「拿到一张真卡推算邻居卡号」的唯一屏障 ——
+ * 邻居卡确实躺在库存里（已印刷未发放），没有它就能直接拿去激活。
  */
-$neighbor = substr($c2, 0, 10);                    // TK + 00000123 → 改成 124
-$guess    = 'TK00000124' . substr($c2, -4);        // 沿用手上这张的校验位
-T::false($cn->isValid($guess), '★ 拿邻居顺序号 + 手上的校验位，验不过');
-T::true($cn->isValid($cn->make(124)), '而正确生成的 124 号是有效的');
-
-// 逐位篡改：任何一位错了都必须被发现
-$bad = 0;
-for ($i = 0; $i < strlen($c2); $i++) {
-    foreach (['0', '9', 'A', 'Z'] as $ch) {
-        $t = $c2;
-        if ($t[$i] === $ch) { continue; }
-        $t[$i] = $ch;
-        if ($cn->isValid($t)) { $bad++; }
+$suffixes = [];
+$malformed = 0;
+for ($i = 0; $i < 200; $i++) {
+    $s = $cn->randomSuffix();
+    $suffixes[$s] = true;
+    if (strlen($s) !== 3 || strspn($s, CardNumber::ALPHABET) !== 3) {
+        $malformed++;
     }
 }
-T::eq(0, $bad, '★ 单字符篡改一律验不过（手输错字当场能发现）');
+T::eq(0, $malformed, '后缀恒为 3 位且只用无歧义字符集');
+T::true(count($suffixes) > 100, '★ 200 次生成得到 ' . count($suffixes) . ' 种不同后缀（确实是随机的）');
 
-T::group('实体卡号 · 密钥就是命根子');
+// 用 random_int 而不是 rand/mt_rand —— 卡号可猜就等于没有后缀
+$src = file_get_contents(__DIR__ . '/../../app/lib/CardNumber.php');
+T::true(str_contains($src, 'random_int('), '★ 用密码学随机源');
+T::false((bool)preg_match('/(?<![\w_])(mt_)?rand\s*\(/', $src),
+    '★ 没有用 rand / mt_rand（可预测，等于没有后缀）');
 
-$other = new CardNumber('TK', 'another-secret-十六字节以上-xyz');
-T::false($other->isValid($c2),
-    '★ 换了 card_hmac_secret，已印出的卡全部失效 —— 所以它必须离线备份');
-T::true($other->isValid($other->make(123)), '新密钥下自己生成的仍然有效');
+T::group('实体卡号 · 不要再加 HMAC');
+
+/**
+ * 这一条是防止后人「顺手加强」。
+ *
+ * 卡号无论如何都要查一次 card 表（还得知道是未发放/已激活/已挂失），
+ * 所以 HMAC 提供的「离线验真伪」收益为零；而代价是一个永远不能更换、
+ * 丢失即全部实体卡作废、还必须独立于数据库离线备份的密钥。
+ */
+T::false(str_contains($src, 'hash_hmac'),
+    '★ 卡号不依赖任何密钥 —— 备份跟着数据库走，没有额外的单点故障');
+
+T::group('实体卡号 · 结构检查');
+
+T::true($cn->isWellFormed($c), '自己生成的通过');
+T::false($cn->isWellFormed(''), '空串不通过');
+T::false($cn->isWellFormed('TK'), '只有前缀不通过');
+T::false($cn->isWellFormed('TK000001234Q'), '少一位不通过');
+T::false($cn->isWellFormed('TK000001234Q77'), '多一位不通过');
+T::false($cn->isWellFormed('XY000001234Q7'), '别家的前缀不通过');
+T::false($cn->isWellFormed('TK0000ABCD4Q7'), '顺序号必须是数字');
+
+// 结构合法 ≠ 卡存在。真伪只有库存表说了算，这里不做也做不到判断。
+T::true($cn->isWellFormed('TK999999994Q7'),
+    '★ 结构合法但库里没有 —— 这一层只挡垃圾输入，不判真伪');
 
 T::group('实体卡号 · 手工输入的容错');
 
-$printed = $cn->format($c2);                        // TK-00000123-XXXX
-T::true($cn->isValid($printed), '带连字符的印刷形式可直接输入');
-T::true($cn->isValid(strtolower($printed)), '小写也认');
-T::true($cn->isValid(" {$printed} "), '首尾空格不影响');
-T::true($cn->isValid(str_replace('-', ' ', $printed)), '用空格分组也认');
+$printed = $cn->format($c);                       // TK-00000123-4Q7
+T::true($cn->isWellFormed($printed), '带连字符的印刷形式可直接输入');
+T::true($cn->isWellFormed(strtolower($printed)), '小写也认');
+T::true($cn->isWellFormed(" {$printed} "), '首尾空格不影响');
+T::true($cn->isWellFormed(str_replace('-', ' ', $printed)), '用空格分组也认');
+T::eq($c, CardNumber::normalize($printed), '归一化后与原始卡号一致');
 
 /**
- * 字母表里没有 I/L/O/U，所以可以放心把它们映射回数字，不会撞车。
- * 收银员在卡片印刷体下把 0 看成 O 是常事。
+ * 字母表里没有 I/L/O/U，所以能放心把它们映射回数字而不会撞车。
+ * 收银员照着卡面把 0 读成 O、1 读成 I 是常事。
  */
 T::eq('0', CardNumber::normalize('O'), 'O → 0');
 T::eq('1', CardNumber::normalize('I'), 'I → 1');
 T::eq('1', CardNumber::normalize('L'), 'L → 1');
-T::eq('TK000001234Q7X', CardNumber::normalize('tk-OOOOOI23-4q7x'),
+T::eq('V', CardNumber::normalize('U'), 'U → V');
+T::eq('TK000001234Q7', CardNumber::normalize('tk-OOOOOI23-4q7'),
     '★ 混合误读也能纠正回来');
 
-T::group('实体卡号 · 拒绝不安全的配置');
+T::group('实体卡号 · 边界与拒绝');
+
+T::true($cn->isWellFormed($cn->make(0)), '顺序号 0 可用');
+T::true($cn->isWellFormed($cn->make(99999999)), '顺序号上限 8 位可用');
+
+foreach ([[-1, '负数'], [100000000, '超出 8 位']] as [$bad, $why]) {
+    $threw = false;
+    try { $cn->make($bad); } catch (\InvalidArgumentException $e) { $threw = true; }
+    T::true($threw, "{$why}的顺序号拒绝生成");
+}
+
+foreach ([['T-K', '带连字符'], ['', '空'], ['TOOLONG', '超过 4 位']] as [$bad, $why]) {
+    $threw = false;
+    try { new CardNumber($bad); } catch (\InvalidArgumentException $e) { $threw = true; }
+    T::true($threw, "{$why}的前缀被拒绝");
+}
 
 $threw = false;
-try { new CardNumber('TK', 'short'); } catch (\InvalidArgumentException $e) { $threw = true; }
-T::true($threw, '★ 密钥太短直接拒绝，不给「先跑起来再说」的机会');
+try { $cn->make(1, 'ab'); } catch (\InvalidArgumentException $e) { $threw = true; }
+T::true($threw, '后缀位数不对时拒绝');
 
-$threw = false;
-try { new CardNumber('T-K', str_repeat('x', 32)); } catch (\InvalidArgumentException $e) { $threw = true; }
-T::true($threw, '前缀必须是纯字母');
-
-T::group('实体卡号 · 边界');
-
-T::true($cn->isValid($cn->make(0)), '顺序号 0 可用');
-T::true($cn->isValid($cn->make(99999999)), '顺序号上限 8 位可用');
-$threw = false;
-try { $cn->make(100000000); } catch (\InvalidArgumentException $e) { $threw = true; }
-T::true($threw, '超出 8 位拒绝生成');
-T::false($cn->isValid(''), '空串不是合法卡号');
-T::false($cn->isValid('TK'), '只有前缀不是合法卡号');
-T::eq(null, $cn->serialOf('TK000001234Q7X'), '非法卡号取不到顺序号');
+T::eq(null, $cn->serialOf('TK'), '结构不合法时取不到顺序号');
+T::eq(null, $cn->suffixOf('TK'), '结构不合法时取不到后缀');
