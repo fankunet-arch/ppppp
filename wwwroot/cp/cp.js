@@ -83,6 +83,7 @@ const LOADERS = {
   dashboard: loadDashboard, alerts: loadAlerts, reviews: loadReviews,
   rules: loadRules, members: () => {}, report: loadReport,
   config: loadConfig, operators: loadOperators, audit: loadAudit, coupons: loadCoupons,
+  cards: loadCards,
 };
 $$('.tab').forEach(t => t.onclick = () => {
   $$('.tab').forEach(x => x.classList.toggle('on', x === t));
@@ -468,6 +469,106 @@ $('#btn-add-op').onclick = async () => {
     $('#op-login').value = ''; $('#op-name-new').value = ''; $('#op-pin').value = '';
     loadOperators();
   } catch (e) { toast(e.message + (e.detail?.hint ? '：' + e.detail.hint : ''), 'err'); }
+};
+
+
+/* ── 实体卡发放 ───────────────────────────────────── */
+
+async function loadCards() {
+  const d = await api('/cards/batches', undefined, 'GET');
+
+  const tot = d.batches.reduce((a, b) => ({
+    total: a.total + b.total, stock: a.stock + b.stock,
+    active: a.active + b.active, void: a.void + b.void,
+  }), { total: 0, stock: 0, active: 0, void: 0 });
+
+  $('#card-stats').innerHTML = `
+    <div class="stat"><b>${tot.total}</b><span>已印制</span></div>
+    <div class="stat"><b>${tot.stock}</b><span>库存待发</span></div>
+    <div class="stat"><b>${tot.active}</b><span>已激活</span></div>
+    <div class="stat"><b>${tot.void}</b><span>已作废</span></div>
+    <div class="stat"><b>${esc(d.prefix)}</b><span>卡号前缀</span></div>
+    <div class="stat"><b>${d.next_serial}</b><span>下一个顺序号</span></div>`;
+
+  $('#card-batches').innerHTML = d.batches.length ? `<table>
+    <tr><th>批次</th><th>顺序号区间</th><th class="num">共</th><th class="num">库存</th>
+        <th class="num">已激活</th><th class="num">已作废</th><th>生成时间</th></tr>${
+    d.batches.map(b => `<tr>
+      <td><b>${esc(b.batch_no)}</b></td>
+      <td class="muted small">${b.serial_from} ~ ${b.serial_to}</td>
+      <td class="num">${b.total}</td>
+      <td class="num">${b.stock}</td>
+      <td class="num">${b.active}</td>
+      <td class="num">${b.void || ''}</td>
+      <td class="muted small">${esc(b.created_at)}</td></tr>`).join('')
+  }</table>` : '<div class="empty">还没有生成过任何批次</div>';
+
+  // 生成批次是管理员才有的动作 —— 它能一次拿到整批明文 PIN
+  const box = $('#cd-gen-box');
+  if (box) box.hidden = !window.IS_ADMIN;
+}
+
+$('#btn-card-look').onclick = async () => {
+  const no = $('#cd-look').value.trim();
+  if (!no) return toast('请输入卡号', 'err');
+  const box = $('#card-look-result');
+  try {
+    const c = await api('/cards/lookup', { card_no: no });
+    const stateText = { stock: '库存中，尚未发给客人', active: '已激活，正常使用中',
+                        void: '已作废/挂失' }[c.state] || c.state;
+    box.innerHTML = `<table>
+      <tr><th>卡号</th><td><b>${esc(c.card_no)}</b></td></tr>
+      <tr><th>状态</th><td>${esc(stateText)}</td></tr>
+      <tr><th>批次</th><td>${esc(c.batch_no)}　顺序号 ${c.serial}</td></tr>
+      ${c.activated_at ? `<tr><th>激活时间</th><td>${esc(c.activated_at)}</td></tr>` : ''}
+      ${c.voided_at ? `<tr><th>作废</th><td>${esc(c.voided_at)}　${esc(c.void_reason || '')}</td></tr>` : ''}
+      ${c.pin_locked_until ? `<tr><th class="warn">PIN 锁定至</th><td>${esc(c.pin_locked_until)}</td></tr>` : ''}
+      ${c.member ? `<tr><th>持卡会员</th><td>#${c.member.id}　${esc(c.member.phone || c.member.email || '')}
+        　积分 ${c.member.points_balance}　计次 ${c.member.visit_count}</td></tr>` : ''}
+    </table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+};
+
+$('#btn-card-void').onclick = async () => {
+  const no = $('#cd-void').value.trim(), why = $('#cd-void-why').value.trim();
+  if (!no || !why) return toast('卡号与原因都必填', 'err');
+  if (!await UI.confirm(`确认作废这张卡？\n\n${no}\n\n作废后该会员会暂时没有卡，积分与流水都保留，下次到店扫新卡即可换发。`,
+                        { okText: '确认作废', danger: true })) return;
+  try {
+    const r = await api('/cards/void', { card_no: no, reason: why });
+    toast(`${r.card_no} 已作废`, 'ok');
+    $('#cd-void').value = ''; $('#cd-void-why').value = '';
+    loadCards();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+$('#btn-card-gen').onclick = async () => {
+  const batch = $('#cd-batch').value.trim();
+  const count = +$('#cd-count').value || 0;
+  if (count < 1) return toast('数量必须大于 0', 'err');
+
+  if (!await UI.confirm(
+    `生成 ${count} 张新卡？\n\n` +
+    `生成后会一次性显示全部卡号与 PIN，这是明文 PIN 唯一出现的时刻 ——\n` +
+    `库里只存不可还原的 hash，关掉就再也取不回来，只能作废整批重来。\n\n` +
+    `请准备好立刻复制保存。`,
+    { okText: '生成并显示清单' })) return;
+
+  try {
+    const d = await api('/cards/generate', { batch_no: batch, count });
+    // 制表符分隔：直接粘进 Excel 就是三列，不用做 CSV 转义
+    const lines = ['卡号\t二维码内容\tPIN']
+      .concat(d.rows.map(r => `${r.display}\t${r.card_no}\t${r.pin}`));
+    $('#card-gen-csv').value = lines.join('\n');
+    $('#card-gen-warn').textContent = d.warning;
+    $('#card-gen-result').hidden = false;
+    $('#card-gen-csv').focus();
+    $('#card-gen-csv').select();
+    toast(`批次 ${d.batch_no} 已生成 ${d.count} 张`, 'ok');
+    loadCards();
+  } catch (e) { toast(e.message, 'err'); }
 };
 
 /* ── 审计 ─────────────────────────────────────────── */

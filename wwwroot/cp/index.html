@@ -33,6 +33,7 @@
       <button class="tab" data-tab="report">报表</button>
       <button class="tab" data-tab="config">配置</button>
       <button class="tab" data-tab="coupons">奖励券</button>
+      <button class="tab" data-tab="cards">发卡</button>
       <button class="tab" data-tab="operators">操作员</button>
       <button class="tab" data-tab="audit">审计</button>
     </nav>
@@ -123,6 +124,56 @@
       <p class="muted small">手工发放不占用客人靠消费攒来的那张，会单独记入审计日志。</p>
     </details>
     <div id="coupon-list"></div>
+  </div>
+
+  <div id="tab-cards" class="panel">
+    <h3>实体卡发放</h3>
+    <div id="card-stats" class="stats"></div>
+
+    <details class="add-box">
+      <summary>查一张卡（客人问「我这卡还能用吗」）</summary>
+      <div class="row">
+        <label>卡号<input id="cd-look" type="text" placeholder="扫码或手输，如 TK-00000123-4Q7"></label>
+        <button id="btn-card-look" class="primary">查询</button>
+      </div>
+      <div id="card-look-result"></div>
+    </details>
+
+    <details class="add-box">
+      <summary>挂失 / 作废一张卡</summary>
+      <div class="row">
+        <label>卡号<input id="cd-void" type="text" placeholder="卡号"></label>
+        <label>原因（必填）<input id="cd-void-why" type="text" placeholder="如：客人报失"></label>
+      </div>
+      <button id="btn-card-void" class="primary">作废</button>
+      <p class="muted small">
+        作废后该会员会暂时没有卡，积分与流水都保留。下次到店扫一张新卡即可换发。
+      </p>
+    </details>
+
+    <details class="add-box" id="cd-gen-box">
+      <summary>生成新批次（交给印刷厂）</summary>
+      <div class="row">
+        <label>批次号<input id="cd-batch" type="text" placeholder="留空自动按日期生成"></label>
+        <label>数量<input id="cd-count" type="number" min="1" max="5000" value="200"></label>
+      </div>
+      <button id="btn-card-gen" class="primary">生成</button>
+      <p class="muted small">
+        单批最多 5000 张。顺序号自动接着上一批往下排，不会重号。
+      </p>
+    </details>
+
+    <div id="card-gen-result" hidden>
+      <p class="err" id="card-gen-warn"></p>
+      <p class="muted small">
+        全选下面的内容复制，粘进 Excel 即可（制表符分隔）。
+        <b>关掉这一块之后 PIN 就再也取不回来了</b>，只能作废整批重新生成。
+      </p>
+      <textarea id="card-gen-csv" rows="14" style="width:100%;font-family:monospace;font-size:12px"></textarea>
+    </div>
+
+    <h3 style="margin-top:24px">已有批次</h3>
+    <div id="card-batches"></div>
   </div>
 
   <div id="tab-operators" class="panel">
