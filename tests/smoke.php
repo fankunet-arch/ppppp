@@ -987,6 +987,90 @@ try { $cards->generateBatch('SMOKEB1', 1); }
 catch (\InvalidArgumentException $e) { $threw = true; }
 ok($threw, '★ 批次号重复时拒绝（否则盘点时对不上账）');
 
+step('⑮ 核销验卡背 PIN —— 唯一真正会造成损失的一步');
+
+/**
+ * 二维码印在卡正面可被拍照复制，PIN 藏在刮开层下只有真正拿到卡的人知道。
+ * 所以核销要验 PIN，而积分入账那一侧不验 ——
+ * 被人抄卡去攒分，店家没有损失，受害者反而多了分。
+ */
+$pinBatch = $app->cards()->generateBatch('SMOKEPIN', 2);
+$pinCard  = $pinBatch[0];
+$bindR    = $app->cardService()->bindNewMember(
+    $pinCard['card_no'], '600777001', null, null, $opStub
+);
+ok($bindR['ok'], '备一位持卡会员');
+$pinMid = (int)$bindR['member']['id'];
+
+// 发一张券给他
+$rw = $app->rewards();
+$db->exec('INSERT INTO coupon (store_code, member_id, coupon_type, source, code, status, created_at)
+           VALUES (?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $pinMid, 1, 3, 'SMOKEPINC1', 1, $db->now()]);
+$couponId = (int)$db->lastInsertId();
+
+$cashier = ['id' => 9, 'name' => '收银员', 'role' => 1];
+$manager = ['id' => 8, 'name' => '经理',   'role' => 2];
+
+// ── 不给 PIN ──
+$r = $rw->redeem($couponId, null, $cashier);
+ok(!$r['ok'] && $r['error'] === 'pin_required', '★ 不给 PIN 不给核销');
+eq(1, (int)$db->value('SELECT status FROM coupon WHERE id=?', [$couponId]), '券仍未使用');
+
+// ── PIN 不对 ──
+$r = $rw->redeem($couponId, null, $cashier, '000000');
+ok(!$r['ok'] && $r['error'] === 'pin_wrong', 'PIN 不对不给核销');
+eq(1, (int)$db->value('SELECT status FROM coupon WHERE id=?', [$couponId]), '券仍未使用');
+
+// ── 收银员不能强制核销 ──
+$r = $rw->redeem($couponId, null, $cashier, null, ['reason' => '想跳过']);
+ok(!$r['ok'] && $r['error'] === 'forbidden', '★ 收银员强制核销被拒（需经理及以上）');
+
+// ── 经理强制核销必须填原因 ──
+$r = $rw->redeem($couponId, null, $manager, null, ['reason' => '  ']);
+ok(!$r['ok'] && $r['error'] === 'reason_required', '★ 强制核销必须填原因');
+
+// ── 正确 PIN ──
+$app->cards()->resetPinFail((int)$app->cards()->findByCardNo($pinCard['card_no'])['id']);
+$r = $rw->redeem($couponId, 'SER001', $cashier, $pinCard['pin']);
+ok($r['ok'], '★ 正确 PIN 核销成功');
+ok(!$r['forced'], '走的是正常路径，不是强制');
+eq(2, (int)$db->value('SELECT status FROM coupon WHERE id=?', [$couponId]), '券状态变为已核销');
+
+$audit = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'coupon_redeem']);
+ok($audit !== null, '正常核销记 coupon_redeem 审计事件');
+
+// ── 经理强制核销（另一张券）──
+$db->exec('INSERT INTO coupon (store_code, member_id, coupon_type, source, code, status, created_at)
+           VALUES (?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $pinMid, 1, 3, 'SMOKEPINC2', 1, $db->now()]);
+$couponId2 = (int)$db->lastInsertId();
+
+$r = $rw->redeem($couponId2, null, $manager, null, ['reason' => '客人忘记卡背 PIN']);
+ok($r['ok'] && $r['forced'], '★ 经理带原因可强制核销');
+eq(2, (int)$db->value('SELECT status FROM coupon WHERE id=?', [$couponId2]), '券已核销');
+
+$forcedLog = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'coupon_redeem_forced']);
+ok($forcedLog !== null, '★ 强制核销记的是单独的 coupon_redeem_forced 事件');
+ok(str_contains((string)$forcedLog['detail'], '客人忘记'), '原因写进了审计明细');
+
+// ── 挂失后没有卡 ──
+$db->exec('INSERT INTO coupon (store_code, member_id, coupon_type, source, code, status, created_at)
+           VALUES (?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $pinMid, 1, 3, 'SMOKEPINC3', 1, $db->now()]);
+$couponId3 = (int)$db->lastInsertId();
+$app->cards()->void((int)$app->cards()->findByCardNo($pinCard['card_no'])['id'], '测试挂失');
+
+$r = $rw->redeem($couponId3, null, $cashier, '123456');
+ok(!$r['ok'] && $r['error'] === 'card_missing',
+   '★ 会员当前没有卡时说清楚（别让人对着 PIN 框干瞪眼）');
+
+// 但经理仍可强制核销 —— 补卡之前不该卡住客人
+$r = $rw->redeem($couponId3, null, $manager, null, ['reason' => '卡已挂失待补发']);
+ok($r['ok'] && $r['forced'], '★ 没有卡时经理仍可强制核销');
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

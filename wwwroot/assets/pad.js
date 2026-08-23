@@ -591,11 +591,63 @@ async function redeemCoupon(personIndex, memberId) {
     `核销券 ${c.code}？\n\n` +
     `有效期至 ${c.valid_to || '永久'}\n\n` +
     `★ 核销后请记得在 POS 上打对应的折扣，两边才对得上账。`,
-    { okText: '确认核销' }
+    { okText: '下一步：验 PIN' }
   )) return;
+
+  /**
+   * 核销必须验卡背 PIN —— 这是整条链路上唯一真正会造成损失的一步。
+   * 二维码印在卡正面可被拍照复制，PIN 藏在刮开层下，只有真正拿到卡的
+   * 人知道。积分入账那一侧不验：被人抄卡去攒分，店家没有损失。
+   */
+  const pin = await UI.input(
+    `请让客人刮开卡背，报出 6 位 PIN`,
+    { password: true, numeric: true, okText: '核销' }
+  );
+  if (pin === null) return offerForceRedeem(c, personIndex, memberId);
+
   try {
-    await api('/coupon/redeem', { coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null });
+    await api('/coupon/redeem', {
+      coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null, pin,
+    });
     toast(`券 ${c.code} 已核销，请到 POS 打折`, 'ok');
+    loadRewardSlot(personIndex, memberId);
+  } catch (e) {
+    toast(e.message, 'err');
+    // PIN 这一类失败才提议强制核销；券本身的问题（过期、已用）提议也没用
+    if (['pin_wrong', 'pin_locked', 'pin_required', 'card_missing', 'pin_not_set'].includes(e.error)) {
+      offerForceRedeem(c, personIndex, memberId);
+    }
+  }
+}
+
+/**
+ * 经理强制核销。
+ *
+ * PIN 用 bcrypt 存、不可还原 —— 客人忘了、或卡背磨花了，谁也查不出来。
+ * 不留这条路，客人就得白跑一趟；把 PIN 存成可解密的又等于库一丢全部泄露。
+ * 所以：留后门，但要经理权限、必须填原因、单独记一条审计事件。
+ */
+async function offerForceRedeem(c, personIndex, memberId) {
+  if (!S.operator || !S.operator.is_manager) {
+    return;   // 收银员没这个权限，连提都不提，免得白按
+  }
+  if (!await UI.confirm(
+    `客人报不出 PIN？\n\n` +
+    `经理可以强制核销这张券。此操作会单独记入审计日志。`,
+    { okText: '强制核销', danger: true }
+  )) return;
+
+  const reason = await UI.input('强制核销原因（会记入审计日志）', {
+    value: '客人忘记卡背 PIN', okText: '确认强制核销', danger: true,
+  });
+  if (reason === null) return;
+
+  try {
+    await api('/coupon/redeem', {
+      coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null,
+      force: true, reason,
+    });
+    toast(`券 ${c.code} 已强制核销，请到 POS 打折`, 'ok');
     loadRewardSlot(personIndex, memberId);
   } catch (e) { toast(e.message, 'err'); }
 }

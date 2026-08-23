@@ -63,6 +63,9 @@ final class Api
         'pin_wrong'              => '卡背 PIN 不正确',
         'pin_locked'             => '卡背 PIN 连续输错多次，已临时锁定',
         'pin_not_set'            => '此卡没有设置 PIN，请联系管理员',
+        'pin_required'           => '请让客人刮开卡背并报出 PIN',
+        'card_missing'           => '该会员当前没有绑定的卡，请先补发一张',
+        'reason_required'        => '强制核销必须填写原因',
         'server_error'           => '系统内部错误，请稍后重试',
     ];
 

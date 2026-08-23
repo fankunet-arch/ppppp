@@ -398,17 +398,40 @@ $api->on('POST', '/member/rewards', static function () use ($app, $requireOperat
 });
 
 /** 核销一张奖励券 */
+/**
+ * 核销免费餐券 —— 整条链路上唯一真正会造成损失的一步。
+ *
+ * 必须验卡背 PIN：二维码印在卡正面可被拍照，PIN 藏在刮开层下，
+ * 只有真正拿到卡的人知道。
+ *
+ * force + reason 是经理强制核销：PIN 用 bcrypt 存、不可还原，
+ * 客人忘了或卡背磨花了谁也查不出来，必须留这条路。它要经理权限、
+ * 必须填原因，并单独记 coupon_redeem_forced 审计事件。
+ */
 $api->on('POST', '/coupon/redeem', static function () use ($app, $requireOperator): void {
     $op  = $requireOperator();
     $b   = Api::body();
     $cid = Api::int($b, 'coupon_id', 0);
     $ser = Api::str($b, 'serial_id');
+    $pin = Api::str($b, 'pin');
+    $force  = !empty($b['force']);
+    $reason = Api::str($b, 'reason', '') ?: '';
+
     if ($cid <= 0) {
         Api::fail('bad_request');
     }
-    $r = $app->rewards()->redeem($cid, $ser ?: null,
-        ['id' => $op['id'], 'name' => $op['name']]);
-    Api::fromResult($r, ['code' => $r['code'] ?? null]);
+
+    $r = $app->rewards()->redeem(
+        $cid, $ser ?: null,
+        ['id' => $op['id'], 'name' => $op['name'], 'role' => $op['role'] ?? 0],
+        $pin,
+        $force ? ['reason' => $reason] : null
+    );
+    Api::fromResult($r, [
+        'code'         => $r['code'] ?? null,
+        'forced'       => $r['forced'] ?? false,
+        'locked_until' => $r['locked_until'] ?? null,
+    ]);
 });
 
 /** 均摊计算 —— 放服务端算，保证与落库口径完全一致（余数给第一位） */
