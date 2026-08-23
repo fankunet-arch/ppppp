@@ -30,6 +30,7 @@ if ($task === '' || in_array($task, ['-h', '--help', 'help'], true)) {
       admin <工号> <显示名>      创建管理员账号
       passwd <工号>              重置该账号 PIN 并解除锁定（忘记 PIN 时用）
       all                       check + seed（migrate 需显式单独执行）
+      card-secret               生成实体卡的 HMAC 密钥（只生成，不写文件）
 
     TXT;
     exit(0);
@@ -240,6 +241,40 @@ function doSeed(App $app): void
 }
 
 // ════════════════════════════════════════════════════════════
+/**
+ * 生成实体卡的 HMAC 密钥。
+ *
+ * 只把值打到屏幕上，【不写任何文件】—— 写文件意味着它会躺在磁盘上、
+ * 进备份、可能被同步走。让人手工贴进 config.php，是唯一能确保
+ * 「它只存在于该在的地方」的做法。
+ *
+ * 这个密钥一旦有卡印出来就【永远不能换】：换了等于所有实体卡作废。
+ */
+function doCardSecret(array $config): void
+{
+    head('生成实体卡 HMAC 密钥');
+
+    $existing = (string)($config['card_hmac_secret'] ?? '');
+    if ($existing !== '') {
+        warn('config.php 里已经有 card_hmac_secret 了');
+        echo "\n\033[31m  如果已经印过卡，换掉它 = 所有实体卡当场作废。\033[0m\n";
+        echo "  只有在「还没印任何卡」时才可以替换。\n\n";
+    }
+
+    $secret = bin2hex(random_bytes(32));
+
+    echo "  把下面这一行加进 app/config/config.php：\n\n";
+    echo "\033[1m    'card_hmac_secret' => '{$secret}',\033[0m\n\n";
+    echo "  同时确认前缀（印在卡号最前面，1~4 位字母）：\n\n";
+    echo "    'card_prefix' => 'TK',\n\n";
+
+    echo "\033[33m  ── 三件事必须做到 ──\033[0m\n";
+    echo "  1. 立刻离线备份这串密钥（纸质或密码管理器）。\n";
+    echo "     服务器重装、磁盘损坏时丢了它，所有已发出的实体卡都验不过。\n";
+    echo "  2. 不要贴进聊天、邮件、工单、git —— 出现过一次就该换一条。\n";
+    echo "  3. config.php 已在 .gitignore 里，确认它没被误提交。\n";
+}
+
 function doAdmin(App $app, ?string $login, ?string $name): void
 {
     if ($login === null || $name === null) {
@@ -478,6 +513,7 @@ try {
         case 'passwd':  doPasswd($app, $argv[2] ?? null); break;
         case 'all':     doCheck($app, $config); doSeed($app); break;
         case 'repair':  doRepair($app, $config); break;
+        case 'card-secret': doCardSecret($config); break;
         default:
             fwrite(STDERR, "未知任务：{$task}\n");
             exit(1);
