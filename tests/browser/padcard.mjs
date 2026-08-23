@@ -38,6 +38,25 @@ await page.click('#search-type button[data-type="phone"]');
 ok(await page.locator('#btn-scan').isHidden(), '★ 切到「手机号」档时扫卡按钮隐藏');
 await page.click('#search-type button[data-type="card"]');
 
+/**
+ * 等一条【新的】toast。
+ *
+ * 必须先把旧的清掉再等：#toast 是全局共享元素，上一条有 3 秒存活期，
+ * 直接等「可见且文本匹配」会命中残留的旧提示，于是读到上一步的结果。
+ * （这条测试第一版就栽在这：明明留了手机号，却读到上一次「当场即可使用」。）
+ */
+const waitFreshToast = async (re) => {
+  await page.evaluate(() => {
+    const t = document.querySelector('#toast');
+    if (t) { t.hidden = true; t.textContent = ''; }
+  });
+  await page.waitForFunction((src) => {
+    const t = document.querySelector('#toast');
+    return t && !t.hidden && new RegExp(src).test(t.textContent || '');
+  }, re.source, { timeout: 8000 });
+  return page.locator('#toast').textContent();
+};
+
 const lookup = async (v) => {
   await page.fill('#member-input', v);
   await page.click('#btn-member-search');
@@ -62,19 +81,26 @@ const hint = await page.locator('#new-card-hint').textContent();
 ok(hint.includes(CARD_A), `表单里带出卡号：「${hint.trim()}」`);
 ok((await page.locator('#member-err').getAttribute('hidden')) !== null, '没有报错');
 
-// 不填手机号也不填邮箱
-await page.click('#btn-member-create');
-await page.waitForTimeout(300);
-ok(/至少填一项/.test(await page.locator('#member-err').textContent()), '手机号与邮箱都空时拦下');
+// 卡片不实名：什么都不填就能启用
+ok(await page.locator('#new-contact').evaluate(el => !el.open),
+   '联系方式默认收起（选填）');
+let t1 = '';
+await Promise.all([waitFreshToast(/已绑卡/).then(v => { t1 = v; }).catch(() => {}),
+                   page.click('#btn-member-create')]);
+ok(/当场即可使用/.test(t1), `★ 不填任何个人信息即可启用，且当场生效（${t1}）`);
+await page.waitForSelector('#member-modal', { state: 'hidden', timeout: 5000 });
 
-// 正常建
+// ── 留了联系方式的那条路仍走双重确认 ──
+await page.evaluate(() => openMemberModal('manual'));
+await page.waitForSelector('#member-modal:not([hidden])');
+await lookup(CARD_B);
+await page.click('#new-contact summary');
 await page.fill('#new-phone', '600555' + Math.floor(Math.random() * 900 + 100));
-await page.click('#btn-member-create');
-await page.waitForFunction(() => {
-  const t = document.querySelector('#toast');
-  return t && !t.hidden && /已创建并绑卡/.test(t.textContent || '');
-}, null, { timeout: 5000 }).catch(() => {});
-ok(/已创建并绑卡/.test(await page.locator('#toast').textContent()), '★ 建会员并绑卡成功');
+let t2 = '';
+await Promise.all([waitFreshToast(/已绑卡/).then(v => { t2 = v; }).catch(() => {}),
+                   page.click('#btn-member-create')]);
+ok(/等客人确认/.test(t2), `★ 留了手机号则积分先冻结，等确认（${t2}）`);
+await page.waitForSelector('#member-modal', { state: 'hidden', timeout: 5000 });
 
 // ── 再扫同一张 → 认出会员 ──
 await page.evaluate(() => openMemberModal('manual'));

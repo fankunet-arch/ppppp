@@ -175,12 +175,21 @@
     <details id="member-new">
       <summary>用这张卡建新会员</summary>
       <p class="muted small" id="new-card-hint"></p>
-      <p class="muted small">仅需手机号或邮箱其一。系统会立即发送含隐私政策的确认消息，
-        客人确认前积分照常入账但暂不可兑换。</p>
-      <label>手机号<input id="new-phone" type="tel" inputmode="tel" autocomplete="off"></label>
-      <label>邮箱<input id="new-email" type="email" inputmode="email" autocomplete="off"></label>
-      <label>生日（选填）<input id="new-birthday" type="date"></label>
-      <button id="btn-member-create" class="primary">创建并选用</button>
+      <p class="muted small">
+        卡片不实名 —— 凭卡号与卡背 PIN 即可积分与兑换，不需要留任何个人信息。
+      </p>
+      <button id="btn-member-create" class="primary big">启用这张卡</button>
+
+      <details id="new-contact">
+        <summary>选填：留联系方式（丢卡时可协助找回）</summary>
+        <p class="muted small">
+          一旦填写，这条记录就受个人信息保护法规约束：系统会发送含隐私政策的
+          确认消息，<b>客人确认前积分照常入账但暂不可兑换</b>。不填则当场就能用。
+        </p>
+        <label>手机号<input id="new-phone" type="tel" inputmode="tel" autocomplete="off"></label>
+        <label>邮箱<input id="new-email" type="email" inputmode="email" autocomplete="off"></label>
+        <label>生日<input id="new-birthday" type="date"></label>
+      </details>
     </details>
     <p id="member-err" class="err" hidden></p>
     <button id="btn-member-close" class="ghost">取消</button>

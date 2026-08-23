@@ -72,23 +72,41 @@ final class MemberRepo
      */
     public function create(string $cardNo, ?string $phone, ?string $email, ?string $birthday): array
     {
-        if (($phone === null || $phone === '') && ($email === null || $email === '')) {
-            throw new \InvalidArgumentException('手机号与邮箱至少填一项，否则无法发送双重确认');
-        }
         $card = \Vip\CardNumber::normalize($cardNo);
         if ($card === '') {
             throw new \InvalidArgumentException('必须提供实体卡号');
         }
+
+        /**
+         * ★ 是否收了个人信息，决定要不要走同意流程。
+         *
+         * 实体卡默认【不实名】：凭卡号 + 卡背 PIN 就能积分与兑换，
+         * 系统里不存任何可识别到人的数据。既然没有个人数据，
+         * 就没有可同意的对象 —— 直接置为已生效，积分不冻结。
+         * LOPDGDD/GDPR 对这类记录基本不适用。
+         *
+         * 但如果客人自愿留了手机号或邮箱（为了丢卡能找回），
+         * 那条记录就重新落入个人数据范畴，双重确认那套照旧：
+         * 置为待确认、积分冻结不可兑换，等客人点确认链接。
+         *
+         * 代价说清楚：不留联系方式 = 忘带卡当天积不了分、丢卡等于分没了，
+         * 且来报失的人没法证明卡是他的。这是门店已经接受的取舍。
+         */
+        $hasPii = ($phone !== null && $phone !== '') || ($email !== null && $email !== '');
+        $consent = $hasPii ? self::CONSENT_PENDING : self::CONSENT_ACTIVE;
+
         $now   = $this->db->now();
+        // 令牌只在需要确认时才有意义，但恒生成一个：uk_token 是唯一键，
+        // 留 NULL 虽然也能过，但让每行都有值，日后要补发确认信不用再回填
         $token = bin2hex(random_bytes(24));
 
         $this->db->exec(
             'INSERT INTO member
                (store_code, card_no, phone, email, birthday,
-                consent_status, consent_token, created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?)',
+                consent_status, consent_at, consent_token, created_at, updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?)',
             [$this->storeCode, $card, $phone ?: null, $email ?: null, $birthday ?: null,
-             self::CONSENT_PENDING, $token, $now, $now]
+             $consent, $hasPii ? null : $now, $token, $now, $now]
         );
         $id = $this->db->lastInsertId();
         return $this->findById($id) ?? throw new \RuntimeException('会员创建后读取失败');

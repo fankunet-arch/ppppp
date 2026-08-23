@@ -848,10 +848,10 @@ $cards  = $app->cards();
 $cardNo = $app->cardNumber();
 
 // ── 批次生成 ──
-$batch = $cards->generateBatch('SMOKEB1', 5);
-eq(5, count($batch), '生成 5 张卡');
-eq(5, count(array_unique(array_column($batch, 'card_no'))), '卡号互不重复');
-eq(5, count(array_unique(array_column($batch, 'serial'))), '顺序号互不重复');
+$batch = $cards->generateBatch('SMOKEB1', 6);
+eq(6, count($batch), '生成 6 张卡');
+eq(6, count(array_unique(array_column($batch, 'card_no'))), '卡号互不重复');
+eq(6, count(array_unique(array_column($batch, 'serial'))), '顺序号互不重复');
 
 $first = $batch[0];
 ok($cardNo->isWellFormed($first['card_no']), "卡号结构合法（{$first['display']}）");
@@ -941,6 +941,31 @@ try { $cards->activate((int)$row2['id'], (int)$m['id'], null); }
 catch (\Throwable $e) { $twoCards = true; }
 ok($twoCards, '★ 一人一卡由 uk_member 唯一键在数据库层保证');
 
+// ── 卡片默认不实名 ──
+/**
+ * 凭卡号 + 卡背 PIN 即可积分与兑换，系统里不存任何可识别到人的数据。
+ * 没有个人数据就没有可同意的对象 —— 积分当场生效，不冻结。
+ *
+ * 留联系方式那条路【保留】着，为的是以后要上实名时链路是通的：
+ * 一旦填了手机号或邮箱，这条记录重新落入个人数据范畴，
+ * 双重确认那套照旧（待确认 + 积分冻结）。
+ */
+$anonCard = $batch[2];
+$anon = $svc->bindNewMember($anonCard['card_no'], null, null, null, $opStub);
+ok($anon['ok'], '不填任何联系方式也能绑卡');
+eq(1, (int)$anon['member']['consent_status'],
+   '★ 匿名卡直接置为已生效（没有个人数据就没有可同意的对象）');
+eq(null, $anon['member']['phone'], '库里没有手机号');
+eq(null, $anon['member']['email'], '库里没有邮箱');
+ok($anon['member']['consent_at'] !== null, '同意时间记为创建时间');
+
+$piiCard = $batch[3];
+$pii = $svc->bindNewMember($piiCard['card_no'], '600888777', null, null, $opStub);
+ok($pii['ok'], '留手机号也能绑卡');
+eq(0, (int)$pii['member']['consent_status'],
+   '★ 留了联系方式则回到待确认（实名那条路仍然通着，供日后启用）');
+eq('600888777', $pii['member']['phone'], '手机号已存');
+
 // ── 不在库存里的卡 ──
 $forgedLook = $svc->lookup($forged);
 ok(!$forgedLook['ok'] && $forgedLook['error'] === 'card_unknown',
@@ -971,8 +996,8 @@ ok(!$voidLook['ok'] && $voidLook['error'] === 'card_void', '扫已作废的旧�
 $b = null;
 foreach ($cards->batches() as $x) { if ($x['batch_no'] === 'SMOKEB1') { $b = $x; } }
 ok($b !== null, '批次能查到');
-eq(5, (int)$b['total'], '批次共 5 张');
-eq(1, (int)$b['active'], '其中 1 张已激活（换发的新卡）');
+eq(6, (int)$b['total'], '批次共 6 张');
+eq(3, (int)$b['active'], '其中 3 张已激活（换发的新卡 + 匿名卡 + 留了手机号的卡）');
 eq(1, (int)$b['void_cnt'], '其中 1 张已作废（挂失的旧卡）');
 
 // ── 拒绝不合理的批次参数 ──

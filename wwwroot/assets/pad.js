@@ -697,6 +697,8 @@ function openMemberModal(personIndex) {
   $('#member-result').innerHTML = '';
   $('#new-card-hint').innerHTML = '';
   $('#member-new').open = false;
+  const contact = $('#new-contact');
+  if (contact) { contact.open = false; }
   showErr('#member-err', '');
   $('#member-modal').hidden = false;
   UI.back.sync();
@@ -775,9 +777,9 @@ async function doCardLookup(value) {
     S.pendingCard = d.card_no;
     $('#member-result').innerHTML = '';
     $('#new-card-hint').innerHTML =
-      `这张卡尚未启用：<b>${escapeHtml(d.card_no)}</b>。填写手机号或邮箱后即可绑定给客人。`;
+      `这张卡尚未启用：<b>${escapeHtml(d.card_no)}</b>`;
     $('#member-new').open = true;
-    setTimeout(() => $('#new-phone').focus(), 50);
+    setTimeout(() => $('#btn-member-create').focus(), 50);
   } catch (e) {
     S.pendingCard = null;
     $('#member-result').innerHTML = '';
@@ -791,14 +793,15 @@ $('#btn-member-create').onclick = async () => {
     // 没有卡就建不了会员 —— 与其让服务端报错，不如在这里说清楚该做什么
     return showErr('#member-err', '请先扫描或输入客人的实体卡号');
   }
+  // 手机号与邮箱都是选填 —— 卡片默认不实名，凭卡号 + 卡背 PIN 即可使用。
+  // 留了联系方式才走双重确认（积分先冻结），不留则当场生效。
   const phone = $('#new-phone').value.trim();
   const email = $('#new-email').value.trim();
-  if (!phone && !email) return showErr('#member-err', '手机号与邮箱至少填一项');
   try {
     const d = await api('/member/create', {
       card_no: S.pendingCard, phone, email, birthday: $('#new-birthday').value || null,
     });
-    toast('已创建并绑卡', 'ok');
+    toast(d.consent_pending ? '已绑卡，等客人确认后可兑换' : '已绑卡，当场即可使用', 'ok');
     $('#new-phone').value = ''; $('#new-email').value = ''; $('#new-birthday').value = '';
     S.pendingCard = null;
     useMember(d.member);

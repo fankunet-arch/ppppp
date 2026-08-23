@@ -292,9 +292,14 @@ $api->on('POST', '/member/create', static function () use ($app, $requireOperato
     if ($card === null || trim($card) === '') {
         Api::fail('card_required');
     }
-    if (($phone === null || $phone === '') && ($email === null || $email === '')) {
-        Api::fail('bad_request', 400, ['hint' => '手机号与邮箱至少填一项，否则无法发送双重确认']);
-    }
+
+    /**
+     * 手机号与邮箱都是【选填】。
+     *
+     * 实体卡默认不实名：凭卡号 + 卡背 PIN 就能积分与兑换，系统里不存
+     * 任何可识别到人的数据，因此没有可同意的对象，积分直接生效。
+     * 客人自愿留联系方式时才走双重确认那一套（详见 MemberRepo::create）。
+     */
 
     $r = $app->cardService()->bindNewMember(
         $card, $phone ?: null, $email ?: null, $bday ?: null, $op
@@ -312,13 +317,16 @@ $api->on('POST', '/member/create', static function () use ($app, $requireOperato
                      'card_no' => $m['card_no']],
     ]);
 
-    // TODO(下一批)：出站调用短信/邮件服务商发送 double opt-in
+    // 留了联系方式的才需要双重确认；全匿名的卡当场就可用
+    // TODO(下一批)：留了联系方式时，出站调用短信/邮件服务商发送 double opt-in
+    $pending = (int)$m['consent_status'] !== 1;
     Api::ok(['member' => [
         'id' => (int)$m['id'],
         'card_no' => $app->cardNumber()->format((string)$m['card_no']),
         'points_balance' => 0, 'visit_count' => 0,
-        'consent_status' => 0, 'points_frozen' => true,
-    ], 'consent_pending' => true]);
+        'consent_status' => (int)$m['consent_status'],
+        'points_frozen'  => $pending,
+    ], 'consent_pending' => $pending]);
 });
 
 // ════════════════════════════════════════════════════════════
