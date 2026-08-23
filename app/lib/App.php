@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Vip;
 
 use Vip\Repo\AlertRepo;
+use Vip\Repo\CardRepo;
 use Vip\Repo\AuditRepo;
 use Vip\Repo\ConfigRepo;
 use Vip\Repo\CursorRepo;
@@ -111,6 +112,24 @@ final class App
     public function members(): MemberRepo
     {
         return $this->once('members', fn() => new MemberRepo($this->localDb(), $this->storeCode()));
+    }
+
+    /**
+     * 实体卡号的生成与结构校验。前缀来自配置，留空则回落到 'TK'。
+     * 真伪判定不在这里 —— 那是 cards()（card 表）的事。
+     */
+    public function cardNumber(): CardNumber
+    {
+        return $this->once('cardNumber', fn() => new CardNumber(
+            (string)($this->config['card_prefix'] ?? 'TK')
+        ));
+    }
+
+    public function cards(): CardRepo
+    {
+        return $this->once('cards', fn() => new CardRepo(
+            $this->localDb(), $this->storeCode(), $this->cardNumber()
+        ));
     }
 
     public function ledger(): LedgerRepo

@@ -65,6 +65,7 @@ spl_autoload_register(static function (string $class): void {
 
 use Vip\App;
 use Vip\LocalDb;
+use Vip\Repo\CardRepo;
 use Vip\PointsEngine as PE;
 use Vip\Test\FakePosSource;
 
@@ -116,7 +117,7 @@ ok(in_array($flavor, ['mysql', 'mariadb'], true), "识别数据库类型：{$fla
 
 // ── 2. 安全闸门 + 建表 ───────────────────────────────────────
 $tables = ['pos_order','member','point_ledger','coupon','meal_item_rule',
-           'meal_period','sys_config','sync_cursor','audit_log','alert'];
+           'meal_period','sys_config','sync_cursor','audit_log','alert','card'];
 
 $existing = [];
 foreach ($db->all('SHOW TABLES') as $row) {
@@ -171,7 +172,7 @@ if ($fresh) {
     if ($missing) {
         die_('缺少表：' . implode(', ', $missing) . "\n请先用 --fresh 建表。");
     }
-    ok(true, '10 张表均已存在');
+    ok(true, count($tables) . ' 张表均已存在');
 }
 
 // ── 3. 清理上次残留 ──────────────────────────────────────────
@@ -816,6 +817,129 @@ eq(0, $ctxAll['portions_counted'],  '★ 整桌兑换 → 可计次 0 份');
 ok(!$ctxAll['eligible'], '★ 整单兑换仍不可发分（原有口径不变）');
 
 // ── 13. 不变量总校验 ─────────────────────────────────────────
+step('⑭ 实体卡库存 —— 真伪只由 card 表说了算');
+
+$cards  = $app->cards();
+$cardNo = $app->cardNumber();
+
+// ── 批次生成 ──
+$batch = $cards->generateBatch('SMOKEB1', 5);
+eq(5, count($batch), '生成 5 张卡');
+eq(5, count(array_unique(array_column($batch, 'card_no'))), '卡号互不重复');
+eq(5, count(array_unique(array_column($batch, 'serial'))), '顺序号互不重复');
+
+$first = $batch[0];
+ok($cardNo->isWellFormed($first['card_no']), "卡号结构合法（{$first['display']}）");
+eq(6, strlen($first['pin']), 'PIN 是 6 位');
+ok(ctype_digit($first['pin']), 'PIN 是纯数字（好印、好念、报的时候没字母歧义）');
+
+// ── 明文 PIN 绝不入库 ──
+$row = $cards->findByCardNo($first['card_no']);
+ok($row !== null, '卡能按卡号查到');
+ok(!str_contains((string)$row['pin_hash'], $first['pin']),
+   '★ 库里存的是 hash，不含明文 PIN');
+ok(str_starts_with((string)$row['pin_hash'], '$2y$'),
+   '★ 用 bcrypt（与收银员 PIN 同一套做法）');
+eq(0, (int)$row['status'], '新卡状态是「库存中」');
+eq(null, $row['member_id'], '新卡未绑定任何会员');
+
+// 同一个 PIN 在不同卡上存出来的 hash 不同（每条独立加盐，防彩虹表）
+$sameP = password_hash($first['pin'], PASSWORD_BCRYPT);
+ok($sameP !== $row['pin_hash'], '★ 相同 PIN 的两次 hash 不相等（每条独立加盐）');
+
+// ── 这一层才是防伪造的真正防线 ──
+$forged = $cardNo->make(99999999);
+ok($cardNo->isWellFormed($forged), '伪造的卡号结构上完全合法');
+eq(null, $cards->findByCardNo($forged),
+   '★ 但库里没有 → 查不到。结构合法 ≠ 卡存在，真伪只由 card 表说了算');
+
+// ── 手输容错 ──
+$typed = str_replace('0', 'O', $first['display']);          // 照卡面把 0 读成 O
+ok($cards->findByCardNo($typed) !== null, "★ 手输把 0 打成 O 也能找到（{$typed}）");
+ok($cards->findByCardNo(strtolower($first['display'])) !== null, '小写也能找到');
+
+// ── PIN 校验与锁定 ──
+$row = $cards->findByCardNo($first['card_no']);
+ok($cards->verifyPin($row, $first['pin'])['ok'], '正确 PIN 通过');
+
+$row = $cards->findByCardNo($first['card_no']);
+$bad = $cards->verifyPin($row, '000000');
+ok(!$bad['ok'] && $bad['error'] === 'pin_wrong', '错误 PIN 被拒');
+
+// 连错到阈值要锁定 —— 卡背 PIN 是静态的，不锁就能慢慢穷举 100 万种
+// 注意上面那次 '000000' 已经算一次失败，所以这里从第 2 次开始数
+$row      = $cards->findByCardNo($first['card_no']);
+$failSoFar = (int)$row['pin_fail'];
+$lockAt   = null;
+for ($i = 0; $i < 8; $i++) {
+    $row = $cards->findByCardNo($first['card_no']);
+    $r   = $cards->verifyPin($row, '999999');
+    if (($r['error'] ?? '') === 'pin_locked') { $lockAt = $failSoFar + $i + 1; break; }
+}
+eq(CardRepo::PIN_MAX_FAIL, $lockAt,
+   '★ 累计错到第 ' . CardRepo::PIN_MAX_FAIL . ' 次时锁定');
+
+$row = $cards->findByCardNo($first['card_no']);
+$still = $cards->verifyPin($row, $first['pin']);
+ok(!$still['ok'] && $still['error'] === 'pin_locked',
+   '★ 锁定期内即使 PIN 正确也拒绝（否则锁了等于没锁）');
+
+$cards->resetPinFail((int)$row['id']);
+$row = $cards->findByCardNo($first['card_no']);
+ok($cards->verifyPin($row, $first['pin'])['ok'], '解锁后正确 PIN 恢复通过');
+
+// ── 激活与一人一卡 ──
+$m = $app->members()->create('600100200', null, null);
+$cards->activate((int)$row['id'], (int)$m['id'], null);
+$row = $cards->findByCardNo($first['card_no']);
+eq(1, (int)$row['status'], '激活后状态变为「已激活」');
+eq((int)$m['id'], (int)$row['member_id'], '已绑定到该会员');
+
+// 同一张卡不能激活两次
+$dup = false;
+try { $cards->activate((int)$row['id'], (int)$m['id'], null); }
+catch (\RuntimeException $e) { $dup = true; }
+ok($dup, '★ 同一张卡不能重复激活（状态条件写在 UPDATE 的 WHERE 里）');
+
+// 同一个会员不能再绑第二张卡 —— 数据库唯一键挡住，不靠应用层自觉
+$second = $batch[1];
+$row2   = $cards->findByCardNo($second['card_no']);
+$twoCards = false;
+try { $cards->activate((int)$row2['id'], (int)$m['id'], null); }
+catch (\Throwable $e) { $twoCards = true; }
+ok($twoCards, '★ 一人一卡由 uk_member 唯一键在数据库层保证');
+
+// ── 挂失换卡 ──
+$cards->void((int)$row['id'], '客人报失');
+$row = $cards->findByCardNo($first['card_no']);
+eq(2, (int)$row['status'], '挂失后状态变为「已作废」');
+eq(null, $row['member_id'],
+   '★ 作废时必须清空 member_id，否则唯一键会挡住这位会员绑新卡');
+
+$cards->activate((int)$row2['id'], (int)$m['id'], null);
+$row2 = $cards->findByCardNo($second['card_no']);
+eq((int)$m['id'], (int)$row2['member_id'], '★ 换发的新卡能正常绑定');
+
+// ── 批次统计 ──
+$b = null;
+foreach ($cards->batches() as $x) { if ($x['batch_no'] === 'SMOKEB1') { $b = $x; } }
+ok($b !== null, '批次能查到');
+eq(5, (int)$b['total'], '批次共 5 张');
+eq(1, (int)$b['active'], '其中 1 张已激活');
+eq(1, (int)$b['void_cnt'], '其中 1 张已作废');
+
+// ── 拒绝不合理的批次参数 ──
+foreach ([[0, '数量为 0'], [5001, '数量超上限']] as [$n, $why]) {
+    $threw = false;
+    try { $cards->generateBatch('SMOKEB2', $n); }
+    catch (\InvalidArgumentException $e) { $threw = true; }
+    ok($threw, "{$why}时拒绝生成");
+}
+$threw = false;
+try { $cards->generateBatch('SMOKEB1', 1); }
+catch (\InvalidArgumentException $e) { $threw = true; }
+ok($threw, '★ 批次号重复时拒绝（否则盘点时对不上账）');
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(
