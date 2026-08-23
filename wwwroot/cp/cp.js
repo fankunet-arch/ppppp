@@ -51,6 +51,8 @@ $('#btn-login').onclick = async () => {
     const d = await api('/auth/login', {
       login_name: $('#login-name').value.trim(), pin: $('#login-pin').value,
     });
+    window.SMS_READY = !!d.sms_ready;
+    renderWarnings(d.warnings);
     enterMain(d.operator);
   } catch (e) {
     $('#login-err').textContent = e.error === 'forbidden' ? '该账号无后台权限（需经理及以上）' : e.message;
@@ -69,6 +71,20 @@ $('#btn-logout').onclick = async () => {
   $('#view-main').classList.remove('active');
   $('#view-login').classList.add('active');
 };
+
+/**
+ * 渲染常驻提醒。
+ *
+ * 「开了实名但确认短信还没接入」这类问题不会自己暴露 —— 客人收不到确认
+ * 链接，积分默默冻结着，等有人来投诉才发现。所以让它一直挂在顶栏下面，
+ * 直到问题解决为止。
+ */
+function renderWarnings(list) {
+  const box = $('#cp-warnings');
+  if (!box) return;
+  box.innerHTML = (list || []).map(w =>
+    `<div class="warnbar"><b>⚠ 待处理</b>　${esc(w.text)}</div>`).join('');
+}
 
 function enterMain(op) {
   $('#op-name').textContent = op.name + '（' + ({ 2: '经理', 3: '管理员' }[op.role] || '') + '）';
@@ -342,8 +358,27 @@ function cfgRow(it, ro) {
 async function saveCfg(key) {
   const el = $(`[data-ck="${key}"]`);
   const val = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+
+  /**
+   * 开启「收集客人联系方式」而确认短信还没接入 —— 先拦一下。
+   *
+   * 这种状态不会自己暴露：客人留了手机号却收不到确认链接，积分默默冻结着，
+   * 等有人来投诉才发现。所以开启时明确告知，开启之后后台再挂一条常驻红条。
+   */
+  if (key === 'member_collect_pii' && val === '1' && window.SMS_READY === false) {
+    const go = await UI.confirm(
+      '确认短信/邮件目前尚未接入。\n\n' +
+      '现在开启的话，留了手机号或邮箱的客人【收不到确认链接】，' +
+      '他们的积分会一直冻结、无法兑换。\n\n' +
+      '确定要开启吗？',
+      { okText: '仍然开启', danger: true }
+    );
+    if (!go) { loadConfig(); return; }   // 取消 → 把复选框状态复原
+  }
+
   try {
-    await api('/config/save', { key, value: val });
+    const r = await api('/config/save', { key, value: val });
+    if (r && r.warnings) renderWarnings(r.warnings);
     toast('已保存', 'ok');
     loadConfig();          // 重载：奖励规则那句话要跟着变
   } catch (e) {
@@ -587,5 +622,12 @@ async function loadAudit() {
 
 /* 启动 */
 (async () => {
-  try { enterMain((await api('/auth/me', undefined, 'GET')).operator); } catch {}
+  // 会话还在时走这条路恢复。红条与 sms_ready 必须在这里一并处理 ——
+  // 只在登录处理里渲染的话，刷新一次页面提醒就没了，等于白提醒。
+  try {
+    const d = await api('/auth/me', undefined, 'GET');
+    window.SMS_READY = !!d.sms_ready;
+    renderWarnings(d.warnings);
+    enterMain(d.operator);
+  } catch {}
 })();

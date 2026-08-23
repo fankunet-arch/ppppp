@@ -45,7 +45,15 @@ $requireAdmin = static function () use ($requireManager): array {
 // 身份（复用 Pad 的会话）
 // ════════════════════════════════════════════════════════════
 
-$api->on('POST', '/auth/login', static function () use ($auth): void {
+/**
+ * 后台要长期挂出来的提醒。跟着登录与 /auth/me 下发，前端渲染成顶部红条。
+ * 目前只有一条：开了实名但确认短信还没接入。
+ */
+$warnings = static function () use ($app): array {
+    return \Vip\Features::warnings($app->cfg()->bool('member_collect_pii', false));
+};
+
+$api->on('POST', '/auth/login', static function () use ($auth, $warnings): void {
     $b = Api::body();
     $r = $auth()->login(
         Api::str($b, 'login_name', '') ?: '',
@@ -62,7 +70,8 @@ $api->on('POST', '/auth/login', static function () use ($auth): void {
         Api::fail('forbidden', 403);
     }
     Api::setToken((string)$r['token'], 12 * 3600);
-    Api::ok(['operator' => $r['operator']]);
+    Api::ok(['operator' => $r['operator'], 'warnings' => $warnings(),
+             'sms_ready' => \Vip\Features::OUTBOUND_MESSAGING]);
 });
 
 $api->on('POST', '/auth/logout', static function () use ($auth): void {
@@ -71,8 +80,9 @@ $api->on('POST', '/auth/logout', static function () use ($auth): void {
     Api::ok();
 });
 
-$api->on('GET', '/auth/me', static function () use ($requireManager): void {
-    Api::ok(['operator' => $requireManager()]);
+$api->on('GET', '/auth/me', static function () use ($requireManager, $warnings): void {
+    Api::ok(['operator' => $requireManager(), 'warnings' => $warnings(),
+             'sms_ready' => \Vip\Features::OUTBOUND_MESSAGING]);
 });
 
 // ════════════════════════════════════════════════════════════
@@ -265,7 +275,7 @@ $api->on('GET', '/config', static function () use ($app, $requireManager): void 
     ]);
 });
 
-$api->on('POST', '/config/save', static function () use ($app, $requireAdmin): void {
+$api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $warnings): void {
     $op  = $requireAdmin();
     $b   = Api::body();
     $key = Api::str($b, 'key', '') ?: '';
@@ -284,7 +294,8 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin): v
         'operator_id' => $op['id'], 'operator_name' => $op['name'],
         'detail' => ['value' => $val],
     ]);
-    Api::ok(['key' => $key, 'value' => $val]);
+    // 顺带把最新提醒带回去，前端不用为了刷新红条再请求一次
+    Api::ok(['key' => $key, 'value' => $val, 'warnings' => $warnings()]);
 });
 
 // ════════════════════════════════════════════════════════════
