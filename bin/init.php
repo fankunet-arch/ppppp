@@ -132,6 +132,16 @@ function doCheck(App $app, array $config): void
  *   · 老库首次引入本机制时做一次基线登记：已经建好的表说明
  *     对应的破坏性迁移早已执行过，直接标记为已应用，不重跑
  */
+/**
+ * 该迁移文件是否真的执行 DROP TABLE。
+ * 判定逻辑在 Vip\SqlText —— 必须先剥注释与字符串，
+ * 否则注释里提一句就会把整条迁移拦在生产库外面（实测踩过）。
+ */
+function sqlHasDropTable(string $file): bool
+{
+    return \Vip\SqlText::hasDropTable((string)file_get_contents($file));
+}
+
 function doMigrate(App $app): void
 {
     $db = $app->localDb();
@@ -168,7 +178,7 @@ function doMigrate(App $app): void
     // 基线登记：库里已有业务表却没有登记记录 → 破坏性迁移显然早已跑过
     if (!$applied && $rows > 0) {
         foreach ($files as $f) {
-            if (stripos((string)file_get_contents($f), 'DROP TABLE') !== false) {
+            if (sqlHasDropTable($f)) {
                 $db->exec('INSERT INTO schema_migration (filename, applied_at) VALUES (?,?)',
                     [basename($f), $db->now()]);
                 $applied[basename($f)] = true;
@@ -184,8 +194,7 @@ function doMigrate(App $app): void
     }
 
     // 破坏性迁移 + 有数据 = 拒绝
-    $destructive = array_filter($pending,
-        fn($f) => stripos((string)file_get_contents($f), 'DROP TABLE') !== false);
+    $destructive = array_filter($pending, fn($f) => sqlHasDropTable($f));
     if ($destructive && $rows > 0) {
         echo "\n\033[31m拒绝执行：库中已有 {$rows} 行业务数据，而待应用的 "
            . implode(', ', array_map('basename', $destructive))
