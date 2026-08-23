@@ -65,13 +65,21 @@ final class MemberRepo
      *   → 发 double opt-in → 客人点同意后转 active 解冻
      *   → N 天未同意则积分冻结 + PII 假名化
      */
-    public function create(?string $phone, ?string $email, ?string $birthday): array
+    /**
+     * @param string $cardNo 实体卡号。必须是 card 库存表里真实存在、
+     *                       且尚未绑定的一张 —— 校验与绑定由 CardService
+     *                       在同一个事务里完成，本方法只负责写 member 行。
+     */
+    public function create(string $cardNo, ?string $phone, ?string $email, ?string $birthday): array
     {
         if (($phone === null || $phone === '') && ($email === null || $email === '')) {
             throw new \InvalidArgumentException('手机号与邮箱至少填一项，否则无法发送双重确认');
         }
+        $card = \Vip\CardNumber::normalize($cardNo);
+        if ($card === '') {
+            throw new \InvalidArgumentException('必须提供实体卡号');
+        }
         $now   = $this->db->now();
-        $card  = $this->generateCardNo();
         $token = bin2hex(random_bytes(24));
 
         $this->db->exec(
@@ -86,22 +94,19 @@ final class MemberRepo
         return $this->findById($id) ?? throw new \RuntimeException('会员创建后读取失败');
     }
 
-    /** 卡号：门店码 + 时间戳基数 + 随机，人可读且不易撞 */
-    private function generateCardNo(): string
+    /**
+     * 换卡时把会员行上的 card_no 同步过去。
+     *
+     * card_no 在 member 上是冗余的（权威在 card 表），留着是为了按卡号
+     * 查会员时不用多join一次 —— 那是收银台上最高频的一次查询。
+     * 冗余就必须有人负责同步，换卡是唯一会变的时刻。
+     */
+    public function updateCardNo(int $memberId, string $cardNo): void
     {
-        for ($i = 0; $i < 8; $i++) {
-            $no = strtoupper(substr($this->storeCode, 0, 4))
-                . date('ymd')
-                . str_pad((string)random_int(0, 9999), 4, '0', STR_PAD_LEFT);
-            $exists = $this->db->value(
-                'SELECT 1 FROM member WHERE store_code = ? AND card_no = ?',
-                [$this->storeCode, $no]
-            );
-            if (!$exists) {
-                return $no;
-            }
-        }
-        throw new \RuntimeException('生成会员卡号连续冲突，请重试');
+        $this->db->exec(
+            'UPDATE member SET card_no = ?, updated_at = ? WHERE store_code = ? AND id = ?',
+            [\Vip\CardNumber::normalize($cardNo), $this->db->now(), $this->storeCode, $memberId]
+        );
     }
 
     /**

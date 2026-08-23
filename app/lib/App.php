@@ -12,6 +12,7 @@ use Vip\Repo\LedgerRepo;
 use Vip\Repo\MealRuleRepo;
 use Vip\Repo\MemberRepo;
 use Vip\Repo\OrderRepo;
+use Vip\Service\CardService;
 use Vip\Service\AuthService;
 use Vip\Service\MaintenanceService;
 use Vip\Service\PointsService;
@@ -129,6 +130,14 @@ final class App
     {
         return $this->once('cards', fn() => new CardRepo(
             $this->localDb(), $this->storeCode(), $this->cardNumber()
+        ));
+    }
+
+    public function cardService(): CardService
+    {
+        return $this->once('cardService', fn() => new CardService(
+            $this->localDb(), $this->cards(), $this->members(),
+            $this->cardNumber(), $this->audit(), $this->storeCode()
         ));
     }
 

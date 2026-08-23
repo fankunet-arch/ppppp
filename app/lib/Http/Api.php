@@ -49,6 +49,20 @@ final class Api
         'exceeds_manual_limit'   => '超过手工录入单笔限额，需经理授权',
         'invalid_amount'         => '金额不合法',
         'db_unavailable'         => '本地数据库暂时不可用，请联系管理员',
+
+        // ── 实体卡 ──────────────────────────────────────────
+        // 每一条都要让收银员知道【下一步该做什么】，而不是只说「不行」
+        'card_malformed'         => '卡号不完整，请重新扫描或核对卡面号码',
+        'card_unknown'           => '这不是本店发行的会员卡',
+        'card_void'              => '此卡已挂失作废，请换一张新卡',
+        'card_taken'             => '此卡已绑定其他会员',
+        'card_not_available'     => '这张卡不在库存中，无法发给客人',
+        'card_member_missing'    => '卡片绑定的会员查不到，请联系管理员',
+        'member_has_card'        => '该会员已有一张卡，如需换卡请走挂失换卡',
+        'card_required'          => '请先扫描客人的实体会员卡',
+        'pin_wrong'              => '卡背 PIN 不正确',
+        'pin_locked'             => '卡背 PIN 连续输错多次，已临时锁定',
+        'pin_not_set'            => '此卡没有设置 PIN，请联系管理员',
         'server_error'           => '系统内部错误，请稍后重试',
     ];
 

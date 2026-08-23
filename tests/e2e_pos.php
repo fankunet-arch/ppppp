@@ -78,12 +78,33 @@ echo "  门店码 {$E2E_STORE}   POS {$cfg['pos_db']['host']}:{$cfg['pos_db']['p
 
 // 清理上一轮
 $cleanup = function () use ($db, $E2E_STORE): void {
-    foreach (['point_ledger', 'pos_order', 'audit_log', 'alert', 'sync_cursor', 'coupon', 'member',
-              'meal_item_rule', 'sys_config'] as $t) {
+    foreach (['point_ledger', 'pos_order', 'audit_log', 'alert', 'sync_cursor', 'coupon',
+              'card', 'member', 'meal_item_rule', 'sys_config'] as $t) {
         try { $db->exec("DELETE FROM `{$t}` WHERE store_code = ?", [$E2E_STORE]); } catch (\Throwable) {}
     }
 };
 $cleanup();
+
+/**
+ * 建会员的测试辅助 —— 改发实体卡后，会员必须绑一张 card 库存表里真实
+ * 存在的卡。预生成一批按需取用，让不关心卡片的用例保持原样。
+ */
+$e2eCardPool = [];
+$newMember = static function (?string $phone = null, ?string $email = null, ?string $bday = null)
+        use ($app, &$e2eCardPool): array {
+    if (!$e2eCardPool) {
+        $e2eCardPool = $app->cards()->generateBatch('E2EPOOL', 20);
+    }
+    $c = array_shift($e2eCardPool);
+    $r = $app->cardService()->bindNewMember(
+        $c['card_no'], $phone, $email, $bday,
+        ['id' => null, 'name' => 'e2e', 'device' => null]
+    );
+    if (!$r['ok']) {
+        throw new \RuntimeException('测试辅助建会员失败：' . ($r['error'] ?? '?'));
+    }
+    return $r['member'];
+};
 
 // 套餐规则与配置按门店隔离，E2E 门店要自带一份，否则 MealRules 全部
 // 回落到安全默认（counts_visit=false），计次恒为 0，测不出真实行为。
@@ -420,7 +441,7 @@ if ($cand !== null) {
     eq_(1, (int)$db->value('SELECT COUNT(*) FROM pos_order WHERE store_code=? AND serial_id=?', [$E2E_STORE, $serial]),
         '★ 重复 locate 不产生重复订单');
 
-    $m1 = $member->create('600100001', null, null);
+    $m1 = $newMember('600100001', null, null);
     $op = ['id' => 1, 'name' => 'e2e', 'role' => 'admin'];
     $totalCents = Money::toCents((string)$row['total_amount']);
 
@@ -455,7 +476,7 @@ if ($c23 !== null) {
     $tot23 = Money::toCents((string)$ord23['total_amount']);
     $ms = [];
     for ($i = 0; $i < 3; $i++) {
-        $ms[] = (int)$member->create('60020000' . $i, null, null)['id'];
+        $ms[] = (int)$newMember('60020000' . $i, null, null)['id'];
     }
     $port23 = (int)$ord23['portions_counted'];
     $parts  = PointsEngine::splitEvenly($tot23, $port23, 3);
@@ -503,7 +524,7 @@ if ($cRedeem === null) {
     eq_(1, $cRedeem['portions_counted'],  '★ 可计次 1 份 —— 付费的那位不该被吞掉');
     is_($cRedeem['eligible'] === true,    '★ 混合单可以发分');
 
-    $mR = $app->members()->create('600300001', null, null);
+    $mR = $newMember('600300001', null, null);
     $gR = $points->grant((string)$cRedeem['serial_id'],
         [['member_id' => (int)$mR['id'], 'amount_cents' => 100, 'portions' => 1]],
         PointsEngine::MODE_WHOLE, ['id' => 1, 'name' => 'e2e', 'role' => 'admin']);
@@ -574,7 +595,7 @@ if ($cRev === null) {
     bad_('桌 9 未定位到订单');
 } else {
     $serialRev = (string)$cRev['serial_id'];
-    $mRev = $app->members()->create('600400001', null, null);
+    $mRev = $newMember('600400001', null, null);
     $opRev = ['id' => 1, 'name' => 'e2e', 'role' => 'admin'];
     $gRev = $points->grant($serialRev,
         [['member_id' => (int)$mRev['id'], 'amount_cents' => $cRev['total_cents'],

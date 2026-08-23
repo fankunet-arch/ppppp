@@ -65,6 +65,7 @@ spl_autoload_register(static function (string $class): void {
 
 use Vip\App;
 use Vip\LocalDb;
+use Vip\CardNumber;
 use Vip\Repo\CardRepo;
 use Vip\PointsEngine as PE;
 use Vip\Test\FakePosSource;
@@ -189,6 +190,30 @@ step('灌入 SMOKE 门店的配置与套餐规则');
 $app = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
 $app->setLocalDb($db);   // 与断言共用同一条连接
 
+/**
+ * 建会员的测试辅助。
+ *
+ * 改发实体卡之后，会员不能凭空创建 —— 必须绑一张 card 库存表里真实存在
+ * 的卡。这里预生成一批库存卡按需取用，让不关心卡片的那些测试保持原样，
+ * 只是把 $newMember(...) 换成 $newMember(...)。
+ */
+$cardPool  = [];
+$newMember = static function (?string $phone = null, ?string $email = null, ?string $bday = null)
+        use ($app, &$cardPool): array {
+    if (!$cardPool) {
+        $cardPool = $app->cards()->generateBatch('SMOKEPOOL', 40);
+    }
+    $c = array_shift($cardPool);
+    $r = $app->cardService()->bindNewMember(
+        $c['card_no'], $phone, $email, $bday,
+        ['id' => null, 'name' => 'smoke', 'device' => null]
+    );
+    if (!$r['ok']) {
+        die_('测试辅助建会员失败：' . ($r['error'] ?? '?'));
+    }
+    return $r['member'];
+};
+
 $cfgSeed = [
     'order_lookup_window_min' => '30',
     'points_per_euro'         => '1',
@@ -304,8 +329,8 @@ eq(1, $ctxB['portions_counted'], '计次份数 1（BOX 不计次）');
 // ── 7. 会员 ──────────────────────────────────────────────────
 step('③ 建会员');
 
-$mA = $app->members()->create('+34600000001', null, null);
-$mB = $app->members()->create(null, 'b@example.com', '1990-05-20');
+$mA = $newMember('+34600000001', null, null);
+$mB = $newMember(null, 'b@example.com', '1990-05-20');
 ok((int)$mA['id'] > 0 && (int)$mB['id'] > 0, '建立 2 名会员');
 eq(0, (int)$mA['consent_status'], '新会员 consent_status=0（pending，积分入账但冻结）');
 ok(!empty($mA['consent_token']), '生成 double opt-in 令牌');
@@ -374,7 +399,7 @@ eq(2, (int)$db->value('SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND 
 // ── 10. AA 分摊 ──────────────────────────────────────────────
 step('⑦ 撤销后改记 AA —— 3 人均摊（其中一人现场新建会员）');
 
-$mC = $app->members()->create('+34600000003', null, null);   // 客人没卡，现场建
+$mC = $newMember('+34600000003', null, null);   // 客人没卡，现场建
 $split = PE::splitEvenly(7170, 3, 3);
 eq(7170, array_sum(array_column($split, 'amount_cents')), 'AA 金额合计不丢分');
 eq(3, array_sum(array_column($split, 'portions')), 'AA 份数合计不丢');
@@ -526,7 +551,7 @@ foreach (['reward_enabled' => '1', 'reward_mode' => 'visits',
         [SMOKE_STORE, $k, $v, $db->now()]);
 }
 
-$rwMember = $app->members()->create('600990001', null, null);
+$rwMember = $newMember('600990001', null, null);
 $rwId     = (int)$rwMember['id'];
 $db->exec('UPDATE member SET visit_count = 10 WHERE id = ?', [$rwId]);
 
@@ -591,7 +616,7 @@ $ctx10 = $loc10['candidates'][0];
 eq(10, $ctx10['portions_counted'], '10 人 10 份 → 计次份数 10');
 
 // 全新会员，从 0 次起算，好判断到底加了几次
-$mid10 = (int)$app->members()->create('+34600000010', null, null)['id'];
+$mid10 = (int)$newMember('+34600000010', null, null)['id'];
 $g10 = $svc->grant('2608130090',
     [['member_id' => $mid10, 'amount_cents' => 23900, 'portions' => 10]],
     PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
@@ -627,7 +652,7 @@ $svcL = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => 
 $svcL->setLocalDb($db);
 $svcL->setPosSource($pos);
 $svcL->points()->locate('51');
-$midL = (int)$app->members()->create('+34600000011', null, null)['id'];
+$midL = (int)$newMember('+34600000011', null, null)['id'];
 $gL = $svcL->points()->grant('2608130091',
     [['member_id' => $midL, 'amount_cents' => 23900, 'portions' => 10]],
     PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
@@ -791,7 +816,7 @@ ok($ctxMx['eligible'], '★ 混合单可以发分（早先是整单拒绝，3 �
 ok($ctxMx['is_redeemed'], '仍标记为含核销，审计能看出来');
 
 // 整单记给一人 → 应计 3 次
-$midMx = (int)$app->members()->create('+34600000012', null, null)['id'];
+$midMx = (int)$newMember('+34600000012', null, null)['id'];
 $gMx = $appMx->points()->grant('2608130096',
     [['member_id' => $midMx, 'amount_cents' => 6670, 'portions' => 3]],
     PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
@@ -888,18 +913,25 @@ $cards->resetPinFail((int)$row['id']);
 $row = $cards->findByCardNo($first['card_no']);
 ok($cards->verifyPin($row, $first['pin'])['ok'], '解锁后正确 PIN 恢复通过');
 
-// ── 激活与一人一卡 ──
-$m = $app->members()->create('600100200', null, null);
-$cards->activate((int)$row['id'], (int)$m['id'], null);
-$row = $cards->findByCardNo($first['card_no']);
-eq(1, (int)$row['status'], '激活后状态变为「已激活」');
-eq((int)$m['id'], (int)$row['member_id'], '已绑定到该会员');
+// ── 扫卡建会员：走真实流程 ──
+$svc   = $app->cardService();
+$opStub = ['id' => null, 'name' => 'smoke', 'device' => null];
 
-// 同一张卡不能激活两次
-$dup = false;
-try { $cards->activate((int)$row['id'], (int)$m['id'], null); }
-catch (\RuntimeException $e) { $dup = true; }
-ok($dup, '★ 同一张卡不能重复激活（状态条件写在 UPDATE 的 WHERE 里）');
+$look = $svc->lookup($first['card_no']);
+ok($look['ok'] && $look['state'] === 'stock', '库存卡 lookup → state=stock（该弹建卡表单）');
+
+$bind = $svc->bindNewMember($first['card_no'], '600100200', null, null, $opStub);
+ok($bind['ok'], '扫库存卡 + 填手机号 → 建会员并绑卡');
+$m = $bind['member'];
+eq(CardNumber::normalize($first['card_no']), $m['card_no'], '会员行上的卡号与实体卡一致');
+
+$look = $svc->lookup($first['card_no']);
+ok($look['ok'] && $look['state'] === 'active', '再扫同一张 → state=active（直接进该会员）');
+eq((int)$m['id'], (int)$look['member']['id'], '认出的是同一位会员');
+
+// 已绑定的卡不能再拿去建新会员 —— 该走「直接进入该会员」
+$again = $svc->bindNewMember($first['card_no'], '600100201', null, null, $opStub);
+ok(!$again['ok'] && $again['error'] === 'card_taken', '★ 已绑定的卡不能再建新会员');
 
 // 同一个会员不能再绑第二张卡 —— 数据库唯一键挡住，不靠应用层自觉
 $second = $batch[1];
@@ -909,24 +941,39 @@ try { $cards->activate((int)$row2['id'], (int)$m['id'], null); }
 catch (\Throwable $e) { $twoCards = true; }
 ok($twoCards, '★ 一人一卡由 uk_member 唯一键在数据库层保证');
 
-// ── 挂失换卡 ──
-$cards->void((int)$row['id'], '客人报失');
+// ── 不在库存里的卡 ──
+$forgedLook = $svc->lookup($forged);
+ok(!$forgedLook['ok'] && $forgedLook['error'] === 'card_unknown',
+   '★ 结构合法但不在库存 → card_unknown（防伪造的真正防线）');
+$junk = $svc->lookup('随便扫到的别的二维码');
+ok(!$junk['ok'] && $junk['error'] === 'card_malformed',
+   '扫错二维码 → card_malformed（提示「卡号不完整」比「查无此卡」有用）');
+
+// ── 挂失换卡：走真实流程 ──
+$rep = $svc->replaceCard((int)$m['id'], $second['card_no'], '客人报失', $opStub);
+ok($rep['ok'], '挂失换卡成功');
+
 $row = $cards->findByCardNo($first['card_no']);
-eq(2, (int)$row['status'], '挂失后状态变为「已作废」');
+eq(2, (int)$row['status'], '旧卡状态变为「已作废」');
 eq(null, $row['member_id'],
    '★ 作废时必须清空 member_id，否则唯一键会挡住这位会员绑新卡');
 
-$cards->activate((int)$row2['id'], (int)$m['id'], null);
 $row2 = $cards->findByCardNo($second['card_no']);
-eq((int)$m['id'], (int)$row2['member_id'], '★ 换发的新卡能正常绑定');
+eq((int)$m['id'], (int)$row2['member_id'], '★ 新卡已绑到同一位会员');
+eq(CardNumber::normalize($second['card_no']),
+   $app->members()->findById((int)$m['id'])['card_no'],
+   '★ 会员行上的 card_no 也同步到新卡（冗余字段必须有人负责同步）');
+
+$voidLook = $svc->lookup($first['card_no']);
+ok(!$voidLook['ok'] && $voidLook['error'] === 'card_void', '扫已作废的旧卡 → card_void');
 
 // ── 批次统计 ──
 $b = null;
 foreach ($cards->batches() as $x) { if ($x['batch_no'] === 'SMOKEB1') { $b = $x; } }
 ok($b !== null, '批次能查到');
 eq(5, (int)$b['total'], '批次共 5 张');
-eq(1, (int)$b['active'], '其中 1 张已激活');
-eq(1, (int)$b['void_cnt'], '其中 1 张已作废');
+eq(1, (int)$b['active'], '其中 1 张已激活（换发的新卡）');
+eq(1, (int)$b['void_cnt'], '其中 1 张已作废（挂失的旧卡）');
 
 // ── 拒绝不合理的批次参数 ──
 foreach ([[0, '数量为 0'], [5001, '数量超上限']] as [$n, $why]) {

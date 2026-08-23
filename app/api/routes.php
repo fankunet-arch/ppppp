@@ -232,31 +232,90 @@ $api->on('POST', '/member/search', static function () use ($app, $requireOperato
  * 内联新建会员（客人现场没卡）。
  * 积分当场入账但冻结，同时发 double opt-in。
  */
+/**
+ * 扫卡/输卡号后的第一步 —— 系统判断这张卡现在是什么状态，Pad 据此决定下一步。
+ *
+ * 返回的 state 有四种，Pad 端一一对应一个动作：
+ *   active → 直接进入该会员（正常使用）
+ *   stock  → 弹出建卡表单（填手机/邮箱后绑定）
+ *   unknown / void → 报错，不给继续
+ *
+ * ★ 防伪造就在这里：卡号不在 card 库存表里一律拒绝。
+ *   卡号里的随机后缀只让人猜不到，判真伪的是那张表。
+ */
+$api->on('POST', '/card/lookup', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $b   = Api::body();
+    $raw = Api::str($b, 'card_no', '');
+    if ($raw === null || trim($raw) === '') {
+        Api::fail('card_required');
+    }
+
+    $r = $app->cardService()->lookup($raw);
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], 404);
+    }
+
+    $card = $r['card'];
+    $out  = [
+        'state'   => $r['state'],
+        'card_no' => $app->cardNumber()->format((string)$card['card_no']),
+        'serial'  => (int)$card['serial'],
+    ];
+
+    if ($r['state'] === 'active') {
+        $m = $r['member'];
+        $out['member'] = [
+            'id'             => (int)$m['id'],
+            'card_no'        => $app->cardNumber()->format((string)$m['card_no']),
+            'phone'          => $m['phone'],
+            'email'          => $m['email'],
+            'points_balance' => (int)$m['points_balance'],
+            'visit_count'    => (int)$m['visit_count'],
+            'consent_status' => (int)$m['consent_status'],
+            'points_frozen'  => (int)$m['consent_status'] !== 1,
+        ];
+    }
+    Api::ok($out);
+});
+
 $api->on('POST', '/member/create', static function () use ($app, $requireOperator): void {
     $op    = $requireOperator();
     $b     = Api::body();
+    $card  = Api::str($b, 'card_no', '');
     $phone = Api::str($b, 'phone');
     $email = Api::str($b, 'email');
     $bday  = Api::str($b, 'birthday');
 
+    // 发实体卡之后，建会员必须先有卡 —— 卡号不再由系统凭空生成，
+    // 而是从 card 库存表里取一张真实存在的绑上去。
+    if ($card === null || trim($card) === '') {
+        Api::fail('card_required');
+    }
     if (($phone === null || $phone === '') && ($email === null || $email === '')) {
         Api::fail('bad_request', 400, ['hint' => '手机号与邮箱至少填一项，否则无法发送双重确认']);
     }
-    try {
-        $m = $app->members()->create($phone ?: null, $email ?: null, $bday ?: null);
-    } catch (\InvalidArgumentException $e) {
-        Api::fail('bad_request', 400, ['hint' => $e->getMessage()]);
+
+    $r = $app->cardService()->bindNewMember(
+        $card, $phone ?: null, $email ?: null, $bday ?: null, $op
+    );
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], 400,
+            isset($r['hint']) ? ['hint' => $r['hint']] : []);
     }
+    $m = $r['member'];
 
     $app->audit()->log('member_create', [
         'target_type' => 'member', 'target_id' => (string)$m['id'],
         'operator_id' => $op['id'], 'operator_name' => $op['name'], 'device' => $op['device'],
-        'detail' => ['has_phone' => (bool)$phone, 'has_email' => (bool)$email],
+        'detail' => ['has_phone' => (bool)$phone, 'has_email' => (bool)$email,
+                     'card_no' => $m['card_no']],
     ]);
 
     // TODO(下一批)：出站调用短信/邮件服务商发送 double opt-in
     Api::ok(['member' => [
-        'id' => (int)$m['id'], 'card_no' => $m['card_no'],
+        'id' => (int)$m['id'],
+        'card_no' => $app->cardNumber()->format((string)$m['card_no']),
         'points_balance' => 0, 'visit_count' => 0,
         'consent_status' => 0, 'points_frozen' => true,
     ], 'consent_pending' => true]);
