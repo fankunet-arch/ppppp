@@ -164,12 +164,17 @@
     </div>
     <div class="row">
       <input id="member-input" type="text" autocomplete="off" placeholder="输入后点查找">
+      <button id="btn-scan" class="primary">扫卡</button>
       <button id="btn-member-search" class="primary">查找</button>
     </div>
+    <p class="muted small" id="scan-note">
+      扫客人卡面的二维码；扫不出时照着卡面手输卡号也行（<code>O</code> 当 <code>0</code> 输没关系）。
+    </p>
     <div id="member-result"></div>
     <hr>
     <details id="member-new">
-      <summary>客人没有卡 —— 现场新建</summary>
+      <summary>用这张卡建新会员</summary>
+      <p class="muted small" id="new-card-hint"></p>
       <p class="muted small">仅需手机号或邮箱其一。系统会立即发送含隐私政策的确认消息，
         客人确认前积分照常入账但暂不可兑换。</p>
       <label>手机号<input id="new-phone" type="tel" inputmode="tel" autocomplete="off"></label>
@@ -179,6 +184,19 @@
     </details>
     <p id="member-err" class="err" hidden></p>
     <button id="btn-member-close" class="ghost">取消</button>
+  </div>
+</div>
+
+<!-- ══ 扫码弹层 ══════════════════════════════════════════ -->
+<div id="scan-modal" class="modal" hidden>
+  <div class="modal-box">
+    <h3>扫描会员卡</h3>
+    <!-- 这三个属性缺任意一个，部分场景下取景框不起播（容器文档 2.3） -->
+    <video id="scan-video" autoplay playsinline muted
+           style="width:100%;border-radius:10px;background:#000;aspect-ratio:4/3"></video>
+    <p id="scan-msg" class="muted small">把卡面的二维码对准取景框</p>
+    <p id="scan-err" class="err" hidden></p>
+    <button id="btn-scan-cancel" class="ghost">取消</button>
   </div>
 </div>
 

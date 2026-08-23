@@ -44,6 +44,7 @@ const S = {
   people: [],        // [{member, amountCents, portions}]
   picks: {},         // 点选模式：itemIndex -> personIndex
   memberTarget: null,// 会员弹层回调
+  pendingCard: null, // 扫到的库存卡，等着绑给新建的会员
 };
 
 /* ── 工具 ────────────────────────────────────────── */
@@ -639,8 +640,11 @@ $('#btn-submit').onclick = async () => {
 /* ── 会员弹层 ────────────────────────────────────── */
 function openMemberModal(personIndex) {
   S.memberTarget = personIndex;
+  S.pendingCard  = null;
   $('#member-input').value = '';
   $('#member-result').innerHTML = '';
+  $('#new-card-hint').innerHTML = '';
+  $('#member-new').open = false;
   showErr('#member-err', '');
   $('#member-modal').hidden = false;
   UI.back.sync();
@@ -652,8 +656,10 @@ $$('#search-type button').forEach(b => b.onclick = () => {
   $$('#search-type button').forEach(x => x.classList.toggle('on', x === b));
   const t = b.dataset.type;
   const inp = $('#member-input');
-  inp.placeholder = { card: '会员卡号', phone: '完整手机号', email: '邮箱地址' }[t];
+  inp.placeholder = { card: '卡面号码，如 TK-00000123-4Q7', phone: '完整手机号', email: '邮箱地址' }[t];
   inp.inputMode = t === 'phone' ? 'tel' : 'text';
+  $('#btn-scan').hidden  = t !== 'card';
+  $('#scan-note').hidden = t !== 'card';
   inp.focus();
 });
 
@@ -665,6 +671,12 @@ async function doMemberSearch() {
   const type = $('#search-type button.on').dataset.type;
   const value = $('#member-input').value.trim();
   if (!value) return showErr('#member-err', '请输入查询内容');
+
+  // 卡号走 /card/lookup 而不是 /member/search：实体卡有四种状态，
+  // 「查无此人」这一种答案不够用 —— 库存卡要引导去建会员，
+  // 作废卡要说清楚换一张，不是本店的卡要当场拒绝。
+  if (type === 'card') { return doCardLookup(value); }
+
   try {
     const d = await api('/member/search', { type, value });
     if (!d.found) {
@@ -682,17 +694,133 @@ async function doMemberSearch() {
   } catch (e) { showErr('#member-err', e.message); }
 }
 
+/**
+ * 扫卡/输卡号之后：系统判断这张卡是什么状态，界面据此决定下一步。
+ *
+ *   active → 认出会员，直接选用
+ *   stock  → 展开建卡表单，把卡号带上
+ *   其它   → 报错（不是本店的卡 / 已作废 / 卡号不完整）
+ */
+async function doCardLookup(value) {
+  showErr('#member-err', '');
+  try {
+    const d = await api('/card/lookup', { card_no: value });
+
+    if (d.state === 'active') {
+      S.pendingCard = null;
+      $('#member-new').open = false;
+      const m = d.member;
+      $('#member-result').innerHTML = `
+        <div class="found"><b>${escapeHtml(m.card_no)}</b>
+          <div class="muted small">${m.points_balance} 分 · 已消费 ${m.visit_count} 次</div>
+          ${m.points_frozen ? '<div class="frozen">该会员尚未完成确认，积分照常入账但暂不可兑换</div>' : ''}
+          <button class="primary" id="btn-use-member" style="margin-top:10px">选用</button></div>`;
+      $('#btn-use-member').onclick = () => useMember(m);
+      return;
+    }
+
+    // 库存卡 —— 这张卡是新的，引导建会员
+    S.pendingCard = d.card_no;
+    $('#member-result').innerHTML = '';
+    $('#new-card-hint').innerHTML =
+      `这张卡尚未启用：<b>${escapeHtml(d.card_no)}</b>。填写手机号或邮箱后即可绑定给客人。`;
+    $('#member-new').open = true;
+    setTimeout(() => $('#new-phone').focus(), 50);
+  } catch (e) {
+    S.pendingCard = null;
+    $('#member-result').innerHTML = '';
+    showErr('#member-err', e.message);
+  }
+}
+
 $('#btn-member-create').onclick = async () => {
   showErr('#member-err', '');
+  if (!S.pendingCard) {
+    // 没有卡就建不了会员 —— 与其让服务端报错，不如在这里说清楚该做什么
+    return showErr('#member-err', '请先扫描或输入客人的实体卡号');
+  }
   const phone = $('#new-phone').value.trim();
   const email = $('#new-email').value.trim();
   if (!phone && !email) return showErr('#member-err', '手机号与邮箱至少填一项');
   try {
-    const d = await api('/member/create', { phone, email, birthday: $('#new-birthday').value || null });
-    toast('已创建，确认消息已发送', 'ok');
+    const d = await api('/member/create', {
+      card_no: S.pendingCard, phone, email, birthday: $('#new-birthday').value || null,
+    });
+    toast('已创建并绑卡', 'ok');
     $('#new-phone').value = ''; $('#new-email').value = ''; $('#new-birthday').value = '';
+    S.pendingCard = null;
     useMember(d.member);
   } catch (e) { showErr('#member-err', e.message); }
+};
+
+/* ── 扫码 ─────────────────────────────────────────
+ * 相机走容器桥接，二维码识别用 Chromium 自带的 BarcodeDetector ——
+ * 不额外引第三方库：门店内网装不了 CDN，自带一份又要长期跟版本。
+ * 平台不支持时不硬撑，直接引导手工输入（卡面本来就印着人可读号码）。
+ */
+let scanStream = null;
+let scanTimer  = null;
+
+function stopScan() {
+  if (scanTimer) { clearTimeout(scanTimer); scanTimer = null; }
+  if (scanStream) {
+    // 不关流的话相机指示灯常亮，后续再取流也会失败
+    scanStream.getTracks().forEach(t => t.stop());
+    scanStream = null;
+  }
+  $('#scan-video').srcObject = null;
+  $('#scan-modal').hidden = true;
+  UI.back.sync();
+}
+
+$('#btn-scan-cancel').onclick = stopScan;
+
+$('#btn-scan').onclick = async () => {
+  showErr('#member-err', '');
+  showErr('#scan-err', '');
+
+  if (typeof window.BarcodeDetector !== 'function') {
+    return showErr('#member-err',
+      '本设备不支持扫码，请照着卡面手工输入卡号（O 当 0 输没关系）');
+  }
+  if (!window.SushiVIP || !SushiVIP.cameraSupported()) {
+    return showErr('#member-err',
+      window.isSecureContext === false
+        ? '页面不在 HTTPS 下，相机不可用；请手工输入卡号'
+        : '相机不可用，请手工输入卡号');
+  }
+
+  $('#scan-modal').hidden = false;
+  UI.back.sync();
+  $('#scan-msg').textContent = '正在打开相机…';
+
+  try {
+    scanStream = await SushiVIP.openCamera();
+    const v = $('#scan-video');
+    v.srcObject = scanStream;
+    await v.play();
+    $('#scan-msg').textContent = '把卡面的二维码对准取景框';
+  } catch (e) {
+    stopScan();
+    return showErr('#member-err', '打开相机失败：' + (e && e.message ? e.message : e));
+  }
+
+  const det = new BarcodeDetector({ formats: ['qr_code'] });
+  const tick = async () => {
+    if (!scanStream) return;                    // 已取消
+    try {
+      const codes = await det.detect($('#scan-video'));
+      if (codes && codes.length) {
+        const raw = String(codes[0].rawValue || '').trim();
+        stopScan();
+        $('#member-input').value = raw;
+        // 扫到什么就查什么，交给服务端判断是不是本店的卡
+        return doCardLookup(raw);
+      }
+    } catch (e) { /* 单帧识别失败无所谓，下一帧继续 */ }
+    scanTimer = setTimeout(tick, 200);
+  };
+  tick();
 };
 
 function useMember(m) {
@@ -762,10 +890,13 @@ function escapeHtml(s) {
  * ui.js 自己的弹层永远排在最上面，这里只管步骤与两个模态框。
  */
 UI.back.register({
-  deep: () => !$('#pin-modal').hidden
+  deep: () => !$('#scan-modal').hidden
+            || !$('#pin-modal').hidden
             || !$('#member-modal').hidden
             || CURRENT_STEP !== 'step-table',
   back: () => {
+    // 扫码弹层排在最上面，且必须走 stopScan —— 直接隐藏会把相机留着不关
+    if (!$('#scan-modal').hidden) { stopScan(); return true; }
     if (!$('#member-modal').hidden) { $('#member-modal').hidden = true; return true; }
     if (!$('#pin-modal').hidden)    { $('#pin-modal').hidden    = true; return true; }
     const prev = STEP_BACK[CURRENT_STEP];
