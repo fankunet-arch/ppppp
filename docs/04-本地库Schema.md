@@ -66,7 +66,7 @@ CREATE TABLE `pos_order` (
 CREATE TABLE `member` (
   `id`             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `store_code`     VARCHAR(20) NOT NULL,
-  `card_no`        VARCHAR(32) NOT NULL             COMMENT '会员卡号，系统生成，Wallet 二维码内容',
+  `card_no`        VARCHAR(32) NOT NULL             COMMENT '实体卡号，来自 card 库存表；权威在 card 表，这里冗余是为了按卡号查会员时不用多 join',
 
   -- PII（数据最小化：仅这三项，无姓名）
   `phone`          VARCHAR(32)  DEFAULT NULL,
@@ -100,6 +100,10 @@ CREATE TABLE `member` (
 ```
 
 **三选一检索**：Pad 端明确选择输入类型（卡号 / 手机号 / 邮箱），对应走 `uk_card` / `idx_phone` / `idx_email`，不做跨字段模糊搜索。
+
+> ⚠️ **卡号这一档已改走 `/card/lookup`**（查 `card` 库存表）而不是 `/member/search`。
+> 实体卡有四种状态，「查无此人」这一种答案不够用 —— 库存卡要引导去建会员，
+> 作废卡要说清楚换一张，不是本店的卡要当场拒绝。详见 [`09-实体卡.md`](./09-实体卡.md)。
 
 ## 4. 积分流水 `point_ledger`（追加式账本）
 
