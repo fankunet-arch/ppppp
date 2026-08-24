@@ -16,10 +16,14 @@ SET @store := 'S001';
 SET @now   := NOW();
 
 INSERT INTO `operator`
-  (`store_code`,`login_name`,`display_name`,`pin_hash`,`role`,`enabled`,`failed_count`,`created_at`,`updated_at`)
+  (`store_code`,`login_name`,`display_name`,`display_name_es`,`pin_hash`,`role`,`enabled`,`failed_count`,`created_at`,`updated_at`)
 VALUES
-(@store, 'admin', '系统管理员', '$2y$12$bFH5NBDQ5TAMEEn.WwBI0Olizn.rnhBJERNh9be.eulwk2JAUNpM2', 3, 1, 0, @now, @now),
-(@store, 'manager', '经理', '$2y$12$rmfCpI7JjUjvtCq1xqkwFuX4hLY6R46nG/IPqJBKPxEm6BHq2X4Aq', 2, 1, 0, @now, @now),
-(@store, 'cashier1', '收银员1', '$2y$12$xS38VmeieesuCmb7V69BauI.yvqObReBGqHclydS5v7k4ZSQ6iziW', 1, 1, 0, @now, @now),
-(@store, 'cashier2', '收银员2', '$2y$12$2mNnGkEMKYaoAE8uLVlIJeo3p.dwg8GUJ8LghSg8bTYOqdb8KgVZG', 1, 1, 0, @now, @now)
-ON DUPLICATE KEY UPDATE `updated_at` = VALUES(`updated_at`);
+(@store, 'admin', '系统管理员', 'Administrador', '$2y$12$bFH5NBDQ5TAMEEn.WwBI0Olizn.rnhBJERNh9be.eulwk2JAUNpM2', 3, 1, 0, @now, @now),
+(@store, 'manager', '经理', 'Encargado', '$2y$12$rmfCpI7JjUjvtCq1xqkwFuX4hLY6R46nG/IPqJBKPxEm6BHq2X4Aq', 2, 1, 0, @now, @now),
+(@store, 'cashier1', '收银员1', 'Cajero 1', '$2y$12$xS38VmeieesuCmb7V69BauI.yvqObReBGqHclydS5v7k4ZSQ6iziW', 1, 1, 0, @now, @now),
+(@store, 'cashier2', '收银员2', 'Cajero 2', '$2y$12$2mNnGkEMKYaoAE8uLVlIJeo3p.dwg8GUJ8LghSg8bTYOqdb8KgVZG', 1, 1, 0, @now, @now)
+-- ★ 西语名要补进去：这几个是内置账号，名字是职务不是人名，两边都该有。
+--   PIN 仍然【不覆盖】—— 重跑 seed 不能把店家改过的口令冲掉。
+ON DUPLICATE KEY UPDATE
+  `display_name_es` = COALESCE(`operator`.`display_name_es`, VALUES(`display_name_es`)),
+  `updated_at`      = VALUES(`updated_at`);

@@ -193,7 +193,7 @@ function enterMain(op, settings) {
   if (op.lang) { I18N.set(op.lang, { remember: false }); }
   applySettings();
   renderLangSwitch();
-  $('#op-name').textContent = op.name + (op.is_manager ? T('top.manager') : '');
+  renderOpName();
   $('#view-login').classList.remove('active');
   $('#view-main').classList.add('active');
   resetFlow();
@@ -205,6 +205,25 @@ function enterMain(op, settings) {
    * refreshDynamicText 里已经带了 checkHealth，不要再单独调一次。
    */
   refreshDynamicText();
+}
+
+/**
+ * 顶栏那个人名。
+ *
+ * 名字本身也要跟着语言走 —— 否则会出现「系统管理员 (encargado)」
+ * 这种中西混排。两个名字在登录时一并下发（op.names），
+ * 所以切语言时就地换掉即可，不用再请求一次服务器。
+ *
+ * 老账号可能没填西语名，服务端已经在 names 里回落成中文名了，
+ * 这里不需要再判一次。
+ */
+function renderOpName() {
+  const el = $('#op-name');
+  if (!el) return;
+  const op = S.operator;
+  if (!op) { el.textContent = ''; return; }
+  const name = (op.names && op.names[I18N.lang]) || op.name || '';
+  el.textContent = name + (op.is_manager ? T('top.manager') : '');
 }
 
 /**
@@ -248,9 +267,7 @@ async function switchLang(lang, persist) {
 function refreshDynamicText() {
   $('#table-hint').textContent = T('lookup.tableHint', { min: S.window || 30 });
   $('#btn-widen').textContent  = T('lookup.widen', { min: S.widenTo || 60 });
-  if (S.operator) {
-    $('#op-name').textContent = S.operator.name + (S.operator.is_manager ? T('top.manager') : '');
-  }
+  renderOpName();
   if (S.orders && S.orders.length) { renderOrders(S.orders); }
   if (S.order) {
     renderSummary(S.order);

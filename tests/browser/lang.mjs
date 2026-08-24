@@ -98,6 +98,54 @@ await page.waitForTimeout(800);
 err = await page.locator('#login-err').textContent();
 ok(/[一-龥]/.test(err), `切回中文，报错也回中文：「${err.trim()}」`);
 
+console.log('\n【③bis 顶栏的人名也要跟着语言走】');
+
+/**
+ * 现场照片上是「系统管理员 (encargado)」—— 名字是中文、职务后缀是西语，
+ * 中西混排。要么全中文，要么全西文，才像话。
+ *
+ * 名字本身没法翻译（display_name 是店家填的，可能是「小王」也可能是
+ * 「María」），所以每个账号存两个名字，按当前语言取。
+ */
+await login('admin');
+ok((await page.locator('#op-name').textContent()).includes('系统管理员'),
+   '中文界面下显示中文名');
+
+await page.click('#lang-main .lang-btn[data-lang=es]');
+await page.waitForTimeout(600);
+const opEs = (await page.locator('#op-name').textContent()).trim();
+ok(!/[一-龥]/.test(opEs), `★★ 西语界面下整条都是西语：「${opEs}」`);
+ok(/Administrador/.test(opEs), '  └ 用的是这个账号的西语名');
+ok(/encargado/i.test(opEs), '  └ 职务后缀也在');
+
+await page.click('#lang-main .lang-btn[data-lang=zh]');
+await page.waitForTimeout(600);
+const opZh = (await page.locator('#op-name').textContent()).trim();
+ok(!/[a-zA-Z]/.test(opZh.replace(/[（）()]/g, '')), `★★ 切回中文后整条都是中文：「${opZh}」`);
+
+// 没填西语名的账号：西语界面下回落到中文名，不能变成空白
+const noEs = php(`
+  require "app/bootstrap.php";
+  $c = require "app/config/config.php";
+  $a = new Vip\\App($c);
+  $a->localDb()->exec('UPDATE operator SET display_name_es = NULL WHERE store_code = ? AND login_name = ?',
+    [$c['store_code'], 'cashier1']);
+  echo 'done';
+`);
+ok(noEs === 'done', '把一个账号的西语名清空，模拟老账号');
+await page.click('#btn-logout');
+await page.waitForSelector('#view-login.active', { timeout: 5000 });
+await page.click('#lang-login .lang-btn[data-lang=es]');
+await page.waitForTimeout(300);
+await login('cashier1');
+const fallback = (await page.locator('#op-name').textContent()).trim();
+ok(fallback.includes('收银员1'),
+   `★ 没填西语名的账号，西语界面下回落到中文名而不是空白：「${fallback}」`);
+await page.click('#btn-logout');
+await page.waitForSelector('#view-login.active', { timeout: 5000 });
+await page.click('#lang-login .lang-btn[data-lang=zh]');
+await page.waitForTimeout(300);
+
 console.log('\n【④ 语言记在账号上】');
 await login('admin');
 ok(await page.locator('#btn-logout').textContent() === '退出', '登录后是中文（这个账号还没选过）');
@@ -285,6 +333,14 @@ ok(errs.length === 0, errs.length ? '有报错：' + errs.join(' | ') : '无 JS 
 
 await browser.close();
 resetLangs();
+// 把刚才清掉的西语名补回去，别给别的测试留残留
+php(`
+  require "app/bootstrap.php";
+  $c = require "app/config/config.php";
+  $a = new Vip\\App($c);
+  $a->localDb()->exec('UPDATE operator SET display_name_es = ? WHERE store_code = ? AND login_name = ?',
+    ['Cajero 1', $c['store_code'], 'cashier1']);
+`);
 
 console.log(`\n${'─'.repeat(50)}\n${fail === 0 ? '全部通过' : '失败 ' + fail}  ${pass + fail} 项\n`);
 process.exit(fail ? 1 : 0);

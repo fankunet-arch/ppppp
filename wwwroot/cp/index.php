@@ -211,12 +211,17 @@ vip_no_store();
       <summary>新建操作员</summary>
       <div class="row">
         <label>工号<input id="op-login" type="text"></label>
-        <label>显示名<input id="op-name-new" type="text"></label>
+        <label>显示名（中文）<input id="op-name-new" type="text"></label>
+        <label>显示名（西语）<input id="op-name-es" type="text" placeholder="留空则用中文名"></label>
         <label>PIN<input id="op-pin" type="password"></label>
         <label>角色<select id="op-role">
           <option value="1">服务员</option><option value="2">经理</option><option value="3">管理员</option>
         </select></label>
       </div>
+      <p class="muted small">
+        Pad 顶栏按当前语言显示对应的名字 —— 要么全中文、要么全西文。
+        西语名留空的话，西语界面下仍显示中文名。
+      </p>
       <button id="btn-add-op" class="primary">创建</button>
     </details>
 
