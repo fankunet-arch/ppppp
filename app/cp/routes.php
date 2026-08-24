@@ -578,6 +578,7 @@ $api->on('GET', '/cards/batches', static function () use ($app, $requireManager)
             'void'        => (int)$b['void_cnt'],
             'serial_from' => (int)$b['serial_from'],
             'serial_to'   => (int)$b['serial_to'],
+            'valid_to'    => $b['valid_to'],
             'created_at'  => $b['created_at'],
         ], $app->cards()->batches()),
     ]);
@@ -595,8 +596,22 @@ $api->on('GET', '/cards/batches', static function () use ($app, $requireManager)
 $api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin): void {
     $op    = $requireAdmin();
     $b     = Api::body();
-    $batch = Api::str($b, 'batch_no', '') ?: '';
-    $count = Api::int($b, 'count', 0);
+    $batch   = Api::str($b, 'batch_no', '') ?: '';
+    $count   = Api::int($b, 'count', 0);
+    $validTo = Api::str($b, 'valid_to', '') ?: '';
+
+    /**
+     * 有效期【必填】。
+     *
+     * 它会直接印在卡面上，而卡面是唯一的告知证据 —— 客人查不到任何线上
+     * 信息，手里只有一张卡。库里的日期与卡面印的必须一致，否则等于没告知。
+     *
+     * 做成必填而不是给个默认值，是为了每次做卡都强制过一遍脑子：
+     * 这批印的是哪个日期？跟发给印刷厂的稿子对得上吗？
+     */
+    if (trim($validTo) === '') {
+        Api::fail('bad_request', 400, ['hint' => '必须填写有效期 —— 它要印在卡面上，是唯一的告知证据']);
+    }
 
     if (trim($batch) === '') {
         // 批次号留空时按日期给一个，同一天多批自动加序号
@@ -608,7 +623,7 @@ $api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin)
     }
 
     try {
-        $rows = $app->cards()->generateBatch($batch, $count);
+        $rows = $app->cards()->generateBatch($batch, $count, $validTo);
     } catch (\InvalidArgumentException $e) {
         Api::fail('bad_request', 400, ['hint' => $e->getMessage()]);
     }
@@ -616,7 +631,7 @@ $api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin)
     $app->audit()->log('card_batch_generate', [
         'target_type' => 'card_batch', 'target_id' => strtoupper(trim($batch)),
         'operator_id' => $op['id'], 'operator_name' => $op['name'],
-        'detail' => ['count' => count($rows),
+        'detail' => ['count' => count($rows), 'valid_to' => $validTo,
                      'serial_from' => $rows[0]['serial'] ?? null,
                      'serial_to' => $rows[count($rows) - 1]['serial'] ?? null],
     ]);
@@ -624,6 +639,7 @@ $api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin)
     Api::ok([
         'batch_no' => strtoupper(trim($batch)),
         'count'    => count($rows),
+        'valid_to' => $validTo,
         'rows'     => $rows,
         'warning'  => '这份清单包含全部卡的明文 PIN，是一份总钥匙。'
                     . '库里只存不可还原的 hash，关掉窗口就再也取不回来。'
@@ -641,6 +657,8 @@ $api->on('POST', '/cards/lookup', static function () use ($app, $requireManager)
 
     $r    = $app->cardService()->lookup($raw);
     $card = $r['card'] ?? null;
+    // 过期与作废的卡在后台【要能查到】—— 客人拿着一张卡来问「还能用吗」，
+    // 回一句「查无此卡」是错的，得告诉他为什么不能用
     if ($card === null) {
         Api::fail((string)($r['error'] ?? 'card_unknown'), Api::NOT_FOUND);
     }
@@ -650,6 +668,8 @@ $api->on('POST', '/cards/lookup', static function () use ($app, $requireManager)
         'card_no'      => $app->cardNumber()->format((string)$card['card_no']),
         'serial'       => (int)$card['serial'],
         'batch_no'     => $card['batch_no'],
+        'valid_to'     => $card['valid_to'],
+        'expired'      => \Vip\Repo\CardRepo::isExpired($card),
         'status'       => (int)$card['status'],
         'activated_at' => $card['activated_at'],
         'voided_at'    => $card['voided_at'],

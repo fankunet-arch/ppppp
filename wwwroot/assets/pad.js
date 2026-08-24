@@ -800,21 +800,56 @@ async function doCardLookup(value) {
   try {
     const d = await api('/card/lookup', { card_no: value });
 
+    /**
+     * 过期卡 —— 不是死路，是换卡的入口。
+     *
+     * 卡面印着有效期，那是客人唯一能看到的告知；到期前到店换新卡则
+     * 积分、计次、未兑换的券全部结转。所以这里直接引导收银员换卡，
+     * 而不是丢一句「此卡已过期」让客人白跑。
+     */
+    if (d.state === 'expired') {
+      return handleExpiredCard(d);
+    }
+
     if (d.state === 'active') {
       const m = d.member;
+      const soon = d.days_left !== null && d.days_left <= EXPIRING_SOON_DAYS;
       $('#member-result').innerHTML = `
         <div class="found"><b>${escapeHtml(m.card_no)}</b>
-          <div class="muted small">${m.points_balance} 分 · 已消费 ${m.visit_count} 次</div>
+          <div class="muted small">${m.points_balance} 分 · 已消费 ${m.visit_count} 次${
+            d.valid_to ? ' · 有效期至 ' + escapeHtml(d.valid_to) : ''}</div>
+          ${soon ? `<div class="frozen">这张卡还有 ${d.days_left} 天到期，可以现在就为客人换一张（积分会转过去）</div>` : ''}
           ${m.points_frozen ? '<div class="frozen">该会员尚未完成确认，积分照常入账但暂不可兑换</div>' : ''}
           <button class="primary" id="btn-use-member" style="margin-top:10px">选用</button></div>`;
       $('#btn-use-member').onclick = () => useMember(m);
       return;
     }
 
-    // 库存卡 —— 这张卡是新的，引导建会员
+    /**
+     * 库存卡 —— 这张卡是新的，引导建会员。
+     *
+     * 但先看它还能用多久：快到期的卡发出去，客人拿回家没多久就得再跑一趟。
+     * 阈值 30 天，超过就直接放行不打扰。
+     */
+    if (d.days_left !== null && d.days_left <= EXPIRING_SOON_DAYS) {
+      const go = await UI.confirm(
+        `这张卡只剩 ${d.days_left} 天就到期了（${d.valid_to}）。\n\n` +
+        `发给客人的话，他很快就得回来换卡。\n` +
+        `建议换一张有效期更长的。确定还要发这张吗？`,
+        { okText: '仍然发这张', cancelText: '换一张', danger: true }
+      );
+      if (!go) {
+        resetLookupState();
+        $('#member-input').value = '';
+        $('#member-input').focus();
+        return;
+      }
+    }
+
     S.pendingCard = d.card_no;
     $('#new-card-hint').innerHTML =
-      `这张卡尚未启用：<b>${escapeHtml(d.card_no)}</b>`;
+      `这张卡尚未启用：<b>${escapeHtml(d.card_no)}</b>`
+      + (d.valid_to ? `　<span class="muted">有效期至 ${escapeHtml(d.valid_to)}</span>` : '');
     $('#member-new').open = true;
     setTimeout(() => $('#btn-member-create').focus(), 50);
   } catch (e) {
@@ -857,6 +892,65 @@ $('#btn-member-create').onclick = async () => {
     useMember(d.member);
   } catch (e) { showErr('#member-err', e.message); }
 };
+
+/** 剩多少天算「快到期」。发卡与用卡两处都按它提醒 */
+const EXPIRING_SOON_DAYS = 30;
+
+/**
+ * 过期卡的处理 —— 引导换发新卡，积分结转。
+ *
+ * 分两种情况：
+ *   · 卡没绑过人（库存里躺过期了）→ 这张卡废了，让收银员换一张发
+ *   · 卡绑着会员 → 走换卡：扫一张新卡，积分/计次/未用的券全部转过去
+ */
+async function handleExpiredCard(d) {
+  if (!d.member) {
+    showErr('#member-err',
+      `此卡已于 ${d.valid_to} 过期，且从未启用过。请另取一张卡发给客人。`);
+    return;
+  }
+
+  const who = `${d.card_no}　${d.member.points_balance} 分 · 已消费 ${d.member.visit_count} 次`;
+  const go = await UI.confirm(
+    `此卡已于 ${d.valid_to} 过期。\n\n${who}\n\n` +
+    `现在可以为客人换一张新卡，积分与未用的券会全部转过去。\n` +
+    `要换吗？`,
+    { okText: '换发新卡', cancelText: '暂不处理' }
+  );
+  if (!go) {
+    showErr('#member-err', `此卡已于 ${d.valid_to} 过期，可随时到店换发新卡`);
+    return;
+  }
+
+  for (;;) {
+    const raw = await UI.input(
+      '请扫描或输入要发给客人的【新卡】卡号',
+      { okText: '换发', cancelText: '取消' }
+    );
+    if (raw === null) {
+      showErr('#member-err', `此卡已于 ${d.valid_to} 过期，可随时到店换发新卡`);
+      return;
+    }
+    try {
+      const r = await api('/card/replace', {
+        member_id: d.member.id, card_no: raw,
+        reason: `原卡 ${d.card_no} 于 ${d.valid_to} 到期`,
+      });
+      toast(`已换发 ${r.card_no}，积分已转移`, 'ok');
+      resetLookupState();
+      $('#member-input').value = '';
+      // 换完直接选用这位会员，收银员不用再查一遍
+      if (r.member) { useMember(r.member); }
+      return;
+    } catch (e) {
+      toast(e.message, 'err');
+      // 新卡本身有问题（已被占用、也过期了…）时让他再扫一张
+      if (!['card_unknown', 'card_malformed', 'card_expired', 'card_not_available'].includes(e.error)) {
+        return;
+      }
+    }
+  }
+}
 
 /**
  * 现场确认码。

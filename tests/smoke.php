@@ -17,6 +17,18 @@ declare(strict_types=1);
  *      SMOKE_DB_USER / SMOKE_DB_PASS
  *   2) app/config/config.php 的 local_db
  *
+ * 🔴 --fresh 请给它一个【专用空库】，不要指着开发库跑：
+ *
+ *     CREATE DATABASE vip_smoke DEFAULT CHARSET utf8mb4
+ *            COLLATE utf8mb4_unicode_ci;
+ *
+ *     SMOKE_DB_HOST=127.0.0.1 SMOKE_DB_NAME=vip_smoke \
+ *     SMOKE_DB_USER=... SMOKE_DB_PASS=... php tests/smoke.php --fresh
+ *
+ *   开发库里有种子数据和浏览器测试留下的卡（store_code != 'SMOKE'），
+ *   下面那道安全检查会直接拒绝执行 —— 这是对的，不要去绕过它，
+ *   换一个空库就行。
+ *
  * ★ 安全设计
  *   · 全程使用独立门店码 SMOKE，绝不触碰生产数据；
  *   · --fresh 会执行 DROP TABLE，因此若库中存在 store_code != 'SMOKE'
@@ -149,6 +161,22 @@ if ($fresh) {
     ok(true, '库中无非 SMOKE 数据，可以安全建表');
 
     step('执行 migrations 与 seeds');
+
+    /**
+     * ★ 先把表全删干净，别指望迁移自己清场。
+     *
+     * 早先这里直接跑迁移，靠 001/002 里的 DROP TABLE 来清空。但后来新增的
+     * 表用的是 CREATE TABLE IF NOT EXISTS（为了不触发 init.php 的破坏性
+     * 迁移闸门）—— 没有任何东西会删它们。于是重跑 --fresh 时，表还在、
+     * 列也还在，后面某个 ALTER 就撞上「Duplicate column」，
+     * 报错指向迁移文件，看着像迁移写错了，其实是没清干净。
+     *
+     * --fresh 就该是 fresh。
+     */
+    foreach (array_merge($tables, ['schema_migration']) as $t) {
+        $db->pdo()->exec("DROP TABLE IF EXISTS `{$t}`");
+    }
+
     // ★ 必须扫目录而不是写死文件名 —— 早先这里硬编码了 001_init.sql，
     //   于是每加一个迁移（002、003…）冒烟测试都会因为缺列而崩，
     //   且报错指向业务代码，看不出真正原因是建表少跑了迁移。
@@ -1201,6 +1229,112 @@ ok($consent->verifyCode($cMid2, $m2[1], $opC)['ok'], '★ 新码可用（重发�
 $anonR = $consent->sendCode((int)$anon['member']['id'], $opC);
 ok(!$anonR['ok'] && $anonR['error'] === 'consent_already_done',
    '★ 匿名卡本来就是已生效状态，不需要也不能再确认');
+
+step('⑰ 卡片有效期 —— 卡面日期是唯一的告知证据');
+
+/**
+ * 为什么用「固定日期印在卡上」而不是「N 个月不活跃就清零」：
+ * 客人查不到任何线上信息，手里只有一张卡。不活跃期这种规则他无从判断
+ * 自己处在什么位置，一旦投诉，店家拿不出「已告知」的证据。
+ * 而固定日期印在卡面 —— 卡片本身就是证据。
+ *
+ * 缺陷是常客也会被清零，补法是「有效期属于卡片，不属于积分」：
+ * 到店换卡则积分全部结转。以下把这条链路钉住。
+ */
+$today    = date('Y-m-d');
+$past     = date('Y-m-d', strtotime('-1 day'));
+$soon     = date('Y-m-d', strtotime('+10 days'));
+$far      = date('Y-m-d', strtotime('+3 years'));
+
+// ── 生成时的有效期校验 ──
+foreach ([[$past, '已经过去的日期'], [$today, '就是今天'], ['2026-13-45', '格式不对']] as [$bad, $why]) {
+    $threw = false;
+    try { $cards->generateBatch('SMOKEVT' . substr(md5($bad), 0, 4), 1, $bad); }
+    catch (\InvalidArgumentException $e) { $threw = true; }
+    ok($threw, "{$why}的有效期被拒绝");
+}
+
+$vb = $cards->generateBatch('SMOKEVAL', 3, $far);
+eq($far, $vb[0]['valid_to'], '★ 有效期写进了卡（印刷清单里也要有这一列）');
+eq($far, (string)$cards->findByCardNo($vb[0]['card_no'])['valid_to'], '库里存下来了');
+
+// ── 判定 ──
+$live = $cards->findByCardNo($vb[0]['card_no']);
+ok(!CardRepo::isExpired($live), '未到期的卡不算过期');
+ok(CardRepo::daysLeft($live) > 300, '剩余天数算得出来');
+
+$fake = ['valid_to' => $past];
+ok(CardRepo::isExpired($fake), '★ 过了 valid_to 就算过期');
+ok(CardRepo::daysLeft($fake) < 0, '过期后剩余天数是负的');
+ok(!CardRepo::isExpired(['valid_to' => null]), '不设有效期的卡永不过期');
+ok(!CardRepo::graceOver(['valid_to' => $past]), '刚过期还在宽限期内');
+ok(CardRepo::graceOver(['valid_to' => date('Y-m-d', strtotime('-8 months'))]),
+   '★ 超过 ' . CardRepo::GRACE_MONTHS . ' 个月宽限才算彻底失效');
+
+// ── 过期卡不能发给客人 ──
+$expBatch = $cards->generateBatch('SMOKEEXP', 2, $far);
+// 直接把库里的日期改成过去，模拟「库存里躺过期了」
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND batch_no = ?',
+    [$past, SMOKE_STORE, 'SMOKEEXP']);
+
+$r = $svc->bindNewMember($expBatch[0]['card_no'], null, null, null, $opStub);
+ok(!$r['ok'] && $r['error'] === 'card_expired',
+   '★ 库存里躺过期的卡不能发给客人（发了他拿回家就是废卡）');
+
+$look = $svc->lookup($expBatch[0]['card_no']);
+eq('expired', $look['state'], '扫过期卡 → state=expired');
+
+// ── 换卡结转：这是整条规则成立的关键 ──
+$oldCard = $vb[1];
+$bindR   = $svc->bindNewMember($oldCard['card_no'], null, null, null, $opStub);
+ok($bindR['ok'], '先发一张正常的卡并激活');
+$vMid = (int)$bindR['member']['id'];
+
+/**
+ * 攒点积分与计次，再把这张卡改成已过期。
+ *
+ * ★ 必须同时写流水。applyDelta 只动余额，而 ⑬ 段有一条不变量
+ *   「每名会员的积分余额与其流水合计一致」—— 只改余额不写流水，
+ *   那条断言会红，而它是对的：造假数据的是测试，不是产品。
+ */
+$app->members()->applyDelta($vMid, 120, 7, 5000);
+$db->exec('INSERT INTO point_ledger
+             (store_code, member_id, entry_type, amount, points, counted_visit,
+              status, source, manual_reason, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $vMid, 6, 50.00, 120, 7, 1, 2, '测试造数', $db->now()]);
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND card_no = ?',
+    [$past, SMOKE_STORE, CardNumber::normalize($oldCard['card_no'])]);
+
+$before = $app->members()->findById($vMid);
+eq(120, (int)$before['points_balance'], '换卡前有 120 分');
+eq(7,   (int)$before['visit_count'],    '换卡前已消费 7 次');
+
+$look = $svc->lookup($oldCard['card_no']);
+eq('expired', $look['state'], '过期卡扫出来是 expired');
+ok(($look['member']['id'] ?? 0) === $vMid,
+   '★ 过期卡要把「绑的是谁」一并带回 —— Pad 才能直接进换卡，不用再查一遍');
+
+$newCard = $vb[2];
+$rep = $svc->replaceCard($vMid, $newCard['card_no'], '原卡到期', $opStub);
+ok($rep['ok'], '★ 过期卡可以换发新卡');
+
+$after = $app->members()->findById($vMid);
+eq(120, (int)$after['points_balance'], '★ 积分完整结转');
+eq(7,   (int)$after['visit_count'],    '★ 计次完整结转');
+eq(CardNumber::normalize($newCard['card_no']), $after['card_no'], '会员行指向新卡');
+eq(2, (int)$cards->findByCardNo($oldCard['card_no'])['status'], '旧卡已作废');
+
+$log = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'card_replace']);
+ok($log !== null && str_contains((string)$log['detail'], 'old_valid_to'),
+   '★ 换卡审计里记下新旧卡的有效期（客人申诉时要查的就是这个）');
+
+// 新卡本身过期的话不能拿来换
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND batch_no = ?',
+    [$past, SMOKE_STORE, 'SMOKEVAL']);
+$r2 = $svc->replaceCard($vMid, $expBatch[1]['card_no'], '再换', $opStub);
+ok(!$r2['ok'] && $r2['error'] === 'card_expired', '★ 不能换成另一张过期卡（换了个寂寞）');
 
 step('⑬ 不变量总校验');
 

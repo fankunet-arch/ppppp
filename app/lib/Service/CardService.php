@@ -61,6 +61,24 @@ final class CardService
             return ['ok' => false, 'state' => 'void', 'error' => 'card_void', 'card' => $card];
         }
 
+        /**
+         * 过期卡：不能继续用，但【要能换】。
+         *
+         * 卡面印着有效期，那是唯一的告知证据；到期前到店换新卡则积分全部结转。
+         * 所以这里除了拒绝，还要把「这张卡绑的是谁」一并带回去 ——
+         * Pad 据此直接进入换卡流程，收银员不用再查一遍。
+         */
+        if (CardRepo::isExpired($card)) {
+            $member = $card['member_id'] !== null
+                ? $this->members->findById((int)$card['member_id'])
+                : null;
+            return [
+                'ok' => false, 'state' => 'expired', 'error' => 'card_expired',
+                'card' => $card, 'member' => $member,
+                'grace_over' => CardRepo::graceOver($card),
+            ];
+        }
+
         if ($status === CardRepo::STATUS_ACTIVE) {
             $member = $card['member_id'] !== null
                 ? $this->members->findById((int)$card['member_id'])
@@ -111,6 +129,10 @@ final class CardService
                 if ($status === CardRepo::STATUS_ACTIVE) {
                     // 已经是别人的卡了 —— 该走「直接进入该会员」，不是建新的
                     return ['ok' => false, 'error' => 'card_taken'];
+                }
+                if (CardRepo::isExpired($card)) {
+                    // 库存里躺过期了。别发给客人 —— 他拿回家就是一张废卡
+                    return ['ok' => false, 'error' => 'card_expired'];
                 }
 
                 try {
@@ -171,6 +193,11 @@ final class CardService
             if ((int)$newCard['status'] !== CardRepo::STATUS_STOCK) {
                 return ['ok' => false, 'error' => 'card_not_available'];
             }
+            // 旧卡过期【不影响】换卡 —— 那正是换卡要解决的场景。
+            // 但新卡本身不能是过期的，否则换了个寂寞
+            if (CardRepo::isExpired($newCard)) {
+                return ['ok' => false, 'error' => 'card_expired'];
+            }
 
             $old = $this->cards->findByMemberId($memberId);
             if ($old !== null) {
@@ -188,9 +215,11 @@ final class CardService
                 'operator_name' => $operator['name'] ?? null,
                 'device' => $operator['device'] ?? null,
                 'detail' => [
-                    'member_id' => $memberId,
-                    'old_card'  => $old['card_no'] ?? null,
-                    'reason'    => $reason,
+                    'member_id'   => $memberId,
+                    'old_card'    => $old['card_no'] ?? null,
+                    'old_valid_to'=> $old['valid_to'] ?? null,
+                    'new_valid_to'=> $newCard['valid_to'] ?? null,
+                    'reason'      => $reason,
                 ],
             ]);
 

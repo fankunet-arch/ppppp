@@ -266,15 +266,41 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator)
     }
 
     $r = $app->cardService()->lookup($raw);
+
+    /**
+     * 过期卡是【可以换】的，所以不能只丢一个错误回去 ——
+     * 要把「这张卡绑的是谁」一并带上，Pad 才能直接进入换卡流程，
+     * 收银员不用再查一遍。
+     */
+    if (!$r['ok'] && ($r['state'] ?? '') === 'expired') {
+        $card = $r['card'];
+        $m    = $r['member'] ?? null;
+        Api::ok([
+            'state'      => 'expired',
+            'card_no'    => $app->cardNumber()->format((string)$card['card_no']),
+            'serial'     => (int)$card['serial'],
+            'valid_to'   => $card['valid_to'],
+            'grace_over' => (bool)($r['grace_over'] ?? false),
+            'member'     => $m === null ? null : [
+                'id'             => (int)$m['id'],
+                'points_balance' => (int)$m['points_balance'],
+                'visit_count'    => (int)$m['visit_count'],
+            ],
+        ]);
+    }
+
     if (!$r['ok']) {
         Api::fail((string)$r['error'], Api::NOT_FOUND);
     }
 
     $card = $r['card'];
     $out  = [
-        'state'   => $r['state'],
-        'card_no' => $app->cardNumber()->format((string)$card['card_no']),
-        'serial'  => (int)$card['serial'],
+        'state'     => $r['state'],
+        'card_no'   => $app->cardNumber()->format((string)$card['card_no']),
+        'serial'    => (int)$card['serial'],
+        'valid_to'  => $card['valid_to'],
+        // 发卡前要提醒收银员「这张快到期了」，判断在前端做，天数由后端算
+        'days_left' => \Vip\Repo\CardRepo::daysLeft($card),
     ];
 
     if ($r['state'] === 'active') {
@@ -368,6 +394,44 @@ $api->on('POST', '/member/create', static function () use ($app, $requireOperato
         'consent_status' => (int)$m['consent_status'],
         'points_frozen'  => $pending,
     ], 'consent_pending' => $pending, 'consent_code' => $codeSent]);
+});
+
+/**
+ * 换发新卡 —— 过期、损坏、挂失都走这里。
+ *
+ * 积分、计次、未兑换的券全部结转（它们挂在 member 上，卡只是钥匙）。
+ * 这是「卡片有有效期、而积分不因此损失」这条规则的落地点：
+ * 卡面印着到期日作为告知证据，客人到店换一张就什么都不损失。
+ */
+$api->on('POST', '/card/replace', static function () use ($app, $requireOperator): void {
+    $op     = $requireOperator();
+    $b      = Api::body();
+    $mid    = Api::int($b, 'member_id', 0);
+    $newNo  = Api::str($b, 'card_no', '') ?: '';
+    $reason = Api::str($b, 'reason', '') ?: '换发新卡';
+
+    if ($mid <= 0 || trim($newNo) === '') {
+        Api::fail('bad_request', 400, ['hint' => '需要会员与新卡号']);
+    }
+
+    $r = $app->cardService()->replaceCard($mid, $newNo, $reason, $op);
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], 400);
+    }
+
+    $m = $app->members()->findById($mid);
+    Api::ok([
+        'card_no'  => $app->cardNumber()->format((string)$r['card']['card_no']),
+        'valid_to' => $r['card']['valid_to'],
+        'member'   => $m === null ? null : [
+            'id'             => (int)$m['id'],
+            'card_no'        => $app->cardNumber()->format((string)$m['card_no']),
+            'points_balance' => (int)$m['points_balance'],
+            'visit_count'    => (int)$m['visit_count'],
+            'consent_status' => (int)$m['consent_status'],
+            'points_frozen'  => (int)$m['consent_status'] !== 1,
+        ],
+    ]);
 });
 
 /**

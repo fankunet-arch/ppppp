@@ -525,17 +525,24 @@ async function loadCards() {
     <div class="stat"><b>${esc(d.prefix)}</b><span>卡号前缀</span></div>
     <div class="stat"><b>${d.next_serial}</b><span>下一个顺序号</span></div>`;
 
+  const today = new Date().toISOString().slice(0, 10);
   $('#card-batches').innerHTML = d.batches.length ? `<table>
-    <tr><th>批次</th><th>顺序号区间</th><th class="num">共</th><th class="num">库存</th>
+    <tr><th>批次</th><th>有效期至</th><th>顺序号区间</th><th class="num">共</th><th class="num">库存</th>
         <th class="num">已激活</th><th class="num">已作废</th><th>生成时间</th></tr>${
-    d.batches.map(b => `<tr>
+    d.batches.map(b => {
+      // 库存里还躺着的过期卡要显眼 —— 发出去客人拿回家就是一张废卡
+      const dead = b.valid_to && b.valid_to < today;
+      return `<tr>
       <td><b>${esc(b.batch_no)}</b></td>
+      <td class="${dead ? 'err' : 'muted small'}">${b.valid_to ? esc(b.valid_to) : '不设'}${
+        dead && b.stock > 0 ? `　⚠ 库存 ${b.stock} 张已过期` : ''}</td>
       <td class="muted small">${b.serial_from} ~ ${b.serial_to}</td>
       <td class="num">${b.total}</td>
       <td class="num">${b.stock}</td>
       <td class="num">${b.active}</td>
       <td class="num">${b.void || ''}</td>
-      <td class="muted small">${esc(b.created_at)}</td></tr>`).join('')
+      <td class="muted small">${esc(b.created_at)}</td></tr>`;
+    }).join('')
   }</table>` : '<div class="empty">还没有生成过任何批次</div>';
 
   // 生成批次是管理员才有的动作 —— 它能一次拿到整批明文 PIN
@@ -555,6 +562,8 @@ $('#btn-card-look').onclick = async () => {
       <tr><th>卡号</th><td><b>${esc(c.card_no)}</b></td></tr>
       <tr><th>状态</th><td>${esc(stateText)}</td></tr>
       <tr><th>批次</th><td>${esc(c.batch_no)}　顺序号 ${c.serial}</td></tr>
+      <tr><th>有效期至</th><td class="${c.expired ? 'err' : ''}">${
+        c.valid_to ? esc(c.valid_to) + (c.expired ? '　⚠ 已过期，可到店换发新卡（积分结转）' : '') : '不设'}</td></tr>
       ${c.activated_at ? `<tr><th>激活时间</th><td>${esc(c.activated_at)}</td></tr>` : ''}
       ${c.voided_at ? `<tr><th>作废</th><td>${esc(c.voided_at)}　${esc(c.void_reason || '')}</td></tr>` : ''}
       ${c.pin_locked_until ? `<tr><th class="warn">PIN 锁定至</th><td>${esc(c.pin_locked_until)}</td></tr>` : ''}
@@ -582,20 +591,40 @@ $('#btn-card-void').onclick = async () => {
 $('#btn-card-gen').onclick = async () => {
   const batch = $('#cd-batch').value.trim();
   const count = +$('#cd-count').value || 0;
+  const valid = $('#cd-valid').value;
   if (count < 1) return toast('数量必须大于 0', 'err');
+  if (!valid)   return toast('必须填写有效期 —— 它要印在卡面上', 'err');
+  if (valid <= new Date().toISOString().slice(0, 10)) {
+    return toast('有效期必须晚于今天', 'err');
+  }
+
+  /**
+   * 有效期单独确认一遍，而且把它放在最前面。
+   *
+   * 卡面那行日期是唯一的告知证据（客人查不到任何线上信息），
+   * 一旦印错，整批卡的合规基础就没了 —— 而且是印完才发现。
+   * 多按一次确认，换的是这个。
+   */
+  if (!await UI.confirm(
+    `请再核对一次有效期：\n\n` +
+    `        ${valid}\n\n` +
+    `这个日期会印在卡面上，也是客人唯一能看到的告知。\n` +
+    `与印刷稿不一致的话，整批卡都得重印。`,
+    { okText: '日期没错', cancelText: '我再看看' })) return;
 
   if (!await UI.confirm(
-    `生成 ${count} 张新卡？\n\n` +
+    `生成 ${count} 张新卡（有效期至 ${valid}）？\n\n` +
     `生成后会一次性显示全部卡号与 PIN，这是明文 PIN 唯一出现的时刻 ——\n` +
     `库里只存不可还原的 hash，关掉就再也取不回来，只能作废整批重来。\n\n` +
     `请准备好立刻复制保存。`,
     { okText: '生成并显示清单' })) return;
 
   try {
-    const d = await api('/cards/generate', { batch_no: batch, count });
-    // 制表符分隔：直接粘进 Excel 就是三列，不用做 CSV 转义
-    const lines = ['卡号\t二维码内容\tPIN']
-      .concat(d.rows.map(r => `${r.display}\t${r.card_no}\t${r.pin}`));
+    const d = await api('/cards/generate', { batch_no: batch, count, valid_to: valid });
+    // 制表符分隔：直接粘进 Excel 就是四列，不用做 CSV 转义。
+    // 有效期也放进去 —— 给印刷厂的稿子要按这一列排版
+    const lines = ['卡号\t二维码内容\tPIN\t有效期至']
+      .concat(d.rows.map(r => `${r.display}\t${r.card_no}\t${r.pin}\t${r.valid_to || ''}`));
     $('#card-gen-csv').value = lines.join('\n');
     $('#card-gen-warn').textContent = d.warning;
     $('#card-gen-result').hidden = false;

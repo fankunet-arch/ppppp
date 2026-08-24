@@ -23,6 +23,9 @@ final class CardRepo
     public const STATUS_ACTIVE  = 1;   // 已激活，绑定会员
     public const STATUS_VOID    = 2;   // 已作废/挂失
 
+    /** 过期后仍可到店换卡结转的宽限期。不印在卡上 —— 实际比承诺的宽松只有好处 */
+    public const GRACE_MONTHS = 6;
+
     /** 卡背 PIN 位数。纯数字：好印、好念，客人报的时候没有字母歧义 */
     public const PIN_LEN = 6;
 
@@ -85,7 +88,12 @@ final class CardRepo
      *
      * @return array<int, array{card_no:string, display:string, pin:string, serial:int}>
      */
-    public function generateBatch(string $batchNo, int $count): array
+    /**
+     * @param string|null $validTo 有效期至（YYYY-MM-DD，含当天）。
+     *                             必须与卡面印刷的日期一致 —— 卡面是唯一的
+     *                             告知证据，两边不一致就等于没告知。
+     */
+    public function generateBatch(string $batchNo, int $count, ?string $validTo = null): array
     {
         $batchNo = strtoupper(trim($batchNo));
         if (!preg_match('/^[A-Z0-9_-]{1,32}$/', $batchNo)) {
@@ -98,12 +106,24 @@ final class CardRepo
         if ($this->batchExists($batchNo)) {
             throw new \InvalidArgumentException("批次号 {$batchNo} 已存在，换一个");
         }
+        if ($validTo !== null && $validTo !== '') {
+            $d = \DateTimeImmutable::createFromFormat('!Y-m-d', $validTo);
+            if ($d === false || $d->format('Y-m-d') !== $validTo) {
+                throw new \InvalidArgumentException('有效期格式应为 YYYY-MM-DD');
+            }
+            if ($d->format('Y-m-d') <= date('Y-m-d')) {
+                // 印一批一发就过期的卡，只会在柜台上制造混乱
+                throw new \InvalidArgumentException('有效期必须晚于今天');
+            }
+        } else {
+            $validTo = null;
+        }
 
         $now   = $this->db->now();
         $start = $this->nextSerial();
         $out   = [];
 
-        $this->db->transaction(function () use ($batchNo, $count, $now, $start, &$out): void {
+        $this->db->transaction(function () use ($batchNo, $count, $now, $start, $validTo, &$out): void {
             for ($i = 0; $i < $count; $i++) {
                 $serial = $start + $i;
                 // 后缀随机，理论上可能与同一顺序号的历史值重复，但顺序号本身
@@ -113,10 +133,10 @@ final class CardRepo
 
                 $this->db->exec(
                     'INSERT INTO card
-                       (store_code, card_no, serial, batch_no, status,
+                       (store_code, card_no, serial, batch_no, valid_to, status,
                         pin_hash, created_at, updated_at)
-                     VALUES (?,?,?,?,?,?,?,?)',
-                    [$this->storeCode, $no, $serial, $batchNo, self::STATUS_STOCK,
+                     VALUES (?,?,?,?,?,?,?,?,?)',
+                    [$this->storeCode, $no, $serial, $batchNo, $validTo, self::STATUS_STOCK,
                      password_hash($pin, PASSWORD_BCRYPT), $now, $now]
                 );
 
@@ -125,6 +145,7 @@ final class CardRepo
                     'card_no'  => $no,
                     'display'  => $this->cardNo->format($no),
                     'pin'      => $pin,
+                    'valid_to' => $validTo,
                 ];
             }
         });
@@ -161,13 +182,47 @@ final class CardRepo
                     SUM(status = ?)                                 AS void_cnt,
                     MIN(serial)                                     AS serial_from,
                     MAX(serial)                                     AS serial_to,
-                    MIN(created_at)                                 AS created_at
+                    MIN(created_at)                                 AS created_at,
+                    MAX(valid_to)                                   AS valid_to
                FROM card
               WHERE store_code = ?
            GROUP BY batch_no
            ORDER BY MIN(serial) DESC',
             [self::STATUS_STOCK, self::STATUS_ACTIVE, self::STATUS_VOID, $this->storeCode]
         );
+    }
+
+    // ── 有效期 ──────────────────────────────────────────────
+
+    /** 该卡是否已过有效期（valid_to 为空视为不设有效期） */
+    public static function isExpired(array $card, ?string $today = null): bool
+    {
+        $v = $card['valid_to'] ?? null;
+        return $v !== null && (string)$v < ($today ?? date('Y-m-d'));
+    }
+
+    /** 距到期还有几天；不设有效期返回 null，已过期返回负数 */
+    public static function daysLeft(array $card, ?string $today = null): ?int
+    {
+        $v = $card['valid_to'] ?? null;
+        if ($v === null) {
+            return null;
+        }
+        $a = new \DateTimeImmutable($today ?? date('Y-m-d'));
+        $b = new \DateTimeImmutable((string)$v);
+        return (int)$a->diff($b)->format('%r%a');
+    }
+
+    /** 过期且已超过宽限期 —— 到这一步积分才真正清零 */
+    public static function graceOver(array $card, ?string $today = null): bool
+    {
+        $v = $card['valid_to'] ?? null;
+        if ($v === null) {
+            return false;
+        }
+        $cut = (new \DateTimeImmutable((string)$v))
+            ->modify('+' . self::GRACE_MONTHS . ' months')->format('Y-m-d');
+        return ($today ?? date('Y-m-d')) > $cut;
     }
 
     // ── 激活与作废 ──────────────────────────────────────────

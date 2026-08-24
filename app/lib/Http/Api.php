@@ -74,6 +74,8 @@ final class Api
         'card_void'              => '此卡已挂失作废，请换一张新卡',
         'card_taken'             => '此卡已绑定其他会员',
         'card_not_available'     => '这张卡不在库存中，无法发给客人',
+        'card_expired'           => '此卡已过有效期，请为客人换发新卡（积分会一并转过去）',
+        'card_expiring_soon'     => '这张卡快到期了',
         'card_member_missing'    => '卡片绑定的会员查不到，请联系管理员',
         'member_has_card'        => '该会员已有一张卡，如需换卡请走挂失换卡',
         'card_required'          => '请先扫描客人的实体会员卡',
