@@ -55,6 +55,20 @@
     doc.head.appendChild(s);
   }
 
+  /**
+   * 取一条文案，但【不硬依赖】i18n.js。
+   *
+   * ui.js 在 i18n.js 之前加载，而且后台（cp/）只引 ui.js 不引词典。
+   * 所以这里永远只是「有就用、没有就回落中文」，不能直接引用 I18N。
+   */
+  function tr(key, fallback) {
+    var i = global.I18N;
+    if (!i || typeof i.t !== 'function') { return fallback; }
+    var v = i.t(key);
+    // 找不到键时 I18N.t 会返回 «key»，那种情况回落到内置中文
+    return (v && v.charAt(0) !== '\u00AB') ? v : fallback;
+  }
+
   function build() {
     injectStyle();
     host = doc.createElement('div');
@@ -90,7 +104,7 @@
       var el = host.querySelector('.ui-ask-input');
       var v  = el.value;
       if (current.required && v.trim() === '') {
-        showErr('不能为空');
+        showErr(tr('ui.required', '不能为空'));
         el.focus();
         return;
       }
@@ -138,9 +152,11 @@
       showErr('');
 
       var ok = host.querySelector('.ui-ok');
-      ok.textContent = opts.okText || '确定';
+      // 默认按钮文案跟着界面语言走。ui.js 比 i18n.js 先加载，
+      // 所以只能在用的时候才去问，不能在加载时取。
+      ok.textContent = opts.okText || tr('common.confirm', '确定');
       ok.classList.toggle('ui-danger', !!opts.danger);
-      host.querySelector('.ui-cancel').textContent = opts.cancelText || '取消';
+      host.querySelector('.ui-cancel').textContent = opts.cancelText || tr('common.cancel', '取消');
 
       current = {
         resolve: resolve,

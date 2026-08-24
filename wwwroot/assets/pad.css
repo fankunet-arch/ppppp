@@ -124,6 +124,30 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
 }
 .topbar .op { font-weight: 600; }
 .topbar .link { margin-left: auto; }
+
+/* ── 语言切换 ─────────────────────────────────────── */
+/* 顶栏里由语言切换器占住「靠右」的位置，后面几个 link 紧跟着排，
+   否则它们各自带 margin-left:auto 会被拆得七零八落 */
+.topbar .lang-switch { margin-left: auto; }
+.topbar .lang-switch ~ .link { margin-left: 0; }
+
+.lang-switch { display: inline-flex; gap: 0; }
+.lang-btn {
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 4px 12px;
+  min-height: 32px;
+  border-radius: 0;
+}
+.lang-btn:first-child { border-radius: 8px 0 0 8px; }
+.lang-btn:last-child  { border-radius: 0 8px 8px 0; }
+.lang-btn + .lang-btn { border-left: none; }
+.lang-btn.on { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+/* 登录页的切到底部居中，不要跟输入框抢注意力 */
+.login-box .lang-switch { justify-content: center; margin-top: 18px; width: 100%; }
 .pill {
   font-size: 13px;
   padding: 3px 10px;

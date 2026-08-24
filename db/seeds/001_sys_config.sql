@@ -106,6 +106,11 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- CUPON DE 5 EUROS（满50减5 纸质券）/ Dto% / Dto. -15% 都是普通折扣，绝不能误判。
   -- 名称会随店家调整而变（Dto. -20% 已被 Dto. -15% 取代），所以做成可配置。
 
+-- ── 界面语言 ──────────────────────────────────────────────
+,(@store,'default_lang','zh',@now)
+  -- 登录页的语言，以及还没选过语言的账号登录后用哪种。zh | es
+  -- 每个操作员可在 Pad 上自行切换，选择记在 operator.lang，改这里不影响他们。
+
 -- ── 实体卡有效期 ──────────────────────────────────────────
 ,(@store,'card_expiring_soon_days','30',@now)
   -- 卡剩多少天到期时开始提醒收银员换卡。发卡时也用这个天数拦一道。

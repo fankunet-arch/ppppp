@@ -27,7 +27,7 @@ const DEV = (() => {
       if (r && r.id && r.source === 'native') return { id: String(r.id), source: 'native' };
     } catch (e) {
       // 桥接在但调用失败：不能让登录页整个崩掉，继续走兜底
-      console.warn('[pad] 原生设备 ID 获取失败，回落本地标识', e);
+      console.warn('[pad] native device id unavailable, falling back', e);
     }
   }
   let d = localStorage.getItem('vip_device');
@@ -96,7 +96,14 @@ function step(id) {
 }
 
 async function api(path, body, method = 'POST') {
-  const opt = { method, headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin' };
+  const opt = {
+    method,
+    // ★ X-Lang 每次都带：服务端据此决定用哪种语言回错误文案。
+    //   不带的话会出现「界面西语、报错中文」——前端不翻服务端的错误，
+    //   那套文案只在 Api::MESSAGES 里有一份（见 i18n.js 顶部说明）。
+    headers: { 'Content-Type': 'application/json', 'X-Lang': I18N.lang },
+    credentials: 'same-origin',
+  };
   if (body !== undefined && method !== 'GET') opt.body = JSON.stringify(body);
   /**
    * ★ 必须把「连不上」和「连上了但没回 JSON」分开报。
@@ -113,7 +120,7 @@ async function api(path, body, method = 'POST') {
   try {
     res = await fetch(API + path, opt);
   } catch (e) {
-    throw { error: 'network', message: '无法连接本机服务，请检查 Pad 的网络与 Web 服务是否在运行' };
+    throw { error: 'network', message: T('net.down') };
   }
   try {
     raw  = await res.text();
@@ -122,11 +129,11 @@ async function api(path, body, method = 'POST') {
     const head = raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
     throw {
       error: 'bad_response',
-      message: `服务器返回的不是 JSON（HTTP ${res.status}）\n${head || '（响应为空）'}`,
+      message: T('net.notJson', { status: res.status, head: head || T('net.emptyBody') }),
     };
   }
   if (!res.ok || json.ok === false) {
-    throw { error: json.error || 'server_error', message: json.message || '操作失败', detail: json.detail };
+    throw { error: json.error || 'server_error', message: json.message || T('net.failed'), detail: json.detail };
   }
   return json.data;
 }
@@ -136,7 +143,7 @@ $('#btn-login').onclick = async () => {
   showErr('#login-err', '');
   const name = $('#login-name').value.trim();
   const pin  = $('#login-pin').value;
-  if (!name || !pin) return showErr('#login-err', '请填写工号与 PIN');
+  if (!name || !pin) return showErr('#login-err', T('login.needBoth'));
   try {
     const d = await api('/auth/login', { login_name: name, pin, device: DEVICE });
     enterMain(d.operator, d.settings);
@@ -163,11 +170,89 @@ $('#btn-logout').onclick = async () => {
 function enterMain(op, settings) {
   S.operator = op;
   S.settings = settings || {};
+  /**
+   * 语言以【账号】为准，不是以这台平板为准。
+   *
+   * 服务端已经把「自己选过的 > 后台默认」算好放在 op.lang 里，
+   * 这里直接用就行 —— 回落逻辑放前端的话，登录、会话恢复、切换后
+   * 三个入口各写一遍，漏一处就是「换台平板语言变了」。
+   *
+   * remember:false —— 不要把别人的语言写进这台平板的本地记录，
+   * 那是登录页专用的，覆盖了就变成「谁最后登录算谁的」。
+   */
+  if (op.lang) { I18N.set(op.lang, { remember: false }); }
   applySettings();
-  $('#op-name').textContent = op.name + (op.is_manager ? '（经理）' : '');
+  renderLangSwitch();
+  $('#op-name').textContent = op.name + (op.is_manager ? T('top.manager') : '');
   $('#view-login').classList.remove('active');
   $('#view-main').classList.add('active');
   resetFlow();
+  checkHealth();
+}
+
+/**
+ * 语言切换器 —— 登录页和顶栏各一个。
+ *
+ * 登录后切换会落库（记在账号上），登录前只存在这台平板本地：
+ * 那时还不知道是谁在登录。
+ */
+function renderLangSwitch() {
+  const langs = (S.settings && S.settings.langs) || { zh: '中文', es: 'Español' };
+  [['#lang-login', false], ['#lang-main', true]].forEach(([sel, loggedIn]) => {
+    const box = $(sel);
+    if (!box) return;
+    box.innerHTML = Object.keys(langs).map(code =>
+      `<button class="lang-btn${code === I18N.lang ? ' on' : ''}" data-lang="${code}">${escapeHtml(langs[code])}</button>`
+    ).join('');
+    box.querySelectorAll('[data-lang]').forEach(b => {
+      b.onclick = () => switchLang(b.getAttribute('data-lang'), loggedIn);
+    });
+  });
+}
+
+async function switchLang(lang, persist) {
+  if (lang === I18N.lang) return;
+  // 先切界面：落库失败也不该让人卡在切不动的语言上
+  I18N.set(lang, { remember: !persist });
+  refreshDynamicText();
+  renderLangSwitch();
+  if (persist && S.operator) {
+    try { await api('/auth/lang', { lang }); } catch (e) { toast(e.message, 'err'); }
+  }
+}
+
+/**
+ * 切语言后，把【JS 生成的】那些文字重画一遍。
+ *
+ * `I18N.applyDom()` 只管带 data-i18n 的静态节点；订单卡片、分配行、
+ * 结果页这些是拼出来的 HTML，得各自重画。当前停在哪一步就画哪一步 ——
+ * 全量重画会把收银员正在填的东西冲掉。
+ */
+function refreshDynamicText() {
+  $('#table-hint').textContent = T('lookup.tableHint', { min: S.window || 30 });
+  $('#btn-widen').textContent  = T('lookup.widen', { min: S.widenTo || 60 });
+  if (S.operator) {
+    $('#op-name').textContent = S.operator.name + (S.operator.is_manager ? T('top.manager') : '');
+  }
+  if (S.orders && S.orders.length) { renderOrders(S.orders); }
+  if (S.order) {
+    renderSummary(S.order);
+    renderPortionBreakdown(S.order);
+    const title = $('#assign-title');
+    if (title) {
+      title.textContent = { 1: T('assign.mode1'), 2: T('assign.mode2'), 3: T('assign.mode3') }[S.mode];
+    }
+  }
+  /**
+   * ★ 这里【不能】调 startAssign() 重画分配步骤。
+   *
+   * 它会把 S.people 重置掉（模式 1 直接整个重建），收银员已经填好的
+   * 金额和选好的会员会当场清空 —— 只是切个语言而已，不该有这种代价。
+   *
+   * renderPeople() 是安全的：金额与份数每敲一下就同步进 S.people 了
+   * （见 data-amt / data-prt 的 oninput），从状态重画不会丢东西。
+   */
+  if (S.people && S.people.length) { renderPeople(true); }
   checkHealth();
 }
 
@@ -194,7 +279,7 @@ async function checkHealth() {
     const h = await api('/health', undefined, 'GET');
     const pill = $('#pos-status');
     if (!h.pos_db) {
-      pill.textContent = 'POS 主库不可用 · 可手工录入';
+      pill.textContent = T('top.posDown');
       pill.hidden = false;
     } else {
       pill.hidden = true;
@@ -215,13 +300,13 @@ $('#btn-pin-cancel').onclick = () => { $('#pin-modal').hidden = true; UI.back.sy
 $('#btn-pin-submit').onclick = async () => {
   const oldPin = $('#pin-old').value, p1 = $('#pin-new').value, p2 = $('#pin-new2').value;
   showErr('#pin-err', '');
-  if (!oldPin || !p1) return showErr('#pin-err', '请填写当前 PIN 与新 PIN');
-  if (p1 !== p2)      return showErr('#pin-err', '两次输入的新 PIN 不一致');
-  if (p1.length < 6)  return showErr('#pin-err', '新 PIN 至少 6 位');
+  if (!oldPin || !p1) return showErr('#pin-err', T('pin.needBoth'));
+  if (p1 !== p2)      return showErr('#pin-err', T('pin.mismatch'));
+  if (p1.length < 6)  return showErr('#pin-err', T('pin.tooShort'));
   try {
     await api('/auth/change-pin', { old_pin: oldPin, new_pin: p1 });
     $('#pin-modal').hidden = true;
-    toast('PIN 已修改', 'ok');
+    toast(T('pin.changed'), 'ok');
   } catch (e) { showErr('#pin-err', e.message); }
 };
 
@@ -254,13 +339,13 @@ $$('[data-back]').forEach(b => b.onclick = () => step(b.dataset.back));
 async function locate(windowMinutes) {
   const table = $('#table-input').value.trim();
   showErr('#locate-err', '');
-  if (!table) return showErr('#locate-err', '请输入桌号');
+  if (!table) return showErr('#locate-err', T('lookup.needTable'));
   try {
     const d = await api('/order/locate', { table_name: table, window_minutes: windowMinutes || 0 });
     $('#win-label').textContent = d.window;
     $('#fallback-label').textContent = d.fallback_window;
     if (!d.candidates.length) {
-      showErr('#locate-err', `最近 ${d.window} 分钟内没找到 ${table} 桌的已结账订单`);
+      showErr('#locate-err', T('lookup.noneInWindow', { min: d.window, table }));
       $('#locate-fallback').hidden = false;
       return;
     }
@@ -285,15 +370,15 @@ async function locateByInvoice() {
   const raw = $('#invoice-input').value.trim();
   showErr('#locate-err', '');
   $('#locate-fallback').hidden = true;
-  if (!raw) return showErr('#locate-err', '请输入小票上的 Factura Simplificada 号');
+  if (!raw) return showErr('#locate-err', T('lookup.needInvoice'));
   try {
     const d = await api('/order/locate-invoice', { invoice_no: raw });
     if (!d.candidates.length) {
       if (d.reason === 'too_old') {
         showErr('#locate-err',
-          `这张小票是 ${(d.order_end_time || '').slice(0, 10)} 的，超过 ${d.max_days} 天不再受理，请找经理处理`);
+          T('lookup.tooOld', { date: (d.order_end_time || '').slice(0, 10), days: d.max_days }));
       } else {
-        showErr('#locate-err', `没找到小票号 ${d.invoice_no} 对应的订单，请核对 Factura Simplificada 那一行`);
+        showErr('#locate-err', T('lookup.invoiceNone', { no: d.invoice_no }));
       }
       $('#locate-fallback').hidden = false;
       return;
@@ -310,6 +395,7 @@ $('#invoice-input').addEventListener('keydown', e => { if (e.key === 'Enter') lo
 
 /* ── 步骤 2：候选订单 ────────────────────────────── */
 function renderOrders(list) {
+  S.orders = list;
   const box = $('#order-list');
   box.innerHTML = '';
   list.forEach(o => {
@@ -317,20 +403,20 @@ function renderOrders(list) {
     b.className = 'card' + (o.eligible ? '' : ' disabled');
     const time = o.order_end_time.slice(11, 16);
     const reason = {
-      not_dine_in: '外带订单不积分',
-      zero_amount: '金额为 0，不积分',
-      free_meal:   '已标记免费餐',
+      not_dine_in: T('order.notDineIn'),
+      zero_amount: T('order.zero'),
+      free_meal:   T('order.freeMeal'),
       // 明细里有 TARJETA 10+1 折扣行 —— 客人正在兑换奖励，这一餐不计次不积分
-      redeemed:    `已用十送一核销 € ${o.redeem_amount || ''}，本餐不计次不积分`,
+      redeemed:    T('order.redeemed', { amount: o.redeem_amount || '' }),
     }[o.ineligible_reason] || '';
     b.innerHTML = `
       <div class="amount">€ ${o.total}</div>
-      <div class="meta">${o.table_name} 桌 · ${o.customer_num || '?'} 人 · ${time} 结账 · 套餐 ${o.portions_counted} 份</div>
-      <div class="meta">流水号 ${o.serial_id}${Number(o.allocated_cents) > 0 ? ` · 已记 € ${o.allocated}` : ''}</div>
+      <div class="meta">${T('order.meta', { table: o.table_name, people: o.customer_num || '?', time, portions: o.portions_counted })}</div>
+      <div class="meta">${T('order.serial', { serial: o.serial_id })}${Number(o.allocated_cents) > 0 ? ' · ' + T('order.already', { amount: o.allocated }) : ''}</div>
       ${reason ? `<div class="meta" style="color:var(--warn)">${reason}</div>` : ''}`;
     b.onclick = () => {
-      if (!o.eligible) return toast(reason || '该订单不可积分', 'err');
-      if (o.remaining_cents <= 0) return toast('该订单已全额记账', 'err');
+      if (!o.eligible) return toast(reason || T('order.notEligible'), 'err');
+      if (o.remaining_cents <= 0) return toast(T('order.fullyDone'), 'err');
       selectOrder(o);
     };
     box.appendChild(b);
@@ -340,33 +426,37 @@ function renderOrders(list) {
 function selectOrder(o) {
   S.order = o;
   S.people = []; S.picks = {};
+  renderSummary(o);
+  step('step-mode');
+}
+
+function renderSummary(o) {
   $('#order-summary').innerHTML = `
-    <div class="amount">€ ${money(o.remaining_cents)} <span class="muted small">可分配</span></div>
-    <div class="meta">${o.table_name} 桌 · 流水号 ${o.serial_id} · 套餐 ${o.remaining_portions} 份可计次</div>
-    ${Number(o.excluded) > 0 ? `<div class="meta">已扣除不计分项 € ${o.excluded}（外卖产品线等）</div>` : ''}`;
+    <div class="amount">€ ${money(o.remaining_cents)} <span class="muted small">${T('order.avail')}</span></div>
+    <div class="meta">${T('order.summaryMeta', { table: o.table_name, serial: o.serial_id, portions: o.remaining_portions })}</div>
+    ${Number(o.excluded) > 0 ? `<div class="meta">${T('order.excluded', { amount: o.excluded })}</div>` : ''}`;
 
   const lb = $('#existing-ledger');
   if (o.existing_ledger && o.existing_ledger.length) {
-    lb.innerHTML = '<b>本单已记账：</b>' + o.existing_ledger.map(l =>
-      `<div class="lrow"><span>${l.card_no || '会员'} · € ${l.amount} · ${l.points} 分</span>
-       <button class="link" data-rev="${l.id}">撤销</button></div>`).join('');
+    lb.innerHTML = `<b>${T('ledger.title')}</b>` + o.existing_ledger.map(l =>
+      `<div class="lrow"><span>${l.card_no || T('common.member')} · € ${l.amount} · ${l.points} ${T('common.points')}</span>
+       <button class="link" data-rev="${l.id}">${T('ledger.reverse')}</button></div>`).join('');
     lb.hidden = false;
     $$('[data-rev]', lb).forEach(b => b.onclick = () => doReverse(parseInt(b.dataset.rev, 10)));
   } else {
     lb.hidden = true;
   }
-  step('step-mode');
 }
 
 /* ── 撤销 ────────────────────────────────────────── */
 async function doReverse(ledgerId) {
-  const reason = await UI.input('撤销原因（会记入审计日志）', {
-    value: '客人要求改记', okText: '确认撤销', danger: true,
+  const reason = await UI.input(T('reverse.ask'), {
+    value: T('reverse.default'), okText: T('reverse.ok'), danger: true,
   });
   if (reason === null) return;
   try {
     await api('/points/reverse', { ledger_id: ledgerId, reason });
-    toast('已撤销，可重新记账', 'ok');
+    toast(T('reverse.done'), 'ok');
     await locate(0);
   } catch (e) {
     toast(e.message, 'err');
@@ -381,11 +471,10 @@ $$('.mode').forEach(b => b.onclick = () => {
 });
 
 $('#btn-free-meal').onclick = async () => {
-  if (!await UI.confirm('确认把本单标记为免费餐（10送1 核销）？\n标记后本单不积分、不计次。',
-                        { okText: '标记为免费餐', danger: true })) return;
+  if (!await UI.confirm(T('freeMeal.ask'), { okText: T('freeMeal.ok'), danger: true })) return;
   try {
     await api('/order/free-meal', { serial_id: S.order.serial_id, is_free_meal: true });
-    toast('已标记为免费餐', 'ok');
+    toast(T('freeMeal.done'), 'ok');
     resetFlow();
   } catch (e) { toast(e.message, 'err'); }
 };
@@ -405,25 +494,23 @@ function renderPortionBreakdown(o) {
   const el = $('#portion-detail');
   if (!el) return;
   const bits = [];
-  if (o.customer_num) bits.push(`买单 ${o.customer_num} 人`);
-  if (o.portions_paid)  bits.push(`付费套餐 <b>${o.portions_paid}</b> 份`);
-  if (o.portions_free)  bits.push(`免费套餐 <b>${o.portions_free}</b> 份`);
-  if (o.allocated_portions) bits.push(`已分配 ${o.allocated_portions} 份`);
+  if (o.customer_num) bits.push(T('assign.paidBy', { n: o.customer_num }));
+  if (o.portions_paid)  bits.push(T('assign.portionsPaid', { n: o.portions_paid }));
+  if (o.portions_free)  bits.push(T('assign.portionsFree', { n: o.portions_free }));
+  if (o.allocated_portions) bits.push(T('assign.portionsDone', { n: o.allocated_portions }));
 
   let html = bits.length ? `<div class="port-bits">${bits.join(' · ')}</div>` : '';
 
   // 明细还没归档过来 —— 和「客人没点套餐」长得一样，必须说破
   if (o.detail_missing) {
-    html += `<div class="port-warn">⚠ 这一单的<b>菜品明细还没同步过来</b>，所以份数显示 0。
-             <br>这不是没点套餐，也不是规则没配 —— 过几分钟再查一次即可。
-             <br>若急着发分，份数请按实际用餐人数手工填写。</div>`;
+    html += `<div class="port-warn">${T('assign.noDetail')}</div>`;
   }
 
   const unknown = o.unknown_items || [];
   if (unknown.length) {
-    html += `<div class="port-warn">⚠ 这些菜品不在「套餐规则」里，份数按 0 计：
+    html += `<div class="port-warn">${T('assign.noRule')}
              ${unknown.map(escapeHtml).join('、')}<br>
-             如果它们属于套餐，请让经理到后台补规则，别在这里手工凑数字。</div>`;
+      ${T('assign.noRuleTail')}</div>`;
   }
   el.innerHTML = html;
   el.hidden = !html;
@@ -432,7 +519,7 @@ function renderPortionBreakdown(o) {
 /* ── 步骤 4：分配 ────────────────────────────────── */
 function startAssign() {
   const o = S.order;
-  $('#assign-title').textContent = { 1: '整单记给一位会员', 2: '均摊 AA', 3: '点选菜品' }[S.mode];
+  $('#assign-title').textContent = { 1: T('assign.mode1'), 2: T('assign.mode2'), 3: T('assign.mode3') }[S.mode];
   $('#sum-total').textContent = money(o.remaining_cents);
   $('#sum-port-total').textContent = o.remaining_portions;
   renderPortionBreakdown(o);
@@ -444,9 +531,9 @@ function startAssign() {
     S.people = [{ member: null, amountCents: o.remaining_cents, portions: o.remaining_portions }];
     renderPeople();
   } else if (S.mode === 2) {
-    body.innerHTML = `<label>AA 人数
+    body.innerHTML = `<label>${T('assign.aaCount')}
       <input id="aa-people" type="number" inputmode="numeric" min="1" max="50" value="${o.customer_num || 2}"></label>
-      <button id="btn-aa" class="primary">按人数分摊</button>`;
+      <button id="btn-aa" class="primary">${T('assign.aaSplit')}</button>`;
     $('#btn-aa').onclick = doSplit;
     $('#assign-people').innerHTML = '';
     updateTotals();
@@ -458,7 +545,7 @@ function startAssign() {
 
 async function doSplit() {
   const n = parseInt($('#aa-people').value, 10);
-  if (!n || n < 1) return toast('请输入人数', 'err');
+  if (!n || n < 1) return toast(T('assign.needCount'), 'err');
   try {
     const d = await api('/points/split', { serial_id: S.order.serial_id, people: n });
     S.people = d.shares.map(s => ({ member: null, amountCents: cents(s.amount), portions: s.portions }));
@@ -469,21 +556,20 @@ async function doSplit() {
 function renderPickItems(body) {
   const items = S.order.items || [];
   if (!items.length) {
-    body.innerHTML = '<p class="muted">该订单没有可认领的收费项，请改用其他方式。</p>';
+    body.innerHTML = `<p class="muted">${T('assign.noItems')}</p>`;
     return;
   }
-  body.innerHTML = `<p class="muted small">先在下方添加要记账的会员，再为每道菜指定认领人。
-    套餐内 0 元菜品不显示；被免的项会标注原价。</p>
+  body.innerHTML = `<p class="muted small">${T('assign.itemsHelp')}</p>
     <div class="items">${items.map((it, i) => `
       <div class="item">
         <span class="name">${escapeHtml(it.name)}${it.quantity > 1 ? ` ×${it.quantity}` : ''}
-          ${it.counts_visit ? '<span class="tag">计次</span>' : ''}
-          ${it.is_waived ? `<div class="waived">原价 € ${money(it.unit_cents * (it.quantity || 1))} → 已免</div>` : ''}
+          ${it.counts_visit ? `<span class="tag">${T('assign.countsVisit')}</span>` : ''}
+          ${it.is_waived ? `<div class="waived">${T('assign.waived', { amount: money(it.unit_cents * (it.quantity || 1)) })}</div>` : ''}
         </span>
         <span class="price">€ ${money(it.line_cents)}</span>
         <select data-item="${i}"></select>
       </div>`).join('')}</div>
-    <button id="btn-add-person" class="ghost">+ 添加会员</button>`;
+    <button id="btn-add-person" class="ghost">${T('assign.addMember')}</button>`;
   $('#btn-add-person').onclick = addPerson;
   refreshPickSelects();
 }
@@ -492,8 +578,8 @@ function refreshPickSelects() {
   $$('[data-item]').forEach(sel => {
     const idx = parseInt(sel.dataset.item, 10);
     const cur = S.picks[idx];
-    sel.innerHTML = '<option value="">未认领</option>' +
-      S.people.map((p, i) => `<option value="${i}"${cur === i ? ' selected' : ''}>${p.member ? p.member.card_no : '会员 ' + (i + 1)}</option>`).join('');
+    sel.innerHTML = `<option value="">${T('assign.unclaimed')}</option>` +
+      S.people.map((p, i) => `<option value="${i}"${cur === i ? ' selected' : ''}>${p.member ? p.member.card_no : T('assign.memberN', { n: i + 1 })}</option>`).join('');
     sel.onchange = () => {
       if (sel.value === '') delete S.picks[idx]; else S.picks[idx] = parseInt(sel.value, 10);
       recomputePicks();
@@ -527,20 +613,20 @@ function renderPeople(keepItems) {
     d.innerHTML = `
       <div class="who">
         ${p.member
-          ? `<b>${escapeHtml(p.member.card_no)}</b><small>${p.member.points_balance} 分 · 已 ${p.member.visit_count} 次${p.member.points_frozen ? ' · 待确认' : ''}</small>
+          ? `<b>${escapeHtml(p.member.card_no)}</b><small>${p.member.points_balance} ${T('common.points')} · ${T('assign.visits', { n: p.member.visit_count })}${p.member.points_frozen ? ' · ' + T('assign.pendingTag') : ''}</small>
              <div class="reward-slot" data-rw="${i}"></div>`
-          : `<button class="link" data-pick="${i}">＋ 选择会员</button>`}
+          : `<button class="link" data-pick="${i}">${T('assign.pickMember')}</button>`}
       </div>
-      <label class="amt">金额<input type="text" inputmode="decimal" data-amt="${i}" value="${money(p.amountCents)}"${S.mode === 3 ? ' readonly' : ''}></label>
-      <label class="prt">份数<input type="number" inputmode="numeric" min="0" data-prt="${i}" value="${p.portions}"${S.mode === 3 ? ' readonly' : ''}></label>
-      ${S.people.length > 1 ? `<button class="rm" data-rm="${i}">移除</button>` : ''}`;
+      <label class="amt">${T('assign.amount')}<input type="text" inputmode="decimal" data-amt="${i}" value="${money(p.amountCents)}"${S.mode === 3 ? ' readonly' : ''}></label>
+      <label class="prt">${T('assign.portions')}<input type="number" inputmode="numeric" min="0" data-prt="${i}" value="${p.portions}"${S.mode === 3 ? ' readonly' : ''}></label>
+      ${S.people.length > 1 ? `<button class="rm" data-rm="${i}">${T('assign.remove')}</button>` : ''}`;
     box.appendChild(d);
   });
 
   if (S.mode !== 1 && !keepItems) {
     const add = document.createElement('button');
     add.className = 'ghost';
-    add.textContent = '+ 添加会员';
+    add.textContent = T('assign.addMember');
     add.onclick = addPerson;
     box.appendChild(add);
   }
@@ -589,8 +675,8 @@ async function loadRewardSlot(personIndex, memberId) {
     const d = await api('/member/rewards', { member_id: memberId });
     const n = d.available.length;
     slot.innerHTML = n
-      ? `<div class="reward-has">🎁 有 <b>${n}</b> 张可用券
-           <button class="link" data-redeem="${personIndex}">核销一张</button>
+      ? `<div class="reward-has">${T('reward.has', { n })}
+           <button class="link" data-redeem="${personIndex}">${T('reward.redeemOne')}</button>
          </div>
          <div class="reward-progress muted">${escapeHtml(d.progress.text)}</div>`
       : `<div class="reward-progress muted">${escapeHtml(d.progress.text)}</div>`;
@@ -609,10 +695,8 @@ async function redeemCoupon(personIndex, memberId) {
   if (!list.length) return;
   const c = list[0];   // 最早到期的那张（服务端已排好序）
   if (!await UI.confirm(
-    `核销券 ${c.code}？\n\n` +
-    `有效期至 ${c.valid_to || '永久'}\n\n` +
-    `★ 核销后请记得在 POS 上打对应的折扣，两边才对得上账。`,
-    { okText: '下一步：验 PIN' }
+    T('reward.ask', { code: c.code, validTo: c.valid_to || T('common.forever') }),
+    { okText: T('reward.next') }
   )) return;
 
   /**
@@ -621,8 +705,8 @@ async function redeemCoupon(personIndex, memberId) {
    * 人知道。积分入账那一侧不验：被人抄卡去攒分，店家没有损失。
    */
   const pin = await UI.input(
-    `请让客人刮开卡背，报出 6 位 PIN`,
-    { password: true, numeric: true, okText: '核销' }
+    T('reward.askPin'),
+    { password: true, numeric: true, okText: T('reward.redeem') }
   );
   if (pin === null) return offerForceRedeem(c, personIndex, memberId);
 
@@ -630,7 +714,7 @@ async function redeemCoupon(personIndex, memberId) {
     await api('/coupon/redeem', {
       coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null, pin,
     });
-    toast(`券 ${c.code} 已核销，请到 POS 打折`, 'ok');
+    toast(T('reward.done', { code: c.code }), 'ok');
     loadRewardSlot(personIndex, memberId);
   } catch (e) {
     toast(e.message, 'err');
@@ -653,13 +737,12 @@ async function offerForceRedeem(c, personIndex, memberId) {
     return;   // 收银员没这个权限，连提都不提，免得白按
   }
   if (!await UI.confirm(
-    `客人报不出 PIN？\n\n` +
-    `经理可以强制核销这张券。此操作会单独记入审计日志。`,
-    { okText: '强制核销', danger: true }
+    T('reward.forceAsk'),
+    { okText: T('reward.forceOk'), danger: true }
   )) return;
 
-  const reason = await UI.input('强制核销原因（会记入审计日志）', {
-    value: '客人忘记卡背 PIN', okText: '确认强制核销', danger: true,
+  const reason = await UI.input(T('reward.forceWhy'), {
+    value: T('reward.forceWhyDef'), okText: T('reward.forceConfirm'), danger: true,
   });
   if (reason === null) return;
 
@@ -668,7 +751,7 @@ async function offerForceRedeem(c, personIndex, memberId) {
       coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null,
       force: true, reason,
     });
-    toast(`券 ${c.code} 已强制核销，请到 POS 打折`, 'ok');
+    toast(T('reward.forceDone', { code: c.code }), 'ok');
     loadRewardSlot(personIndex, memberId);
   } catch (e) { toast(e.message, 'err'); }
 }
@@ -677,34 +760,34 @@ async function offerForceRedeem(c, personIndex, memberId) {
 $('#btn-submit').onclick = async () => {
   showErr('#assign-err', '');
   const missing = S.people.some(p => !p.member && p.amountCents > 0);
-  if (missing) return showErr('#assign-err', '有分配了金额但未选择会员的行');
+  if (missing) return showErr('#assign-err', T('assign.missingMember'));
 
   const allocations = S.people
     .filter(p => p.member && (p.amountCents > 0 || p.portions > 0))
     .map(p => ({ member_id: p.member.id, amount: money(p.amountCents), portions: p.portions }));
-  if (!allocations.length) return showErr('#assign-err', '请至少为一位会员分配金额');
+  if (!allocations.length) return showErr('#assign-err', T('assign.needOne'));
 
   const btn = $('#btn-submit');
   btn.disabled = true;
   try {
     const d = await api('/points/grant', { serial_id: S.order.serial_id, mode: S.mode, allocations });
     $('#done-body').innerHTML = d.entries.map(e => `
-      <div class="card"><div class="amount">+${e.points} 分</div>
-      <div class="meta">${escapeHtml(e.card_no)} · € ${e.amount} · 计次 +${e.visits}</div></div>`).join('')
+      <div class="card"><div class="amount">${T('done.points', { points: e.points })}</div>
+             <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, visits: e.visits })}</div></div>`).join('')
       // 本次达标发了新券就大字提示 —— 服务员要当场告诉客人
       + (d.rewards || []).map(r => r.granted > 0
         ? `<div class="card reward-card">
-             <div class="amount">🎁 +${r.granted} 张免费券</div>
-             <div class="meta">${escapeHtml(r.card_no)} 已达标，请告知客人下次可用</div>
-             <div class="meta">券码 ${r.coupons.map(c => escapeHtml(c.code)).join('、')}</div>
+             <div class="amount">${T('done.granted', { n: r.granted })}</div>
+             <div class="meta">${T('done.grantedMeta', { card: escapeHtml(r.card_no) })}</div>
+             <div class="meta">${T('done.grantedCodes', { codes: r.coupons.map(c => escapeHtml(c.code)).join('、') })}</div>
            </div>`
         : `<div class="card reward-card">
-             <div class="amount">🎁 已达标 ${r.pending} 次</div>
-             <div class="meta">${escapeHtml(r.card_no)} 达到门槛，但后台设为「人工发券」，请经理在后台发放</div>
+             <div class="amount">${T('done.pending', { n: r.pending })}</div>
+             <div class="meta">${T('done.pendingMeta', { card: escapeHtml(r.card_no) })}</div>
            </div>`).join('');
     step('step-done');
   } catch (e) {
-    showErr('#assign-err', e.message + (e.detail && e.detail.total ? `（可分配 € ${e.detail.total}，已分配 € ${e.detail.allocated}）` : ''));
+    showErr('#assign-err', e.message + (e.detail && e.detail.total ? T('assign.overflow', { total: e.detail.total, allocated: e.detail.allocated }) : ''));
   } finally {
     btn.disabled = false;
   }
@@ -727,7 +810,7 @@ $$('#search-type button').forEach(b => b.onclick = () => {
   $$('#search-type button').forEach(x => x.classList.toggle('on', x === b));
   const t = b.dataset.type;
   const inp = $('#member-input');
-  inp.placeholder = { card: '卡面号码，如 TK-00000123-4Q7', phone: '完整手机号', email: '邮箱地址' }[t];
+  inp.placeholder = { card: T('member.phCard'), phone: T('member.phPhone'), email: T('member.phEmail') }[t];
   inp.inputMode = t === 'phone' ? 'tel' : 'text';
   $('#btn-scan').hidden  = t !== 'card';
   $('#scan-note').hidden = t !== 'card';
@@ -764,7 +847,7 @@ async function doMemberSearch() {
   resetLookupState();
   const type = $('#search-type button.on').dataset.type;
   const value = $('#member-input').value.trim();
-  if (!value) return showErr('#member-err', '请输入查询内容');
+  if (!value) return showErr('#member-err', T('member.needInput'));
 
   // 卡号走 /card/lookup 而不是 /member/search：实体卡有四种状态，
   // 「查无此人」这一种答案不够用 —— 库存卡要引导去建会员，
@@ -774,16 +857,16 @@ async function doMemberSearch() {
   try {
     const d = await api('/member/search', { type, value });
     if (!d.found) {
-      $('#member-result').innerHTML = '<p class="muted">未找到该会员，可在下方新建。</p>';
+      $('#member-result').innerHTML = `<p class="muted">${T('member.none')}</p>`;
       $('#member-new').open = true;
       return;
     }
     const m = d.member;
     $('#member-result').innerHTML = `
       <div class="found"><b>${escapeHtml(m.card_no)}</b>
-        <div class="muted small">${m.points_balance} 分 · 已消费 ${m.visit_count} 次 · 累计 € ${m.total_spent}</div>
-        ${m.points_frozen ? '<div class="frozen">该会员尚未完成确认，积分照常入账但暂不可兑换</div>' : ''}
-        <button class="primary" id="btn-use-member" style="margin-top:10px">选用</button></div>`;
+        <div class="muted small">${T('member.stats', { points: m.points_balance, visits: m.visit_count, spent: m.total_spent })}</div>
+        ${m.points_frozen ? `<div class="frozen">${T('member.frozen')}</div>` : ''}
+        <button class="primary" id="btn-use-member" style="margin-top:10px">${T('member.use')}</button></div>`;
     $('#btn-use-member').onclick = () => useMember(m);
   } catch (e) { showErr('#member-err', e.message); }
 }
@@ -816,11 +899,11 @@ async function doCardLookup(value) {
       const soon = d.days_left !== null && d.days_left <= expiringSoonDays();
       $('#member-result').innerHTML = `
         <div class="found"><b>${escapeHtml(m.card_no)}</b>
-          <div class="muted small">${m.points_balance} 分 · 已消费 ${m.visit_count} 次${
-            d.valid_to ? ' · 有效期至 ' + escapeHtml(d.valid_to) : ''}</div>
-          ${soon ? `<div class="frozen">这张卡还有 ${d.days_left} 天到期，可以现在就为客人换一张（积分会转过去）</div>` : ''}
-          ${m.points_frozen ? '<div class="frozen">该会员尚未完成确认，积分照常入账但暂不可兑换</div>' : ''}
-          <button class="primary" id="btn-use-member" style="margin-top:10px">选用</button></div>`;
+          <div class="muted small">${T('member.statsShort', { points: m.points_balance, visits: m.visit_count })}${
+            d.valid_to ? ' · ' + T('card.validTo', { date: escapeHtml(d.valid_to) }) : ''}</div>
+          ${soon ? `<div class="frozen">${T('card.soonInline', { days: d.days_left })}</div>` : ''}
+          ${m.points_frozen ? `<div class="frozen">${T('member.frozen')}</div>` : ''}
+          <button class="primary" id="btn-use-member" style="margin-top:10px">${T('member.use')}</button></div>`;
       $('#btn-use-member').onclick = () => useMember(m);
 
       /**
@@ -845,10 +928,8 @@ async function doCardLookup(value) {
      */
     if (d.days_left !== null && d.days_left <= expiringSoonDays()) {
       const go = await UI.confirm(
-        `这张卡只剩 ${d.days_left} 天就到期了（${d.valid_to}）。\n\n` +
-        `发给客人的话，他很快就得回来换卡。\n` +
-        `建议换一张有效期更长的。确定还要发这张吗？`,
-        { okText: '仍然发这张', cancelText: '换一张', danger: true }
+        T('card.issueSoonAsk', { days: d.days_left, date: d.valid_to }),
+        { okText: T('card.issueAnyway'), cancelText: T('card.takeAnother'), danger: true }
       );
       if (!go) {
         resetLookupState();
@@ -860,8 +941,8 @@ async function doCardLookup(value) {
 
     S.pendingCard = d.card_no;
     $('#new-card-hint').innerHTML =
-      `这张卡尚未启用：<b>${escapeHtml(d.card_no)}</b>`
-      + (d.valid_to ? `　<span class="muted">有效期至 ${escapeHtml(d.valid_to)}</span>` : '');
+      T('card.notActive', { card: escapeHtml(d.card_no) })
+      + (d.valid_to ? `　<span class="muted">${T('card.validTo', { date: escapeHtml(d.valid_to) })}</span>` : '');
     $('#member-new').open = true;
     setTimeout(() => $('#btn-member-create').focus(), 50);
   } catch (e) {
@@ -874,7 +955,7 @@ $('#btn-member-create').onclick = async () => {
   showErr('#member-err', '');
   if (!S.pendingCard) {
     // 没有卡就建不了会员 —— 与其让服务端报错，不如在这里说清楚该做什么
-    return showErr('#member-err', '请先扫描或输入客人的实体卡号');
+    return showErr('#member-err', T('member.needCard'));
   }
   /**
    * 后台关闭「允许收集客人联系方式」时，这几个输入框已经从 DOM 里移除，
@@ -889,7 +970,7 @@ $('#btn-member-create').onclick = async () => {
   }
   try {
     const d = await api('/member/create', body);
-    toast(d.consent_pending ? '已绑卡，等客人确认后可兑换' : '已绑卡，当场即可使用', 'ok');
+    toast(T(d.consent_pending ? 'member.boundPending' : 'member.bound'), 'ok');
     // 这几个输入框在关闭收集时【已从 DOM 移除】，必须判空 ——
     // 否则 null.value 抛异常，后面的 useMember 永远执行不到，
     // 表现是「提示说成功了，但弹层不关、会员也没选中」
@@ -930,24 +1011,22 @@ function graceMonths() {
 async function handleExpiredCard(d) {
   if (!d.member) {
     showErr('#member-err',
-      `此卡已于 ${d.valid_to} 过期，且从未启用过。请另取一张卡发给客人。`);
+      T('card.expiredStock', { date: d.valid_to }));
     return;
   }
 
-  const who = `${d.card_no}　${d.member.points_balance} 分 · 已消费 ${d.member.visit_count} 次`;
+  const who = T('card.expiredWho', { card: d.card_no, points: d.member.points_balance, visits: d.member.visit_count });
   const go = await UI.confirm(
-    `此卡已于 ${d.valid_to} 过期。\n\n${who}\n\n` +
-    `现在可以为客人换一张新卡，积分与未用的券会全部转过去。\n` +
-    `要换吗？`,
-    { okText: '换发新卡', cancelText: '暂不处理' }
+    T('card.expiredAsk', { date: d.valid_to, who }),
+    { okText: T('card.replaceOk'), cancelText: T('card.replaceLater') }
   );
   if (!go) {
-    showErr('#member-err', `此卡已于 ${d.valid_to} 过期，可随时到店换发新卡`);
+    showErr('#member-err', T('card.expiredHint', { date: d.valid_to }));
     return;
   }
 
-  await runReplaceLoop(d.member.id, `原卡 ${d.card_no} 于 ${d.valid_to} 到期`,
-    () => showErr('#member-err', `此卡已于 ${d.valid_to} 过期，可随时到店换发新卡`));
+  await runReplaceLoop(d.member.id, T('card.reasonExpired', { card: d.card_no, date: d.valid_to }),
+    () => showErr('#member-err', T('card.expiredHint', { date: d.valid_to })));
 }
 
 /**
@@ -958,15 +1037,13 @@ async function handleExpiredCard(d) {
  */
 async function offerRenewSoon(d, m) {
   const go = await UI.confirm(
-    `这张卡还有 ${d.days_left} 天到期（${d.valid_to}）。\n\n` +
-    `${m.points_balance} 分 · 已消费 ${m.visit_count} 次\n\n` +
-    `现在就可以为客人换一张新卡，积分与未用的券会全部转过去。\n` +
-    `不换也不影响这次消费，下次扫到还会再提醒。`,
-    { okText: '现在换卡', cancelText: '稍后再说' }
+    T('card.renewSoonAsk', { days: d.days_left, date: d.valid_to,
+                             points: m.points_balance, visits: m.visit_count }),
+    { okText: T('card.renewNow'), cancelText: T('common.later') }
   );
   if (!go) return;
 
-  await runReplaceLoop(m.id, `原卡 ${d.card_no} 将于 ${d.valid_to} 到期，提前换发`, null);
+  await runReplaceLoop(m.id, T('card.reasonEarly', { card: d.card_no, date: d.valid_to }), null);
 }
 
 /**
@@ -980,8 +1057,8 @@ async function offerRenewSoon(d, m) {
 async function runReplaceLoop(memberId, reason, onGiveUp) {
   for (;;) {
     const raw = await UI.input(
-      '请扫描或输入要发给客人的【新卡】卡号',
-      { okText: '换发', cancelText: '取消' }
+      T('card.askNewNo'),
+      { okText: T('card.replaceGo'), cancelText: T('common.cancel') }
     );
     if (raw === null) {
       if (onGiveUp) { onGiveUp(); }
@@ -989,7 +1066,7 @@ async function runReplaceLoop(memberId, reason, onGiveUp) {
     }
     try {
       const r = await api('/card/replace', { member_id: memberId, card_no: raw, reason });
-      toast(`已换发 ${r.card_no}，积分已转移`, 'ok');
+      toast(T('card.replaced', { card: r.card_no }), 'ok');
       resetLookupState();
       $('#member-input').value = '';
       // 换完直接选用这位会员，收银员不用再查一遍
@@ -1023,28 +1100,26 @@ async function forceReplace(memberId, reason, newCardNo, err) {
   // api() 把服务端的 detail 原样挂在 err.detail 上（不是 data）
   const months    = (err.detail && err.detail.grace_months) || graceMonths();
   const expiredOn = (err.detail && err.detail.old_valid_to) || '';
-  const head = `这张卡已过期超过 ${months} 个月的宽限期`
-             + (expiredOn ? `（有效期至 ${expiredOn}）` : '') + '。';
+  const head = T('card.graceHead', { months })
+             + (expiredOn ? T('card.graceOn', { date: expiredOn }) : '');
 
   if (!S.operator || !S.operator.is_manager) {
     // 收银员没这个权限。把话说清楚：不是系统坏了，是要找经理
-    showErr('#member-err', `${head}积分已按规则失效，如需破例换发请找经理操作。`);
+    showErr('#member-err', T('card.graceClerk', { head }));
     return true;
   }
 
   if (!await UI.confirm(
-    `${head}\n\n` +
-    `按规则这张卡的积分已经失效。\n` +
-    `经理可以强制换发并保留积分，此操作会单独记入审计日志。`,
-    { okText: '强制换发', cancelText: '按规则拒绝', danger: true }
+    T('card.graceAsk', { head }),
+    { okText: T('card.graceForce'), cancelText: T('card.graceRefuse'), danger: true }
   )) {
-    showErr('#member-err', `${head}积分已按规则失效。`);
+    showErr('#member-err', T('card.graceRefused', { head }));
     return true;
   }
 
-  const why = await UI.input('强制换发原因（会记入审计日志）', {
-    value: '客人长期未到店，经理同意保留积分',
-    okText: '确认强制换发', danger: true,
+  const why = await UI.input(T('card.graceWhy'), {
+    value: T('card.graceWhyDef'),
+    okText: T('card.graceConfirm'), danger: true,
   });
   if (why === null) return true;
 
@@ -1052,7 +1127,7 @@ async function forceReplace(memberId, reason, newCardNo, err) {
     const r = await api('/card/replace', {
       member_id: memberId, card_no: newCardNo, reason, force_reason: why,
     });
-    toast(`已强制换发 ${r.card_no}，积分已保留`, 'ok');
+    toast(T('card.graceDone', { card: r.card_no }), 'ok');
     resetLookupState();
     $('#member-input').value = '';
     if (r.member) { useMember(r.member); }
@@ -1074,19 +1149,19 @@ async function forceReplace(memberId, reason, newCardNo, err) {
  */
 async function runConsentFlow(member, sent) {
   if (!sent || sent.error) {
-    toast('确认码没发出去，积分会先冻结（可稍后在会员处重发）', 'err');
+    toast(T('consent.notSent'), 'err');
     return;
   }
 
-  const where = sent.channel === 'sms' ? '手机短信' : '邮箱';
-  let tip = `确认码已发到客人的${where}。\n请让客人报出 6 位数字。`;
+  const where = T(sent.channel === 'sms' ? 'consent.viaSms' : 'consent.viaEmail');
+  let tip = T('consent.sent', { where });
 
   for (;;) {
     const code = await UI.input(tip, {
-      numeric: true, okText: '确认', cancelText: '稍后再说',
+      numeric: true, okText: T('common.confirm'), cancelText: T('common.later'),
     });
     if (code === null) {
-      toast('未确认，积分先冻结', 'err');
+      toast(T('consent.notDone'), 'err');
       return;
     }
 
@@ -1094,24 +1169,24 @@ async function runConsentFlow(member, sent) {
       await api('/consent/verify', { member_id: member.id, code });
       member.consent_status = 1;
       member.points_frozen  = false;
-      toast('已确认，积分可以兑换了', 'ok');
+      toast(T('consent.done'), 'ok');
       return;
     } catch (e) {
       // 码错了还能再试；过期或锁死就只能重发
       if (e.error === 'code_wrong') {
         const left = e.detail && e.detail.left;
-        tip = `确认码不正确${left ? `（还可以试 ${left} 次）` : ''}。\n请客人再报一次。`;
+        tip = T('consent.wrong', { left: left ? T('consent.left', { n: left }) : '' });
         continue;
       }
       if (e.error === 'code_expired' || e.error === 'code_locked') {
-        if (!await UI.confirm(`${e.message}\n\n要重新发一条吗？`, { okText: '重新发送' })) {
-          toast('未确认，积分先冻结', 'err');
+        if (!await UI.confirm(T('consent.resendAsk', { message: e.message }), { okText: T('consent.resend') })) {
+          toast(T('consent.notDone'), 'err');
           return;
         }
         try {
           const r = await api('/consent/send', { member_id: member.id });
-          const w = r.channel === 'sms' ? '手机短信' : '邮箱';
-          tip = `新的确认码已发到客人的${w}。\n请让客人报出 6 位数字。`;
+          const w = T(r.channel === 'sms' ? 'consent.viaSms' : 'consent.viaEmail');
+          tip = T('consent.resent', { where: w });
           continue;
         } catch (e2) {
           toast(e2.message, 'err');
@@ -1152,29 +1227,28 @@ $('#btn-scan').onclick = async () => {
 
   if (typeof window.BarcodeDetector !== 'function') {
     return showErr('#member-err',
-      '本设备不支持扫码，请照着卡面手工输入卡号。'
-    + '不用纠结哪个是字母哪个是数字，看着像什么就输什么，系统会自动纠正');
+      T('scan.unsupported'));
   }
   if (!window.SushiVIP || !SushiVIP.cameraSupported()) {
     return showErr('#member-err',
       window.isSecureContext === false
-        ? '页面不在 HTTPS 下，相机不可用；请手工输入卡号'
-        : '相机不可用，请手工输入卡号');
+        ? T('scan.needHttps')
+      : T('scan.noCamera'));
   }
 
   $('#scan-modal').hidden = false;
   UI.back.sync();
-  $('#scan-msg').textContent = '正在打开相机…';
+  $('#scan-msg').textContent = T('scan.opening');
 
   try {
     scanStream = await SushiVIP.openCamera();
     const v = $('#scan-video');
     v.srcObject = scanStream;
     await v.play();
-    $('#scan-msg').textContent = '把卡面的二维码对准取景框';
+    $('#scan-msg').textContent = T('scan.aim');
   } catch (e) {
     stopScan();
-    return showErr('#member-err', '打开相机失败：' + (e && e.message ? e.message : e));
+    return showErr('#member-err', T('scan.failed', { err: (e && e.message ? e.message : e) }));
   }
 
   const det = new BarcodeDetector({ formats: ['qr_code'] });
@@ -1199,9 +1273,9 @@ function useMember(m) {
   if (S.memberTarget === 'manual') {
     S.manualMember = m;
     $('#manual-member').innerHTML = `<div class="found"><b>${escapeHtml(m.card_no)}</b>
-      <div class="muted small">${m.points_balance} 分</div></div>`;
+      <div class="muted small">${m.points_balance} ${T('common.points')}</div></div>`;
   } else if (S.people.some((p, i) => p.member && p.member.id === m.id && i !== S.memberTarget)) {
-    return showErr('#member-err', '该会员已在本单中，不能重复');
+    return showErr('#member-err', T('member.duplicate'));
   } else {
     S.people[S.memberTarget].member = m;
     renderPeople(S.mode === 3);
@@ -1214,7 +1288,7 @@ function useMember(m) {
 /* ── 手工录入 ────────────────────────────────────── */
 function openManual() {
   S.manualMember = null;
-  $('#manual-member').innerHTML = '<button class="link" id="btn-manual-pick">＋ 选择会员</button>';
+  $('#manual-member').innerHTML = `<button class="link" id="btn-manual-pick">${T('assign.pickMember')}</button>`;
   $('#btn-manual-pick').onclick = () => openMemberModal('manual');
   $('#manual-amount').value = '';
   showErr('#manual-err', '');
@@ -1223,14 +1297,14 @@ function openManual() {
 
 $('#btn-manual-submit').onclick = async () => {
   showErr('#manual-err', '');
-  if (!S.manualMember) return showErr('#manual-err', '请先选择会员');
+  if (!S.manualMember) return showErr('#manual-err', T('manual.needMember'));
   const amt = $('#manual-amount').value.trim();
-  if (cents(amt) <= 0) return showErr('#manual-err', '请填写正确金额');
+  if (cents(amt) <= 0) return showErr('#manual-err', T('manual.needAmount'));
   try {
     const d = await api('/points/manual', {
       member_id: S.manualMember.id, amount: amt, reason_code: $('#manual-reason').value,
     });
-    toast(`已录入 +${d.points} 分，等待后台复核`, 'ok');
+    toast(T('manual.done', { points: d.points }), 'ok');
     resetFlow();
   } catch (e) { showErr('#manual-err', e.message); }
 };
@@ -1240,7 +1314,17 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-/* 启动：若已有有效会话直接进主界面 */
+/**
+ * 启动。
+ *
+ * 语言要在【第一次请求之前】定好：api() 每次都带 X-Lang，
+ * 定晚了第一条错误提示就会是另一种语言。
+ * 这时还不知道是谁在登录，所以用这台平板上次用的那种；
+ * 登录成功后 enterMain() 会按账号覆盖掉。
+ */
+I18N.set(I18N.initial('zh'), { remember: false });
+renderLangSwitch();
+
 (async () => {
   try {
     const d = await api('/auth/me', undefined, 'GET');
@@ -1248,9 +1332,14 @@ function escapeHtml(s) {
   } catch {
     try {
       const h = await api('/health', undefined, 'GET');
-      if (!h.local_db) $('#health-note').textContent = '本地数据库连接异常，请联系管理员';
+      if (!h.local_db) $('#health-note').textContent = T('health.dbDown');
+      // 这台平板还没人切过语言时，跟后台配的默认走
+      if (h.default_lang && !I18N.remembered()) {
+        I18N.set(h.default_lang, { remember: false });
+        renderLangSwitch();
+      }
     } catch {
-      $('#health-note').textContent = '无法连接本机服务';
+      $('#health-note').textContent = T('health.noService');
     }
   }
 })();

@@ -1425,6 +1425,38 @@ $g5 = $svc->replaceCard($hMid, $hb[0]['card_no'], '刚过期换卡', $clerk);
 ok($g5['ok'] && ($g5['forced'] ?? false) === false,
    '★ 还在宽限期内的卡，普通收银员照样能换，不用惊动经理');
 
+step('⑱ 界面语言 —— 跟着账号走，不跟着平板走');
+
+/**
+ * 收银台的平板是共用的，中文和西语的员工换班轮着用同一台。
+ * 语言存在 operator 行上，所以「换台平板还是我的语言」「换个人就换语言」
+ * 这两件事才成立。存在平板本地的话就变成「谁后切的算谁的」。
+ */
+$auth   = $app->auth();
+$langOp = $auth->createOperator('smokelang', '语言测试', '778899', 1);
+ok($langOp > 0, "建一个测试账号");
+
+$row = $db->one('SELECT lang FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+ok($row['lang'] === null, '★ 新账号的 lang 是 NULL —— 「没选过」要能和「选了中文」区分开');
+
+ok($auth->setLang($langOp, 'es'), '设成西语');
+$row = $db->one('SELECT lang FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+eq('es', $row['lang'], '★ 落到了 operator 行上');
+
+ok(!$auth->setLang($langOp, 'fr'), '★ 不支持的语言码直接拒绝');
+$row = $db->one('SELECT lang FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+eq('es', $row['lang'], '★ 被拒时不改动原值 —— 宁可保持原样，也别把人的选择改坏');
+
+// 登录与会话恢复两条路都要带上语言，漏一条就是「刷新之后语言变了」
+$lg = $auth->login('smokelang', '778899', 'SMOKEPAD', '127.0.0.1');
+ok($lg['ok'], '能登录');
+eq('es', $lg['operator']['lang'] ?? null, '★ 登录响应里带着语言');
+$me = $auth->resolve((string)$lg['token']);
+eq('es', $me['lang'] ?? null, '★ 会话恢复那条路也带着语言（最容易漏的一条）');
+
+$db->exec('DELETE FROM operator_session WHERE store_code = ? AND operator_id = ?', [SMOKE_STORE, $langOp]);
+$db->exec('DELETE FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

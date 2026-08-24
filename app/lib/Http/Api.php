@@ -35,6 +35,25 @@ final class Api
      */
     public const NOT_FOUND = 422;
 
+    /**
+     * 本次请求用哪种语言回话。
+     *
+     * 由 index.php 在分派前按「请求头 → 登录账号 → 后台默认」的顺序定下来。
+     * 做成静态量是因为 fail() 到处都在调，逐层传语言会污染每一个签名，
+     * 而这个值在单次请求内是恒定的。
+     */
+    private static string $lang = \Vip\Lang::FALLBACK;
+
+    public static function setLang(?string $lang): void
+    {
+        self::$lang = \Vip\Lang::normalize($lang);
+    }
+
+    public static function lang(): string
+    {
+        return self::$lang;
+    }
+
     private const MESSAGES = [
         'unauthorized'           => '登录已过期，请重新登录',
         'forbidden'              => '当前账号没有此操作权限',
@@ -97,6 +116,79 @@ final class Api
         'code_locked'            => '确认码连续输错多次，请重新发送一条',
         'consent_already_done'   => '该会员已完成确认',
         'server_error'           => '系统内部错误，请稍后重试',
+    ];
+
+
+    /**
+     * 西班牙语文案。
+     *
+     * ★ 键必须与 MESSAGES 完全一致 —— 测试里有断言逐个比对，
+     *   漏一条就红。漏翻译不会报错、只会在收银台上冒出一句中文，
+     *   现场没人会来报这种「小事」，所以必须靠测试守住。
+     *
+     * 写给收银员看的：短句、直接说下一步该做什么，不用敬语堆砌。
+     */
+    private const MESSAGES_ES = [
+        'unauthorized'           => 'La sesión ha caducado, vuelva a iniciar sesión',
+        'forbidden'              => 'Esta cuenta no tiene permiso para esta operación',
+        'invalid_credentials'    => 'Usuario o PIN incorrecto',
+        'locked'                 => 'Demasiados intentos fallidos, cuenta bloqueada temporalmente',
+        'method_not_allowed'     => 'Método de petición incorrecto',
+        'not_found'              => 'La ruta no existe',
+        'bad_request'            => 'Parámetros de la petición incorrectos',
+        'pos_unavailable'        => 'El TPV no responde ahora mismo, puede usar la entrada manual',
+        'order_not_found'        => 'No se ha encontrado el ticket',
+        'not_dine_in'            => 'Los pedidos para llevar no acumulan puntos',
+        'free_meal'              => 'Este ticket está marcado como comida gratuita, no acumula puntos',
+        'redeemed'              => 'Este ticket ya se usó para canjear el 10+1: no cuenta visita ni puntos',
+        'bad_invoice'            => 'Número de ticket no válido, compruebe la Factura Simplificada',
+        'pin_too_short'          => 'El PIN es demasiado corto, mínimo 6 dígitos',
+        'pin_unchanged'          => 'El PIN nuevo no puede ser igual al anterior',
+        'zero_amount'            => 'El importe del ticket es 0, no acumula puntos',
+        'exceeds_total'          => 'El importe asignado supera el total que puede puntuar',
+        'exceeds_portions'       => 'Las raciones asignadas superan las del ticket',
+        'negative_allocation'    => 'El importe o las raciones no pueden ser negativos',
+        'duplicate_member'       => 'El mismo cliente aparece repetido, revíselo',
+        'empty_allocation'       => 'Asigne importe al menos a un cliente',
+        'invalid_member'         => 'Los datos del cliente están incompletos',
+        'member_not_found'       => 'No se ha encontrado ese cliente',
+        'already_reversed'       => 'Este apunte ya se anuló antes',
+        'not_reversible'         => 'Este apunte no se puede anular',
+        'reversal_window_expired'=> 'Fuera del plazo para anular por su cuenta, hace falta un encargado',
+        'manual_entry_disabled'  => 'La entrada manual está desactivada',
+        'exceeds_manual_limit'   => 'Supera el límite por entrada manual, hace falta un encargado',
+        'invalid_amount'         => 'Importe no válido',
+        'db_unavailable'         => 'La base de datos local no responde, avise al administrador',
+
+        // ── Tarjeta física ──────────────────────────────────
+        'card_malformed'         => 'Número de tarjeta incompleto, vuelva a escanear o compruebe el número',
+        'card_unknown'           => 'Esta no es una tarjeta emitida por el restaurante',
+        'card_void'              => 'Esta tarjeta está anulada, entregue una nueva',
+        'card_taken'             => 'Esta tarjeta ya está asignada a otro cliente',
+        'card_not_available'     => 'Esta tarjeta no está en stock, no se puede entregar',
+        'card_expired'           => 'Tarjeta caducada: entregue una nueva (los puntos se traspasan)',
+        'grace_over'             => 'Esta tarjeta superó el plazo de renovación; los puntos han caducado — hace falta un encargado',
+        'card_expiring_soon'     => 'Esta tarjeta caduca pronto',
+        'card_member_missing'    => 'No se encuentra el cliente asociado a la tarjeta, avise al administrador',
+        'member_has_card'        => 'Este cliente ya tiene tarjeta; para cambiarla use la renovación',
+        'card_required'          => 'Escanee primero la tarjeta del cliente',
+        'pin_wrong'              => 'El PIN del reverso no es correcto',
+        'pin_locked'             => 'Demasiados fallos con el PIN del reverso, bloqueado temporalmente',
+        'pin_not_set'            => 'Esta tarjeta no tiene PIN, avise al administrador',
+        'pin_required'           => 'Pida al cliente que rasque el reverso y diga el PIN',
+        'card_missing'           => 'Este cliente no tiene tarjeta activa, entregue una primero',
+        'reason_required'        => 'Para forzar la operación hay que indicar el motivo',
+        'pii_disabled'           => 'El restaurante no recoge datos de contacto, no se los pida al cliente',
+        'no_channel'             => 'No se puede enviar el código: SMS/email sin configurar, o el cliente no dejó ese dato',
+        'channel_not_configured' => 'El canal de envío no está configurado, avise al administrador',
+        'send_failed'            => 'No se pudo enviar el código, inténtelo de nuevo',
+        'no_recipient'           => 'No hay teléfono ni email disponibles',
+        'code_not_sent'          => 'Todavía no se ha enviado ningún código',
+        'code_wrong'             => 'El código no es correcto',
+        'code_expired'           => 'El código ha caducado, envíe uno nuevo',
+        'code_locked'            => 'Demasiados fallos con el código, envíe uno nuevo',
+        'consent_already_done'   => 'Este cliente ya completó la confirmación',
+        'server_error'           => 'Error interno del sistema, inténtelo de nuevo',
     ];
 
     /** @var array<string,callable> 'METHOD /path' => handler */
@@ -255,9 +347,24 @@ final class Api
         self::emit(200, ['ok' => true, 'data' => $data]);
     }
 
+    /** 按当前语言取文案；缺翻译时回落中文，再缺就把错误码原样吐出去 */
+    public static function message(string $code): string
+    {
+        if (self::$lang === \Vip\Lang::ES) {
+            return self::MESSAGES_ES[$code] ?? self::MESSAGES[$code] ?? $code;
+        }
+        return self::MESSAGES[$code] ?? $code;
+    }
+
+    /** 测试用：拿到两张表好逐键比对，漏翻译要能被发现 */
+    public static function messageKeys(): array
+    {
+        return ['zh' => array_keys(self::MESSAGES), 'es' => array_keys(self::MESSAGES_ES)];
+    }
+
     public static function fail(string $code, int $status = 400, array $detail = [], string $ref = ''): never
     {
-        $msg = self::MESSAGES[$code] ?? $code;
+        $msg = self::message($code);
         if ($ref !== '') {
             // 代码直接拼进提示语 —— 收银员拍照就能把它带出来，不用再教怎么找
             $msg .= "（错误代码 {$ref}）";

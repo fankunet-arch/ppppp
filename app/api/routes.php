@@ -64,7 +64,11 @@ $api->on('GET', '/health', static function () use ($app): void {
         $posOk  = false;
         $posMsg = 'POS 主库暂时无法访问，收银流程可继续（手工录入）';
     }
-    Api::ok(['local_db' => $localOk, 'pos_db' => $posOk, 'pos_note' => $posMsg]);
+    // default_lang 也从这里给：登录页要用，而那时还没有会话
+    Api::ok([
+        'local_db' => $localOk, 'pos_db' => $posOk, 'pos_note' => $posMsg,
+        'default_lang' => \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK)),
+    ]);
 });
 
 // ════════════════════════════════════════════════════════════
@@ -85,10 +89,27 @@ $padSettings = static function () use ($app): array {
         // 有效期相关的两个阈值，Pad 拿它决定什么时候提醒换卡
         'expiring_soon_days' => $app->cardService()->expiringSoonDays(),
         'grace_months'       => $app->cardService()->graceMonths(),
+        // 还没选过语言的账号用这个；已选过的以 operator.lang 为准
+        'default_lang'       => \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK)),
+        'langs'              => \Vip\Lang::ALL,
     ];
 };
 
-$api->on('POST', '/auth/login', static function () use ($auth, $padSettings): void {
+/**
+ * 这个账号实际该用哪种语言：自己选过的 > 后台默认。
+ *
+ * 回落放在服务端而不是让前端 `op.lang || settings.default_lang` ——
+ * 前端有三处要用（登录、会话恢复、切换后），漏一处就是「换台平板语言变了」，
+ * 而且这种 bug 在开发机上永远复现不出来。
+ */
+$withLang = static function (array $op) use ($app): array {
+    $op['lang'] = \Vip\Lang::isValid($op['lang'] ?? null)
+        ? (string)$op['lang']
+        : \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK));
+    return $op;
+};
+
+$api->on('POST', '/auth/login', static function () use ($auth, $padSettings, $withLang): void {
     $b     = Api::body();
     $login = Api::str($b, 'login_name', '');
     $pin   = Api::str($b, 'pin', '');
@@ -102,7 +123,11 @@ $api->on('POST', '/auth/login', static function () use ($auth, $padSettings): vo
         Api::fail((string)$r['error'], $r['error'] === 'locked' ? 423 : 401, $r['detail'] ?? []);
     }
     Api::setToken((string)$r['token'], 12 * 3600);
-    Api::ok(['operator' => $r['operator'], 'settings' => $padSettings()]);
+    $op = $withLang((array)$r['operator']);
+    // 登录响应本身也按这个人的语言回话 —— 否则登录页是中文、
+    // 进去之后第一条提示还是中文，要等下一次请求才切过来
+    Api::setLang($op['lang']);
+    Api::ok(['operator' => $op, 'settings' => $padSettings()]);
 });
 
 /**
@@ -130,8 +155,25 @@ $api->on('POST', '/auth/logout', static function () use ($auth): void {
     Api::ok();
 });
 
-$api->on('GET', '/auth/me', static function () use ($requireOperator, $padSettings): void {
-    Api::ok(['operator' => $requireOperator(), 'settings' => $padSettings()]);
+$api->on('GET', '/auth/me', static function () use ($requireOperator, $padSettings, $withLang): void {
+    Api::ok(['operator' => $withLang($requireOperator()), 'settings' => $padSettings()]);
+});
+
+/**
+ * 切换界面语言 —— 记在账号上，换台平板登录也还是这个语言。
+ *
+ * 之所以要落库而不是只存在平板本地：收银台的平板是共用的，
+ * 中文和西语的员工换班轮着用同一台。存本地就变成「谁后切的算谁的」。
+ */
+$api->on('POST', '/auth/lang', static function () use ($app, $requireOperator): void {
+    $op   = $requireOperator();
+    $lang = Api::str(Api::body(), 'lang', '') ?: '';
+    if (!\Vip\Lang::isValid($lang)) {
+        Api::fail('bad_request', 400, ['hint' => '不支持的语言']);
+    }
+    $app->auth()->setLang((int)$op['id'], $lang);
+    Api::setLang($lang);
+    Api::ok(['lang' => $lang]);
 });
 
 // ════════════════════════════════════════════════════════════
