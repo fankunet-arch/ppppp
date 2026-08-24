@@ -197,7 +197,14 @@ function enterMain(op, settings) {
   $('#view-login').classList.remove('active');
   $('#view-main').classList.add('active');
   resetFlow();
-  checkHealth();
+  /**
+   * 带参数的那几处文字是 JS 填的（「放宽到 N 分钟再找」「查找最近 N 分钟…」），
+   * 登录后必须先填一次 —— 漏了的话那个按钮上一个字都没有，
+   * 界面上看起来就是「按钮不见了」。
+   *
+   * refreshDynamicText 里已经带了 checkHealth，不要再单独调一次。
+   */
+  refreshDynamicText();
 }
 
 /**
@@ -423,8 +430,10 @@ async function locate(windowMinutes) {
   if (!table) return showErr('#locate-err', T('lookup.needTable'));
   try {
     const d = await api('/order/locate', { table_name: table, window_minutes: windowMinutes || 0 });
-    $('#win-label').textContent = d.window;
-    $('#fallback-label').textContent = d.fallback_window;
+    S.window  = d.window;
+    S.widenTo = d.fallback_window;
+    $('#table-hint').textContent = T('lookup.tableHint', { min: d.window });
+    $('#btn-widen').textContent  = T('lookup.widen', { min: d.fallback_window });
     if (!d.candidates.length) {
       showErr('#locate-err', T('lookup.noneInWindow', { min: d.window, table }));
       $('#locate-fallback').hidden = false;
@@ -440,7 +449,7 @@ async function locate(windowMinutes) {
 }
 $('#btn-locate').onclick = () => locate(0);
 $('#table-input').addEventListener('keydown', e => { if (e.key === 'Enter') locate(0); });
-$('#btn-widen').onclick = () => locate(parseInt($('#fallback-label').textContent, 10) || 60);
+$('#btn-widen').onclick = () => locate(S.widenTo || 60);
 $('#btn-manual').onclick = () => { openManual(); };
 
 /**

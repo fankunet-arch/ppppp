@@ -83,6 +83,7 @@ require __DIR__ . '/cases/CardNumberTest.php';
 require __DIR__ . '/cases/ContainerCompatTest.php';
 require __DIR__ . '/cases/I18nTest.php';
 require __DIR__ . '/cases/CacheBustTest.php';
+require __DIR__ . '/cases/DomRefTest.php';
 
 /**
  * 上面这份名单是手写的，所以它自己会漏 —— 新加一个用例文件却忘了登记，
