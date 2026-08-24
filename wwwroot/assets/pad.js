@@ -294,7 +294,68 @@ async function checkHealth() {
     } else {
       pill.hidden = true;
     }
+    noteVersion(h.app_version);
   } catch {}
+}
+
+/**
+ * 代码更新的自动落地。
+ *
+ * 现场的痛点：代码传上去了，Pad 上还是旧页面 —— 而 Pad 没有地址栏，
+ * 点「刷新」也没用（WebView 认为自己已经有 pad.js 了，压根不去取）。
+ *
+ * 页面改成 index.php + 资源带版本号之后，重新加载一次就必然拿到新代码。
+ * 这里负责的是「什么时候重新加载」：服务端报的版本和手里这份对不上，
+ * 就在【安全的时机】自己刷掉，不用人去按那个按钮。
+ *
+ * ★ 绝不能在收银员干活干到一半时刷新 —— 已经填好的金额、选好的会员
+ *   会当场清空，比看到旧界面严重得多。所以只在两种时刻动手：
+ *     · 还停在第一步、什么都没开始
+ *     · 一单做完点「下一单」的那一刻
+ *   都不满足就先记下来，等下一次到达安全点再说。
+ */
+let pendingUpdate = false;
+let targetVersion = null;
+
+function noteVersion(serverVersion) {
+  if (!serverVersion || !window.APP_VERSION) return;   // 老页面没有版本号，跳过
+  if (String(serverVersion) === String(window.APP_VERSION)) return;
+  targetVersion = String(serverVersion);
+  pendingUpdate = true;
+  applyUpdateIfIdle();
+}
+
+/**
+ * 🔴 同一个版本只刷一次。
+ *
+ * 刷完之后版本还是对不上，说明刷新解决不了问题（比如两处的版本号
+ * 口径不一致、或者中间有个绕不开的缓存）。这时候【必须停手】——
+ * 收银机陷入无限刷新，比看到旧界面严重得多，那是整台机器没法用。
+ *
+ * 记在 sessionStorage：它跨得过刷新，又会随应用被划掉而清空 ——
+ * 正好是「这一轮别再试了，下次重开可以再试」的语义。
+ */
+function alreadyTried(version) {
+  try {
+    if (sessionStorage.getItem('vip_reload_for') === version) { return true; }
+    sessionStorage.setItem('vip_reload_for', version);
+  } catch (e) { /* 隐私模式读不到，那就允许刷这一次 */ }
+  return false;
+}
+
+function applyUpdateIfIdle() {
+  if (!pendingUpdate) return;
+  const busy = CURRENT_STEP !== 'step-table'
+            || (S.people && S.people.length > 0)
+            || S.order !== null
+            || !$('#member-modal').hidden
+            || !$('#scan-modal').hidden
+            || !$('#pin-modal').hidden;
+  if (busy) return;
+  pendingUpdate = false;
+  if (alreadyTried(targetVersion)) { return; }
+  // 版本号带在 URL 上：连文档本身也绕开任何中间缓存，不只靠 no-store
+  location.replace(location.pathname + '?v=' + encodeURIComponent(String(Date.now())));
 }
 
 /* ── 改自己的 PIN ────────────────────────────────── */
@@ -328,10 +389,20 @@ function resetFlow() {
   showErr('#locate-err', '');
   $('#locate-fallback').hidden = true;
   step('step-table');
-  setLookupMode(S.lookupMode || 'invoice');
+  /**
+   * 每一单都从【桌号】开始。
+   *
+   * 客人还在桌上、收银员手边就是桌号，这是绝大多数情况。
+   * 小票号是补救路径：客人拿着小票折返，或者桌号对不上。
+   *
+   * 这里【不】沿用上一单选过的那种 —— 沿用的话，偶尔办一次小票号的单，
+   * 之后每一单都停在小票号上，收银员得反复切回来。
+   * 「默认」就该是每单都回到默认。
+   */
+  setLookupMode('table');
 }
 
-/* 两种找单方式切换：小票号（精确）/ 桌号（客人没拿小票时） */
+/* 两种找单方式切换：桌号（默认，最常用）/ 小票号（精确，补救用） */
 function setLookupMode(mode) {
   S.lookupMode = mode;
   $$('.lookup-tab').forEach(t => t.classList.toggle('on', t.dataset.mode === mode));
@@ -343,7 +414,7 @@ function setLookupMode(mode) {
   setTimeout(() => box.focus(), 0);
 }
 $$('.lookup-tab').forEach(t => t.onclick = () => setLookupMode(t.dataset.mode));
-$('#btn-new').onclick = resetFlow;
+$('#btn-new').onclick = () => { resetFlow(); applyUpdateIfIdle(); };
 $$('[data-back]').forEach(b => b.onclick = () => step(b.dataset.back));
 
 async function locate(windowMinutes) {

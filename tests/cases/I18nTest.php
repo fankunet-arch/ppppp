@@ -128,7 +128,7 @@ T::group('多语言 · 静态 DOM 的翻译标记不会吃掉输入框');
  * 这个错误在中文界面下完全看不出来（初始 HTML 是对的），
  * 只有切一次语言才会暴露，所以必须静态查出来。
  */
-$html = file_get_contents(__DIR__ . '/../../wwwroot/index.html');
+$html = file_get_contents(__DIR__ . '/../../wwwroot/index.php');
 preg_match_all('/<(\w+)[^>]*\sdata-i18n="[^"]+"[^>]*>(.*?)<\/\1>/s', $html, $tags, PREG_SET_ORDER);
 $withChildren = [];
 foreach ($tags as $t) {
@@ -146,10 +146,17 @@ T::true($withChildren === [], '★ 没有 data-i18n 元素里裹着输入控件'
  *   上面那行注释里就写着 “pad.js”，会先被找到，于是这条断言
  *   在顺序完全正确时也红。（第一版就是这么写错的。）
  */
-preg_match_all('/<script[^>]+src="([^"]+)"/', $html, $scripts);
-$order = array_map(static fn(string $p): string => basename($p), $scripts[1]);
+// src 现在是 `<?= vip_asset('assets/pad.js') ?>`（带缓存版本号），两种写法都要认
+preg_match_all(
+    '/<script[^>]+src="(?:<\?=\s*vip_asset\(\s*\x27([^\x27]+)\x27\s*\)\s*\?>|([^"]+))"/',
+    $html, $scripts, PREG_SET_ORDER
+);
+$order = array_map(
+    static fn(array $m): string => basename($m[1] !== '' ? $m[1] : $m[2]),
+    $scripts
+);
 $iI18n = array_search('i18n.js', $order, true);
 $iPad  = array_search('pad.js',  $order, true);
-T::true($iI18n !== false, 'index.html 引了 i18n.js');
+T::true($iI18n !== false, 'index.php 引了 i18n.js');
 T::true($iI18n !== false && $iPad !== false && $iI18n < $iPad,
     '★ i18n.js 必须排在 pad.js 之前（实际顺序：' . implode(' → ', $order) . '）');

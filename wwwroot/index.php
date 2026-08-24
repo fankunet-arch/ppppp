@@ -1,3 +1,36 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Pad 前端入口。
+ *
+ * ★ 这里是 .php 而不是 .html，唯一的原因是【缓存】。
+ *
+ *   静态 HTML 没法告诉浏览器「我换了」，于是代码传上去了、Pad 上
+ *   还是旧页面 —— 而 Pad 没有地址栏、没有开发者工具，
+ *   连点「刷新」都没用（WebView 认为自己已经有 pad.js 了，不会再去取）。
+ *
+ *   由 PHP 发出来之后：
+ *     · 页面本身 no-store，每次都重新取（就几 KB）
+ *     · 资源 URL 带上 ?v=<文件改动时间>，没改的 URL 不变、照旧命中缓存，
+ *       一个字节都不下；改了的 URL 变了，浏览器必然重新下载
+ *
+ *   所以「平时不下载、更新时立刻生效」这两件事是同时成立的。
+ *
+ * 🔴 nginx 要放行本文件，见 docs/06 §5。
+ *    文档里那份配置有一条 `location ~ \.php$ { return 404; }`，
+ *    不改的话这个页面会 404。
+ */
+require __DIR__ . '/_assets.php';
+
+vip_no_store();
+
+// 版本号取这几个文件里最新的 mtime；客户端拿它和 /health 比对
+$appVersion = vip_app_version([
+    'index.php', 'assets/pad.js', 'assets/pad.css',
+    'assets/ui.js', 'assets/i18n.js', 'assets/sushivip-bridge.js',
+]);
+?>
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -5,7 +38,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="same-origin">
 <title>会员积分 · Pad</title>
-<link rel="stylesheet" href="/assets/pad.css">
+<link rel="stylesheet" href="<?= vip_asset('assets/pad.css') ?>">
 </head>
 <body>
 
@@ -45,26 +78,27 @@
     <h2 data-i18n="step1.title">① 找订单</h2>
 
     <div class="lookup-tabs">
-      <button id="tab-invoice" class="lookup-tab on"  data-mode="invoice" data-i18n="lookup.invoice">小票号</button>
-      <button id="tab-table"   class="lookup-tab"     data-mode="table"   data-i18n="lookup.table">桌号</button>
+      <button id="tab-table"   class="lookup-tab on"  data-mode="table"   data-i18n="lookup.table">桌号</button>
+      <button id="tab-invoice" class="lookup-tab"     data-mode="invoice" data-i18n="lookup.invoice">小票号</button>
     </div>
 
-    <!-- 按小票号：Factura Simplificada = 全局唯一，不受时间窗限制 -->
-    <div id="pane-invoice" class="lookup-pane">
-      <div class="row">
-        <input id="invoice-input" type="text" inputmode="numeric" data-i18n-ph="lookup.invoice" autocomplete="off">
-        <button id="btn-locate-invoice" class="primary" data-i18n="lookup.find">查找订单</button>
-      </div>
-      <p class="muted small" data-i18n-html="lookup.invoiceHint"></p>
-    </div>
-
-    <!-- 按桌号：原有路径，客人没拿小票时用 -->
-    <div id="pane-table" class="lookup-pane" hidden>
+    <!-- 按桌号：默认路径。客人还在桌上，收银员手边就是桌号，最快 -->
+    <div id="pane-table" class="lookup-pane">
       <div class="row">
         <input id="table-input" type="text" inputmode="numeric" data-i18n-ph="lookup.table" autocomplete="off">
         <button id="btn-locate" class="primary" data-i18n="lookup.find">查找订单</button>
       </div>
       <p class="muted small" id="table-hint"></p>
+    </div>
+
+    <!-- 按小票号：补救路径。客人拿着小票折返、或桌号对不上时用。
+         Factura Simplificada = 全局唯一，不受 30 分钟时间窗限制 -->
+    <div id="pane-invoice" class="lookup-pane" hidden>
+      <div class="row">
+        <input id="invoice-input" type="text" inputmode="numeric" data-i18n-ph="lookup.invoice" autocomplete="off">
+        <button id="btn-locate-invoice" class="primary" data-i18n="lookup.find">查找订单</button>
+      </div>
+      <p class="muted small" data-i18n-html="lookup.invoiceHint"></p>
     </div>
 
     <p id="locate-err" class="err" hidden></p>
@@ -206,10 +240,13 @@
 
 <div id="toast" class="toast" hidden></div>
 
+<!-- 版本号：pad.js 用它和 /health 返回的值比对，不一致说明手里这份是旧的 -->
+<script>window.APP_VERSION = <?= json_encode($appVersion) ?>;</script>
+
 <!-- 顺序即依赖：桥接、通用 UI、词典都必须先于 pad.js 加载（都是同步脚本） -->
-<script src="/assets/sushivip-bridge.js"></script>
-<script src="/assets/ui.js"></script>
-<script src="/assets/i18n.js"></script>
-<script src="/assets/pad.js"></script>
+<script src="<?= vip_asset('assets/sushivip-bridge.js') ?>"></script>
+<script src="<?= vip_asset('assets/ui.js') ?>"></script>
+<script src="<?= vip_asset('assets/i18n.js') ?>"></script>
+<script src="<?= vip_asset('assets/pad.js') ?>"></script>
 </body>
 </html>

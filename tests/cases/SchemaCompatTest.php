@@ -475,8 +475,8 @@ T::group('前端 —— hidden 属性不得被样式压过');
  * 连登录页都被盖住，而所有 API 测试都发现不了（它们不渲染页面）。
  */
 foreach ([
-    'wwwroot/assets/pad.css' => 'wwwroot/index.html',
-    'wwwroot/cp/cp.css'      => 'wwwroot/cp/index.html',
+    'wwwroot/assets/pad.css' => 'wwwroot/index.php',
+    'wwwroot/cp/cp.css'      => 'wwwroot/cp/index.php',
 ] as $cssPath => $htmlPath) {
     $css  = (string)file_get_contents(__DIR__ . '/../../' . $cssPath);
     $name = basename($cssPath);

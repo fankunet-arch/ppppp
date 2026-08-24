@@ -107,6 +107,17 @@ node /path/to/repo/tests/browser/back.mjs
 与宽限期月数）、被拒之后**旧卡没被动过**、原因空白不放行，
 以及成功后记的是 `card_replace_forced` 这个单独的审计动作。
 
+### `cachebust.mjs` —— 版本更新怎么落到 Pad 上（16 项）
+
+现场原话：「我点了好久的刷新按钮，但是代码还是老旧的」。
+页面改由 PHP 发之后，资源 URL 带 mtime 版本号，这里验的是：
+
+- 每个资源引用都带 `?v=`，文档本身是 `no-store`
+- 服务端版本变了 → 停在第一步时**自己刷新**
+- **干活干到一半时绝不刷新** —— 已填的金额不能被冲掉
+- **同一个版本只刷一次** —— 否则版本号一直对不上时收银机会无限刷新
+- 换一个新版本，照常更新（别把上一条守过头变成「以后都不更新」）
+
 ### `lang.mjs` —— 多语言（42 项）
 
 跑完把两个测试账号的语言偏好还原成 NULL，不留残留。
@@ -234,3 +245,34 @@ php(`... Vip\\CardNumber::normalize($x) ...`)   // ✅
 ```
 
 报错是 `Class "VipCardNumber" not found`，看着莫名其妙 —— 记住这一条就够了。
+
+### 7. `waitForNavigation()` 在这个项目里会误判
+
+Pad 的物理返回键靠往历史里放哨兵实现（`ui.js` 的 `pushState` / `history.back`），
+**每次切步骤都会触发一次 `framenavigated`** —— URL 压根没变，
+但 `page.waitForNavigation()` 照样 resolve。
+拿它判断「页面有没有真的重新加载」，结论会完全反过来。
+
+改成在 `window` 上插一个标记：真刷新会换掉整个 document，标记随之消失。
+
+```js
+const didReload = async (action) => {
+  await page.evaluate(() => { window.__mark = 1; });
+  await action();
+  await page.waitForTimeout(1500);
+  return !(await page.evaluate(() => window.__mark === 1));
+};
+```
+
+（`cachebust.mjs` 第一版就是用 `waitForNavigation` 写的，
+得出「守不住无限刷新」的错误结论，查了半天才发现是测试在骗人。）
+
+### 8. 伪造版本号做测试时，那个假值必须是【固定的】
+
+`cachebust.mjs` 用 `page.route` 伪造 `/health` 的 `app_version`。
+第一版写成 `'NEWER-' + Date.now()`，每次请求都是新值 ——
+于是刷新之后还是对不上 → 再刷 → **无限刷新**，测试直接超时。
+
+那次翻车反倒问出了产品里一个真问题：**同一个版本必须只刷一次**。
+收银机陷进无限刷新，比看到旧界面严重得多。现在 `pad.js` 用
+`sessionStorage` 记住「已经为哪个版本刷过了」。

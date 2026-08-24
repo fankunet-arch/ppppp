@@ -1,3 +1,21 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * 后台入口。
+ *
+ * 与 Pad 端同理：改成 .php 只是为了让资源 URL 能带上版本号，
+ * 避免「代码传上去了，浏览器里还是旧页面」。说明见 wwwroot/_assets.php。
+ *
+ * 后台在普通浏览器里开，Ctrl+F5 还能救；Pad 上没有这个办法，
+ * 所以那边更要紧 —— 但两边用同一套机制，省得日后只修一边。
+ *
+ * 🔴 nginx 要放行本文件，见 docs/06 §5。
+ */
+require __DIR__ . '/../_assets.php';
+
+vip_no_store();
+?>
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -5,7 +23,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="same-origin">
 <title>会员积分 · 管理后台</title>
-<link rel="stylesheet" href="/cp/cp.css">
+<link rel="stylesheet" href="<?= vip_asset('cp/cp.css') ?>">
 </head>
 <body>
 
@@ -237,7 +255,7 @@
 
 <div id="toast" class="toast" hidden></div>
 <!-- 顺序即依赖：ui.js 必须先于 cp.js 加载 -->
-<script src="/assets/ui.js"></script>
-<script src="/cp/cp.js"></script>
+<script src="<?= vip_asset('assets/ui.js') ?>"></script>
+<script src="<?= vip_asset('cp/cp.js') ?>"></script>
 </body>
 </html>

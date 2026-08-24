@@ -64,10 +64,37 @@ $api->on('GET', '/health', static function () use ($app): void {
         $posOk  = false;
         $posMsg = 'POS 主库暂时无法访问，收银流程可继续（手工录入）';
     }
-    // default_lang 也从这里给：登录页要用，而那时还没有会话
+    /**
+     * app_version：前端拿它和自己手里的 window.APP_VERSION 比对。
+     *
+     * 对不上就说明这个 Pad 上跑的是旧代码 —— 页面能自己在安全的时机
+     * 刷新掉，不用收银员去点那个「点了也没用」的刷新按钮。
+     * 取值口径与 wwwroot/_assets.php 完全一致，两处必须同源。
+     */
+    require_once __DIR__ . '/../../wwwroot/_assets.php';
+
+    /**
+     * default_lang 也从这里给：登录页要用，而那时还没有会话。
+     *
+     * ★ 必须容错。本接口的全部职责就是「库连不上时也要能答话」，
+     *   为了一个语言默认值把它拖垮，等于把唯一的诊断入口也弄没了。
+     *   （真栽过：加完这一行，库一停 /health 直接 500，
+     *     登录页那句「本地数据库连接异常」再也不出现。）
+     */
+    $defaultLang = \Vip\Lang::FALLBACK;
+    if ($localOk) {
+        try {
+            $defaultLang = \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK));
+        } catch (\Throwable) { /* 保持回落值 */ }
+    }
+
     Api::ok([
         'local_db' => $localOk, 'pos_db' => $posOk, 'pos_note' => $posMsg,
-        'default_lang' => \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK)),
+        'default_lang' => $defaultLang,
+        'app_version'  => vip_app_version([
+            'index.php', 'assets/pad.js', 'assets/pad.css',
+            'assets/ui.js', 'assets/i18n.js', 'assets/sushivip-bridge.js',
+        ]),
     ]);
 });
 
