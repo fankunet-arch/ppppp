@@ -1,12 +1,18 @@
 /**
- * 有效期相关的两条【只有真浏览器能验】的路径。
+ * 有效期相关的四条【只有真浏览器能验】的路径。
  *
- *   1. 发卡时的拦阻   —— 剩 ≤30 天的库存卡，发出去之前要问一句
+ *   1. 发卡时的拦阻   —— 快到期的库存卡，发出去之前要问一句
  *   2. 换卡           —— 扫到过期卡，当场换一张新的，积分转过去
+ *   3. 到期前的提醒   —— 在用的卡快到期时每次扫都提醒，可以「稍后再说」
+ *   4. 超出宽限期     —— 前台换不了，必须经理填原因强制换发
  *
- * 这两条服务端在 smoke ⑰ 段已经验过了；这里验的是**界面把它们串起来对不对**：
+ * 服务端那几段在 smoke ⑰ 已经验过了；这里验的是**界面把它们串起来对不对**：
  * 弹层弹没弹、点「换一张」有没有真的把待绑卡号清掉、
  * 换卡弹的是输入框而不是确认框、换完有没有直接把会员选上。
+ *
+ * 第 3 条最值得盯：它必须是【每次都提醒】。做成「提醒过一次就记下不再问」
+ * 看着更清爽，但最后一次提醒之后就再没人提，卡直接过期 —— 而收银员
+ * 当时跳过的理由（忙、新卡没到、客人不想换）下次根本不成立。
  */
 import { launch, BASE } from './_launch.mjs';
 import { execSync } from 'node:child_process';
@@ -15,8 +21,37 @@ const REPO = '/home/user/ppppp';
 let pass = 0, fail = 0;
 const ok = (c, m) => { c ? (pass++, console.log('  \x1b[32m✓\x1b[0m ' + m)) : (fail++, console.log('  \x1b[31m✗\x1b[0m ' + m)); };
 
-/** 用管道喂 PHP，省得把整段代码塞进 -r 的引号地狱 */
-const php = (code) => execSync('php', { cwd: REPO, encoding: 'utf8', input: '<?php ' + code }).trim();
+/**
+ * 用管道喂 PHP，省得把整段代码塞进 -r 的引号地狱。
+ *
+ * 出错时必须把 PHP 的报错原样抛出来 —— 默认的 execSync 只给一句
+ * 「Command failed: php」，造数失败时等于什么线索都没有。
+ */
+const php = (code) => {
+  /**
+   * ★ 这段 shutdown 钩子不能省。
+   *
+   *   脚本从 stdin 喂进去时，PHP 的致命错误【一个字都不打】——
+   *   stdout、stderr 全空，只留一个 255 退出码。`-d display_errors=stderr`
+   *   也救不回来。于是造数一失败就完全没有线索，只能靠猜。
+   *   自己挂一个 shutdown 钩子把 error_get_last() 打到 stderr，
+   *   才问得出到底哪一句炸了。
+   */
+  const probe = 'register_shutdown_function(function () {'
+    + ' $e = error_get_last();'
+    + ' if ($e !== null && ($e["type"] & (E_ERROR | E_PARSE | E_COMPILE_ERROR)) !== 0) {'
+    + '   fwrite(STDERR, $e["message"] . "\n  @ " . $e["file"] . ":" . $e["line"] . "\n");'
+    + ' }});';
+  try {
+    return execSync('php', {
+      cwd: REPO, encoding: 'utf8', input: '<?php ' + probe + code,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+  } catch (e) {
+    const detail = [e.stdout, e.stderr].filter(Boolean).join('\n').trim();
+    throw new Error('造数 PHP 失败：\n' + (detail || '(PHP 没有输出)'));
+  }
+};
 
 const TAG = 'X' + Math.floor(Math.random() * 9000 + 1000);
 
@@ -31,6 +66,8 @@ const fixture = JSON.parse(php(`
   $ok   = $a->cards()->generateBatch("${TAG}A", 2, $far);   // 一张建会员，一张当新卡
   $soonB= $a->cards()->generateBatch("${TAG}B", 1, $soon);  // 快到期的库存卡
   $dead = $a->cards()->generateBatch("${TAG}C", 1, $far);   // 待会改成已过期的库存卡
+  $warn = $a->cards()->generateBatch("${TAG}D", 2, $far);   // 一张改成「快到期」的在用卡 + 换发用
+  $over = $a->cards()->generateBatch("${TAG}E", 2, $far);   // 一张改成「超出宽限期」+ 换发用
 
   // 建一名会员并给他攒点分，好验换卡有没有把分带过去
   $op  = ['id' => 1, 'name' => 'browser-test', 'device' => 'TEST'];
@@ -50,12 +87,34 @@ const fixture = JSON.parse(php(`
       [$past, $c['store_code'], Vip\\CardNumber::normalize($d)]);
   }
 
+  // ── 在用但快到期的卡：验「每次扫都提醒」 ──
+  $rw   = $a->cardService()->bindNewMember($warn[0]['display'], null, null, null, $op);
+  $wMid = (int)$rw['member']['id'];
+  $a->localDb()->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND card_no = ?',
+    [$soon, $c['store_code'], Vip\\CardNumber::normalize($warn[0]['display'])]);
+
+  // ── 超出宽限期的卡：验「必须经理」 ──
+  $ro   = $a->cardService()->bindNewMember($over[0]['display'], null, null, null, $op);
+  $oMid = (int)$ro['member']['id'];
+  $grace= $a->cardService()->graceMonths();
+  $long = date('Y-m-d', strtotime('-' . ($grace + 3) . ' months'));
+  $a->localDb()->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND card_no = ?',
+    [$long, $c['store_code'], Vip\\CardNumber::normalize($over[0]['display'])]);
+
   echo json_encode([
     'expiredBound'  => $ok[0]['display'],   // 已绑会员 + 已过期 → 换卡入口
     'fresh'         => $ok[1]['display'],   // 换发用的新卡
     'soon'          => $soonB[0]['display'],// 剩 20 天的库存卡
     'expiredStock'  => $dead[0]['display'], // 从没绑过人就过期了
+    'warnCard'      => $warn[0]['display'], // 在用，剩 20 天
+    'warnFresh'     => $warn[1]['display'],
+    'overCard'      => $over[0]['display'], // 在用，过期超出宽限期
+    'overFresh'     => $over[1]['display'],
     'memberId'      => $mid,
+    'warnMemberId'  => $wMid,
+    'overMemberId'  => $oMid,
+    'graceMonths'   => $grace,
+    'longAgo'       => $long,
     'past'          => $past,
   ]);
 `));
@@ -216,6 +275,124 @@ if (stillThere) {
   ok(err.trim() !== '', `★ 旧卡换过之后就认不出了：「${err.trim()}」`);
 }
 
+// ── ⑤ 在用但快到期：每次扫都提醒，可跳过 ──────────────
+console.log('\n【⑤ 到期前的反复提醒】');
+await page.evaluate(() => openMemberModal('manual'));
+await page.waitForSelector('#member-modal:not([hidden])');
+
+await lookup(fixture.warnCard);
+msg = await waitDialog();
+ok(/还有 \d+ 天到期/.test(msg), `在用的卡快到期时会主动提醒：「${msg.split('\n')[0]}」`);
+ok(await page.locator('.ui-cancel').textContent() === '稍后再说',
+   '★ 默认给的是「稍后再说」—— 不换也不该拖慢收银台');
+ok(await page.locator('.ui-ok').textContent() === '现在换卡', '要换的话按钮就在这儿');
+ok(/不影响这次消费/.test(msg), '明说不换也不耽误这一单');
+
+await clickCancel();
+await page.waitForTimeout(300);
+ok(await page.locator('#btn-use-member').isVisible(),
+   '★ 点「稍后再说」之后这张卡照常能用（会员结果还在，能直接选用）');
+
+// 关键：再扫一次还要再提醒 —— 系统不替他们记「已读」
+await lookup(fixture.warnCard);
+msg = await waitDialog();
+ok(/还有 \d+ 天到期/.test(msg),
+   '★★ 再扫一次【还是】会提醒 —— 忙过去了、新卡到了，下次就该换了');
+await clickCancel();
+await page.waitForTimeout(300);
+
+// 这次真换
+await lookup(fixture.warnCard);
+await waitDialog();
+await clickOk();
+msg = await waitDialog();
+ok(/新卡/.test(msg), '点「现在换卡」进的是同一套换卡流程');
+await page.fill('.ui-ask-input', fixture.warnFresh);
+t = '';
+await Promise.all([waitFreshToast(/已换发/).then(v => { t = v; }).catch(() => {}), clickOk()]);
+ok(/已换发/.test(t), `★ 提前换卡成功：「${String(t).trim()}」`);
+
+await page.waitForSelector('#member-modal', { state: 'hidden', timeout: 5000 });
+const warnAfter = JSON.parse(php(`
+  require "app/bootstrap.php";
+  $c = require "app/config/config.php";
+  $a = new Vip\\App($c);
+  $m = $a->members()->findById(${fixture.warnMemberId});
+  echo json_encode(['card' => $m['card_no']]);
+`));
+ok(warnAfter.card === fixture.warnFresh.replace(/-/g, ''), '会员行已指向新卡');
+
+// ── ⑥ 超出宽限期：普通账号换不了，必须经理 ──────────────
+console.log('\n【⑥ 超出宽限期】');
+await page.evaluate(() => openMemberModal('manual'));
+await page.waitForSelector('#member-modal:not([hidden])');
+await lookup(fixture.overCard);
+msg = await waitDialog();
+ok(/已于 .* 过期/.test(msg), '超期卡照样认得出来');
+await clickOk();                       // 换发新卡
+await waitDialog();                    // 输入新卡号
+await page.fill('.ui-ask-input', fixture.overFresh);
+await clickOk();
+msg = await waitDialog();
+ok(/超过 \d+ 个月的宽限期/.test(msg),
+   `★ 超出宽限期时拦下来并说清原因：「${msg.split('\n')[0]}」`);
+ok(msg.includes(fixture.longAgo), '把过期日期一并说出来');
+ok(await page.locator('.ui-cancel').textContent() === '按规则拒绝',
+   '★ 取消按钮写的是「按规则拒绝」—— 让经理明白这一按是什么意思');
+
+await clickCancel();
+await page.waitForTimeout(400);
+err = await page.locator('#member-err').textContent();
+ok(/已按规则失效/.test(err), `拒绝后留一句话：「${err.trim()}」`);
+
+const overMid = JSON.parse(php(`
+  require "app/bootstrap.php";
+  $c = require "app/config/config.php";
+  $a = new Vip\\App($c);
+  $m = $a->members()->findById(${fixture.overMemberId});
+  echo json_encode(['card' => $m['card_no']]);
+`));
+ok(overMid.card === fixture.overCard.replace(/-/g, ''),
+   '★ 被拒之后旧卡没被动过（不能拒了还把卡作废）');
+
+// 走一遍强制换发
+await lookup(fixture.overCard);
+await waitDialog();
+await clickOk();
+await waitDialog();
+await page.fill('.ui-ask-input', fixture.overFresh);
+await clickOk();
+await waitDialog();
+ok(await page.locator('.ui-ok').evaluate(el => el.classList.contains('ui-danger')),
+   '强制换发是危险操作，红色按钮');
+await clickOk();
+msg = await waitDialog();
+ok(/原因/.test(msg), '★ 必须填原因才能强制换发');
+ok((await page.locator('.ui-ask-input').inputValue()).length > 0, '给了一句默认原因，省得现打字');
+
+// 空原因不该放行
+await page.fill('.ui-ask-input', '   ');
+await clickOk();
+await page.waitForTimeout(300);
+ok(await page.locator('.ui-ask').evaluate(el => !el.hidden), '★ 原因填空白时弹层不关');
+
+await page.fill('.ui-ask-input', '老客户，经理同意保留积分');
+t = '';
+await Promise.all([waitFreshToast(/已强制换发/).then(v => { t = v; }).catch(() => {}), clickOk()]);
+ok(/已强制换发/.test(t) && /积分已保留/.test(t), `★ 经理强制换发成功：「${String(t).trim()}」`);
+
+const forced = JSON.parse(php(`
+  require "app/bootstrap.php";
+  $c = require "app/config/config.php";
+  $a = new Vip\\App($c);
+  $m = $a->members()->findById(${fixture.overMemberId});
+  $l = $a->localDb()->one('SELECT detail FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+        [$c['store_code'], 'card_replace_forced']);
+  echo json_encode(['card' => $m['card_no'], 'detail' => (string)($l['detail'] ?? '')]);
+`));
+ok(forced.card === fixture.overFresh.replace(/-/g, ''), '会员行指向新卡');
+ok(forced.detail.includes('经理同意保留'), '★ 原因记进了 card_replace_forced 审计事件');
+
 console.log('\n【JS 错误】');
 ok(errs.length === 0, errs.length ? '有报错：' + errs.join(' | ') : '无 JS 报错');
 
@@ -226,9 +403,13 @@ php(`
   require "app/bootstrap.php";
   $c = require "app/config/config.php";
   $a = new Vip\\App($c);
-  $a->localDb()->exec('DELETE FROM point_ledger WHERE member_id = ?', [${fixture.memberId}]);
+  foreach ([${fixture.memberId}, ${fixture.warnMemberId}, ${fixture.overMemberId}] as $id) {
+    $a->localDb()->exec('DELETE FROM point_ledger WHERE member_id = ?', [$id]);
+  }
   $a->localDb()->exec('DELETE FROM card WHERE batch_no LIKE ?', ['${TAG}%']);
-  $a->localDb()->exec('DELETE FROM member WHERE id = ?', [${fixture.memberId}]);
+  foreach ([${fixture.memberId}, ${fixture.warnMemberId}, ${fixture.overMemberId}] as $id) {
+    $a->localDb()->exec('DELETE FROM member WHERE id = ?', [$id]);
+  }
 `);
 
 console.log(`\n${'─'.repeat(50)}\n${fail === 0 ? '全部通过' : '失败 ' + fail}  ${pass + fail} 项\n`);

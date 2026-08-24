@@ -156,7 +156,7 @@ final class App
     {
         return $this->once('cardService', fn() => new CardService(
             $this->localDb(), $this->cards(), $this->members(),
-            $this->cardNumber(), $this->audit(), $this->storeCode()
+            $this->cardNumber(), $this->audit(), $this->storeCode(), $this->cfg()
         ));
     }
 

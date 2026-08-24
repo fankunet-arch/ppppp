@@ -82,6 +82,9 @@ $padSettings = static function () use ($app): array {
     return [
         // 关闭时 Pad 完全不显示手机号/邮箱/生日输入框，后端也拒收
         'collect_pii' => $app->cfg()->bool('member_collect_pii', false),
+        // 有效期相关的两个阈值，Pad 拿它决定什么时候提醒换卡
+        'expiring_soon_days' => $app->cardService()->expiringSoonDays(),
+        'grace_months'       => $app->cardService()->graceMonths(),
     ];
 };
 
@@ -414,8 +417,23 @@ $api->on('POST', '/card/replace', static function () use ($app, $requireOperator
         Api::fail('bad_request', 400, ['hint' => '需要会员与新卡号']);
     }
 
-    $r = $app->cardService()->replaceCard($mid, $newNo, $reason, $op);
+    /**
+     * 超过宽限期的卡，前台换不了 —— 经理带原因才放行。
+     * 客户端只有在拿到 grace_over 之后才该带这个字段上来。
+     */
+    $force    = Api::str($b, 'force_reason', '') ?: '';
+    $override = trim($force) === '' ? null : ['reason' => $force];
+
+    $r = $app->cardService()->replaceCard($mid, $newNo, $reason, $op, $override);
     if (!$r['ok']) {
+        // grace_over 不是「出错了」，是「这一步需要经理」——
+        // 把判定依据一并带回，Pad 才能把话说清楚
+        if (($r['error'] ?? '') === 'grace_over') {
+            Api::fail('grace_over', 409, [
+                'old_valid_to' => $r['old_valid_to'] ?? null,
+                'grace_months' => $r['grace_months'] ?? null,
+            ]);
+        }
         Api::fail((string)$r['error'], 400);
     }
 
@@ -423,6 +441,7 @@ $api->on('POST', '/card/replace', static function () use ($app, $requireOperator
     Api::ok([
         'card_no'  => $app->cardNumber()->format((string)$r['card']['card_no']),
         'valid_to' => $r['card']['valid_to'],
+        'forced'   => (bool)($r['forced'] ?? false),
         'member'   => $m === null ? null : [
             'id'             => (int)$m['id'],
             'card_no'        => $app->cardNumber()->format((string)$m['card_no']),

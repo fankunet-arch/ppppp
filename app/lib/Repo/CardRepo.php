@@ -23,8 +23,16 @@ final class CardRepo
     public const STATUS_ACTIVE  = 1;   // 已激活，绑定会员
     public const STATUS_VOID    = 2;   // 已作废/挂失
 
-    /** 过期后仍可到店换卡结转的宽限期。不印在卡上 —— 实际比承诺的宽松只有好处 */
+    /**
+     * 过期后仍可到店换卡结转的宽限期（月）。不印在卡上 ——
+     * 实际比承诺的宽松只有好处。
+     *
+     * 这是**兜底默认值**，真正生效的是 sys_config.card_grace_months。
+     */
     public const GRACE_MONTHS = 6;
+
+    /** 提前提醒换卡的默认天数。真正生效的是 sys_config.card_expiring_soon_days */
+    public const EXPIRING_SOON_DAYS = 30;
 
     /** 卡背 PIN 位数。纯数字：好印、好念，客人报的时候没有字母歧义 */
     public const PIN_LEN = 6;
@@ -213,15 +221,23 @@ final class CardRepo
         return (int)$a->diff($b)->format('%r%a');
     }
 
-    /** 过期且已超过宽限期 —— 到这一步积分才真正清零 */
-    public static function graceOver(array $card, ?string $today = null): bool
+    /**
+     * 过期且已超过宽限期 —— 前台到这一步就换不了卡了，得经理强制换发。
+     *
+     * ★ $graceMonths 是【必填】的，故意不给默认值。
+     *   宽限期是后台可调的（sys_config.card_grace_months），
+     *   给个默认值就等于允许调用方悄悄绕过后台设置 ——
+     *   那样后台改了数字而现场行为不变，是最难查的一类 bug。
+     *   要拿这个值请走 CardService，它会从配置里读。
+     */
+    public static function graceOver(array $card, int $graceMonths, ?string $today = null): bool
     {
         $v = $card['valid_to'] ?? null;
         if ($v === null) {
             return false;
         }
         $cut = (new \DateTimeImmutable((string)$v))
-            ->modify('+' . self::GRACE_MONTHS . ' months')->format('Y-m-d');
+            ->modify('+' . $graceMonths . ' months')->format('Y-m-d');
         return ($today ?? date('Y-m-d')) > $cut;
     }
 

@@ -106,6 +106,13 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- CUPON DE 5 EUROS（满50减5 纸质券）/ Dto% / Dto. -15% 都是普通折扣，绝不能误判。
   -- 名称会随店家调整而变（Dto. -20% 已被 Dto. -15% 取代），所以做成可配置。
 
+-- ── 实体卡有效期 ──────────────────────────────────────────
+,(@store,'card_expiring_soon_days','30',@now)
+  -- 卡剩多少天到期时开始提醒收银员换卡。发卡时也用这个天数拦一道。
+,(@store,'card_grace_months','6',@now)
+  -- 过期后还能换卡结转积分的窗口。超过之后前台换不了，需经理强制换发。
+  -- ⚠️ 宽限期内卡本身【不能用】—— 不能积分、不能兑换，只能换卡。
+
 ON DUPLICATE KEY UPDATE
   `config_value` = VALUES(`config_value`),
   `updated_at`   = VALUES(`updated_at`);

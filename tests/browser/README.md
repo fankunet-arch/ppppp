@@ -82,13 +82,11 @@ node /path/to/repo/tests/browser/back.mjs
 另外验**扫码不支持时的降级** —— 无头 Chromium 没有 `BarcodeDetector`，
 正好用来确认这种情况下引导手工输入而不是弹一个空取景框卡住。
 
-### `padexpiry.mjs` —— 有效期与换卡（33 项）
+### `padexpiry.mjs` —— 有效期与换卡（55 项）
 
-自己造四张卡：一张快到期的库存卡、一张过期的库存卡、
-一张绑着会员且已过期的卡（会员身上有 88 分 / 4 次），外加一张换发用的新卡。
-跑完把卡、会员、流水全删干净。
+自己造八张卡、三名会员，跑完把卡、会员、流水全删干净。
 
-服务端那一段在 `smoke.php` ⑰ 已经验过，这里验的是**界面把它串起来对不对**：
+服务端那几段在 `smoke.php` ⑰ 已经验过，这里验的是**界面把它串起来对不对**：
 
 - 剩 ≤30 天的库存卡，发之前会拦一次；点「换一张」要真的把
   `S.pendingCard` 清掉（残留会把这张快到期的卡绑出去）
@@ -97,6 +95,17 @@ node /path/to/repo/tests/browser/back.mjs
   让他接着扫，不用从头再来
 - 换完直接选上这位会员并关闭弹层，且积分一分不少
 - 旧卡换过之后就认不出了，不能再换第二次
+
+另外守着两条容易做错的规则：
+
+**① 到期前的提醒必须是「每次都提醒」。** 测试会连扫两次同一张快到期的卡，
+断言第二次**仍然**弹提示。做成「提醒过一次就记下不再问」看着更清爽，
+但收银员当时跳过的理由（忙、新卡没到、客人不想换）下次根本不成立 ——
+一旦记了「已读」，最后一次提醒之后就再没人提，卡直接过期。
+
+**② 超出宽限期必须经理才能换。** 验的是拦得住、话说得清（带上过期日期
+与宽限期月数）、被拒之后**旧卡没被动过**、原因空白不放行，
+以及成功后记的是 `card_replace_forced` 这个单独的审计动作。
 
 ### `cards.mjs` —— 后台发卡（29 项）
 
@@ -175,3 +184,34 @@ await page.waitForSelector('#member-modal[hidden]');                // ❌ 必�
 
 `point_ledger` 里没有 `business_date` 列（写这条 INSERT 时想当然加了，
 直接抛异常）。落库前先照着 `db/migrations/001_init.sql` 核一遍列名。
+
+### 5. PHP 从 stdin 喂进去时，致命错误【一个字都不打】
+
+`padexpiry.mjs` 用管道给 PHP 喂造数脚本（省得跟 `php -r` 的引号地狱较劲）。
+这么跑的时候，PHP 的 fatal **stdout、stderr 全空**，只留一个 255 退出码 ——
+`-d display_errors=stderr` 也救不回来。于是造数一失败就完全没有线索。
+
+解法是自己挂一个 shutdown 钩子，把 `error_get_last()` 打到 stderr：
+
+```js
+const probe = 'register_shutdown_function(function () {'
+  + ' $e = error_get_last();'
+  + ' if ($e !== null && ($e["type"] & (E_ERROR | E_PARSE | E_COMPILE_ERROR)) !== 0) {'
+  + '   fwrite(STDERR, $e["message"] . " @ " . $e["file"] . ":" . $e["line"]);'
+  + ' }});';
+execSync('php', { input: '<?php ' + probe + code, ... });
+```
+
+真栽过：造数里一句 `generateBatch` 撞了重复批次号，
+界面上只有「Command failed: php」六个字，查了半天。
+
+### 6. 模板字面量里的 PHP 命名空间要写双反斜杠
+
+造数脚本嵌在 JS 的模板字面量里，`\C` 这种未知转义会被 JS **吃掉反斜杠**：
+
+```js
+php(`... Vip\CardNumber::normalize($x)  ...`)    // ❌ 变成 VipCardNumber
+php(`... Vip\\CardNumber::normalize($x) ...`)   // ✅
+```
+
+报错是 `Class "VipCardNumber" not found`，看着莫名其妙 —— 记住这一条就够了。

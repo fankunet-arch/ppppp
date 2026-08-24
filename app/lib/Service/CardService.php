@@ -7,6 +7,7 @@ use Vip\CardNumber;
 use Vip\LocalDb;
 use Vip\Repo\AuditRepo;
 use Vip\Repo\CardRepo;
+use Vip\Repo\ConfigRepo;
 use Vip\Repo\MemberRepo;
 
 /**
@@ -29,7 +30,23 @@ final class CardService
         private CardNumber $cardNo,
         private AuditRepo $audit,
         private string $storeCode,
+        private ConfigRepo $cfg,
     ) {
+    }
+
+    /** 过期后还能换卡的宽限期（月），后台可调 */
+    public function graceMonths(): int
+    {
+        $v = $this->cfg->int('card_grace_months', CardRepo::GRACE_MONTHS);
+        // 0 是有意义的（过期即不能换），负数不是
+        return $v < 0 ? CardRepo::GRACE_MONTHS : $v;
+    }
+
+    /** 提前多少天开始提醒换卡，后台可调 */
+    public function expiringSoonDays(): int
+    {
+        $v = $this->cfg->int('card_expiring_soon_days', CardRepo::EXPIRING_SOON_DAYS);
+        return $v < 0 ? CardRepo::EXPIRING_SOON_DAYS : $v;
     }
 
     /**
@@ -75,7 +92,7 @@ final class CardService
             return [
                 'ok' => false, 'state' => 'expired', 'error' => 'card_expired',
                 'card' => $card, 'member' => $member,
-                'grace_over' => CardRepo::graceOver($card),
+                'grace_over' => CardRepo::graceOver($card, $this->graceMonths()),
             ];
         }
 
@@ -173,14 +190,20 @@ final class CardService
      *
      * @return array{ok:bool, error?:string, card?:array}
      */
-    public function replaceCard(int $memberId, string $newRaw, string $reason, array $operator): array
-    {
+    public function replaceCard(
+        int $memberId,
+        string $newRaw,
+        string $reason,
+        array $operator,
+        ?array $override = null,
+    ): array {
         $n = CardNumber::normalize($newRaw);
         if (!$this->cardNo->isWellFormed($n)) {
             return ['ok' => false, 'error' => 'card_malformed'];
         }
+        $grace = $this->graceMonths();
 
-        return $this->db->transaction(function () use ($memberId, $n, $reason, $operator): array {
+        return $this->db->transaction(function () use ($memberId, $n, $reason, $operator, $override, $grace): array {
             $member = $this->members->findById($memberId);
             if ($member === null) {
                 return ['ok' => false, 'error' => 'member_not_found'];
@@ -200,6 +223,31 @@ final class CardService
             }
 
             $old = $this->cards->findByMemberId($memberId);
+
+            /**
+             * 超过宽限期 —— 前台换不了，必须经理填原因强制换发。
+             *
+             * 为什么不干脆一刀拒绝：柜台当面回绝客人，正是投诉的来源。
+             * 给经理留一个带原因、带留痕的口子，既守住了规则（普通收银员
+             * 破不了例），又让店里能按具体情况处理，事后还查得到是谁放的行。
+             * 与「经理强制核销」是同一套做法。
+             */
+            $forced = false;
+            if ($old !== null && CardRepo::graceOver($old, $grace)) {
+                if ($override === null) {
+                    return ['ok' => false, 'error' => 'grace_over',
+                            'old_valid_to' => $old['valid_to'],
+                            'grace_months' => $grace];
+                }
+                if ((int)($operator['role'] ?? 0) < 2) {
+                    return ['ok' => false, 'error' => 'forbidden'];
+                }
+                if (trim((string)($override['reason'] ?? '')) === '') {
+                    return ['ok' => false, 'error' => 'reason_required'];
+                }
+                $forced = true;
+            }
+
             if ($old !== null) {
                 // 必须先解绑再绑新的，顺序反了会撞唯一键
                 $this->cards->void((int)$old['id'], $reason);
@@ -209,7 +257,8 @@ final class CardService
                 isset($operator['id']) ? (int)$operator['id'] : null);
             $this->members->updateCardNo($memberId, $n);
 
-            $this->audit->log('card_replace', [
+            // 强制换发单独记一个动作，后台「审计」页按它就能筛出全部破例
+            $this->audit->log($forced ? 'card_replace_forced' : 'card_replace', [
                 'target_type' => 'card', 'target_id' => $n,
                 'operator_id' => $operator['id'] ?? null,
                 'operator_name' => $operator['name'] ?? null,
@@ -220,10 +269,15 @@ final class CardService
                     'old_valid_to'=> $old['valid_to'] ?? null,
                     'new_valid_to'=> $newCard['valid_to'] ?? null,
                     'reason'      => $reason,
-                ],
+                ] + ($forced ? [
+                    'forced'        => true,
+                    'grace_months'  => $grace,
+                    'forced_reason' => (string)$override['reason'],
+                ] : []),
             ]);
 
-            return ['ok' => true, 'card' => $this->cards->findByCardNo($n)];
+            return ['ok' => true, 'card' => $this->cards->findByCardNo($n),
+                    'forced' => $forced];
         });
     }
 }

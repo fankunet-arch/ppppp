@@ -813,7 +813,7 @@ async function doCardLookup(value) {
 
     if (d.state === 'active') {
       const m = d.member;
-      const soon = d.days_left !== null && d.days_left <= EXPIRING_SOON_DAYS;
+      const soon = d.days_left !== null && d.days_left <= expiringSoonDays();
       $('#member-result').innerHTML = `
         <div class="found"><b>${escapeHtml(m.card_no)}</b>
           <div class="muted small">${m.points_balance} 分 · 已消费 ${m.visit_count} 次${
@@ -822,6 +822,18 @@ async function doCardLookup(value) {
           ${m.points_frozen ? '<div class="frozen">该会员尚未完成确认，积分照常入账但暂不可兑换</div>' : ''}
           <button class="primary" id="btn-use-member" style="margin-top:10px">选用</button></div>`;
       $('#btn-use-member').onclick = () => useMember(m);
+
+      /**
+       * 快到期：每次扫到都问一遍，直到换了卡或者卡真的过期。
+       *
+       * 故意做成「每次都问」而不是「提醒一次就记下不再问」——
+       * 当时忙不过来、新卡还没到、客人不想换，都是常态，
+       * 而这些理由下次就不成立了。系统不替他们记「已读」，
+       * 因为一旦记了，最后一次提醒之后就再没人提，卡直接过期。
+       *
+       * 但它只是提醒：点「稍后再说」照常用卡，什么都不耽误。
+       */
+      if (soon) { offerRenewSoon(d, m); }
       return;
     }
 
@@ -831,7 +843,7 @@ async function doCardLookup(value) {
      * 但先看它还能用多久：快到期的卡发出去，客人拿回家没多久就得再跑一趟。
      * 阈值 30 天，超过就直接放行不打扰。
      */
-    if (d.days_left !== null && d.days_left <= EXPIRING_SOON_DAYS) {
+    if (d.days_left !== null && d.days_left <= expiringSoonDays()) {
       const go = await UI.confirm(
         `这张卡只剩 ${d.days_left} 天就到期了（${d.valid_to}）。\n\n` +
         `发给客人的话，他很快就得回来换卡。\n` +
@@ -893,8 +905,20 @@ $('#btn-member-create').onclick = async () => {
   } catch (e) { showErr('#member-err', e.message); }
 };
 
-/** 剩多少天算「快到期」。发卡与用卡两处都按它提醒 */
-const EXPIRING_SOON_DAYS = 30;
+/**
+ * 剩多少天算「快到期」—— 后台可调（配置 → 实体卡有效期）。
+ * 发卡与用卡两处都按它提醒。登录/恢复会话时随 settings 一起下发。
+ */
+function expiringSoonDays() {
+  const v = S.settings && S.settings.expiring_soon_days;
+  return typeof v === 'number' && v >= 0 ? v : 30;
+}
+
+/** 过期后还能换卡的宽限期（月），后台可调。只用于把话说清楚，判定在服务端 */
+function graceMonths() {
+  const v = S.settings && S.settings.grace_months;
+  return typeof v === 'number' && v >= 0 ? v : 6;
+}
 
 /**
  * 过期卡的处理 —— 引导换发新卡，积分结转。
@@ -922,20 +946,49 @@ async function handleExpiredCard(d) {
     return;
   }
 
+  await runReplaceLoop(d.member.id, `原卡 ${d.card_no} 于 ${d.valid_to} 到期`,
+    () => showErr('#member-err', `此卡已于 ${d.valid_to} 过期，可随时到店换发新卡`));
+}
+
+/**
+ * 快到期的卡：提醒收银员现在就能换。
+ *
+ * 与过期卡的区别是「不换也没关系」—— 所以默认按钮是「稍后再说」，
+ * 不要做成必须处理掉才能继续，那会拖慢收银台。
+ */
+async function offerRenewSoon(d, m) {
+  const go = await UI.confirm(
+    `这张卡还有 ${d.days_left} 天到期（${d.valid_to}）。\n\n` +
+    `${m.points_balance} 分 · 已消费 ${m.visit_count} 次\n\n` +
+    `现在就可以为客人换一张新卡，积分与未用的券会全部转过去。\n` +
+    `不换也不影响这次消费，下次扫到还会再提醒。`,
+    { okText: '现在换卡', cancelText: '稍后再说' }
+  );
+  if (!go) return;
+
+  await runReplaceLoop(m.id, `原卡 ${d.card_no} 将于 ${d.valid_to} 到期，提前换发`, null);
+}
+
+/**
+ * 换卡的输入循环 —— 过期换卡与提前换卡共用。
+ *
+ * 扫错一张不该让人从头再来，所以出错时输入框留着继续扫；
+ * 只有「不是卡的问题」才退出。
+ *
+ * @param onGiveUp 取消时的收尾（过期卡要留一句话，提前换卡则什么都不用做）
+ */
+async function runReplaceLoop(memberId, reason, onGiveUp) {
   for (;;) {
     const raw = await UI.input(
       '请扫描或输入要发给客人的【新卡】卡号',
       { okText: '换发', cancelText: '取消' }
     );
     if (raw === null) {
-      showErr('#member-err', `此卡已于 ${d.valid_to} 过期，可随时到店换发新卡`);
+      if (onGiveUp) { onGiveUp(); }
       return;
     }
     try {
-      const r = await api('/card/replace', {
-        member_id: d.member.id, card_no: raw,
-        reason: `原卡 ${d.card_no} 于 ${d.valid_to} 到期`,
-      });
+      const r = await api('/card/replace', { member_id: memberId, card_no: raw, reason });
       toast(`已换发 ${r.card_no}，积分已转移`, 'ok');
       resetLookupState();
       $('#member-input').value = '';
@@ -943,6 +996,11 @@ async function handleExpiredCard(d) {
       if (r.member) { useMember(r.member); }
       return;
     } catch (e) {
+      // 超过宽限期 —— 不是卡的问题，是这一步需要经理
+      if (e.error === 'grace_over') {
+        if (await forceReplace(memberId, reason, raw, e)) { return; }
+        return;
+      }
       toast(e.message, 'err');
       // 新卡本身有问题（已被占用、也过期了…）时让他再扫一张
       if (!['card_unknown', 'card_malformed', 'card_expired', 'card_not_available'].includes(e.error)) {
@@ -950,6 +1008,56 @@ async function handleExpiredCard(d) {
       }
     }
   }
+}
+
+/**
+ * 超过宽限期的强制换发 —— 经理专属，必须填原因。
+ *
+ * 为什么不干脆一刀拒绝：柜台当面回绝客人正是投诉的来源。
+ * 留一个带原因、带留痕的口子，规则守住了（收银员破不了例），
+ * 店里也能按具体情况处理。与「经理强制核销」是同一套做法。
+ *
+ * @return 是否已经处理完（成功换发或经理主动放弃）
+ */
+async function forceReplace(memberId, reason, newCardNo, err) {
+  // api() 把服务端的 detail 原样挂在 err.detail 上（不是 data）
+  const months    = (err.detail && err.detail.grace_months) || graceMonths();
+  const expiredOn = (err.detail && err.detail.old_valid_to) || '';
+  const head = `这张卡已过期超过 ${months} 个月的宽限期`
+             + (expiredOn ? `（有效期至 ${expiredOn}）` : '') + '。';
+
+  if (!S.operator || !S.operator.is_manager) {
+    // 收银员没这个权限。把话说清楚：不是系统坏了，是要找经理
+    showErr('#member-err', `${head}积分已按规则失效，如需破例换发请找经理操作。`);
+    return true;
+  }
+
+  if (!await UI.confirm(
+    `${head}\n\n` +
+    `按规则这张卡的积分已经失效。\n` +
+    `经理可以强制换发并保留积分，此操作会单独记入审计日志。`,
+    { okText: '强制换发', cancelText: '按规则拒绝', danger: true }
+  )) {
+    showErr('#member-err', `${head}积分已按规则失效。`);
+    return true;
+  }
+
+  const why = await UI.input('强制换发原因（会记入审计日志）', {
+    value: '客人长期未到店，经理同意保留积分',
+    okText: '确认强制换发', danger: true,
+  });
+  if (why === null) return true;
+
+  try {
+    const r = await api('/card/replace', {
+      member_id: memberId, card_no: newCardNo, reason, force_reason: why,
+    });
+    toast(`已强制换发 ${r.card_no}，积分已保留`, 'ok');
+    resetLookupState();
+    $('#member-input').value = '';
+    if (r.member) { useMember(r.member); }
+  } catch (e) { toast(e.message, 'err'); }
+  return true;
 }
 
 /**

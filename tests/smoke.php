@@ -1267,9 +1267,30 @@ $fake = ['valid_to' => $past];
 ok(CardRepo::isExpired($fake), '★ 过了 valid_to 就算过期');
 ok(CardRepo::daysLeft($fake) < 0, '过期后剩余天数是负的');
 ok(!CardRepo::isExpired(['valid_to' => null]), '不设有效期的卡永不过期');
-ok(!CardRepo::graceOver(['valid_to' => $past]), '刚过期还在宽限期内');
-ok(CardRepo::graceOver(['valid_to' => date('Y-m-d', strtotime('-8 months'))]),
-   '★ 超过 ' . CardRepo::GRACE_MONTHS . ' 个月宽限才算彻底失效');
+$G = $svc->graceMonths();
+eq(CardRepo::GRACE_MONTHS, $G, '宽限期默认取到 ' . CardRepo::GRACE_MONTHS . ' 个月');
+ok(!CardRepo::graceOver(['valid_to' => $past], $G), '刚过期还在宽限期内');
+ok(CardRepo::graceOver(['valid_to' => date('Y-m-d', strtotime('-8 months'))], $G),
+   '★ 超过 ' . $G . ' 个月宽限才算彻底失效');
+
+/**
+ * 宽限期是后台可调的 —— 改了必须【当场】生效。
+ *
+ * 用同一个 $svc 验，不新建对象：真实现场就是后台改完、Pad 下一次请求就该
+ * 按新值判。ConfigRepo 有缓存，set() 里清了 —— 这条断言守的正是那一句，
+ * 漏了的话表现是「后台数字改了但行为不变」，最难查的一类。
+ */
+$app->cfg()->set('card_grace_months', '1');
+eq(1, $svc->graceMonths(), '★ 后台把宽限期改成 1 个月，服务层当场读到 1');
+ok(CardRepo::graceOver(['valid_to' => date('Y-m-d', strtotime('-3 months'))], $svc->graceMonths()),
+   '★ 按新的 1 个月判定，3 个月前过期的卡已超宽限');
+$app->cfg()->set('card_grace_months', '0');
+eq(0, $svc->graceMonths(), '0 是有意义的取值（过期即不能换），不该被兜底吃掉');
+$app->cfg()->set('card_expiring_soon_days', '45');
+eq(45, $svc->expiringSoonDays(), '提醒天数同样可调');
+$app->cfg()->set('card_grace_months', (string)CardRepo::GRACE_MONTHS);
+$app->cfg()->set('card_expiring_soon_days', (string)CardRepo::EXPIRING_SOON_DAYS);
+eq(CardRepo::GRACE_MONTHS, $svc->graceMonths(), '改回默认值');
 
 // ── 过期卡不能发给客人 ──
 $expBatch = $cards->generateBatch('SMOKEEXP', 2, $far);
@@ -1335,6 +1356,74 @@ $db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND batch_no = ?',
     [$past, SMOKE_STORE, 'SMOKEVAL']);
 $r2 = $svc->replaceCard($vMid, $expBatch[1]['card_no'], '再换', $opStub);
 ok(!$r2['ok'] && $r2['error'] === 'card_expired', '★ 不能换成另一张过期卡（换了个寂寞）');
+
+/**
+ * ── 超过宽限期：前台换不了，经理带原因才行 ──────────────
+ *
+ * 这一段守的是「宽限期真的会拦」。之前 graceOver() 写了也测了，
+ * 但没有任何一处调用它 —— 一张 2019 年过期的卡照样能换。
+ * 光测工具函数不够，必须测到 replaceCard 这一层。
+ */
+$farNew  = date('Y-m-d', strtotime('+2 years'));
+$gb      = $cards->generateBatch('SMOKEGRC', 3, $farNew);
+$bindG   = $svc->bindNewMember($gb[0]['card_no'], null, null, null, $opStub);
+ok($bindG['ok'], '再发一张卡用于宽限期测试');
+$gMid = (int)$bindG['member']['id'];
+$app->members()->applyDelta($gMid, 60, 3, 2000);
+$db->exec('INSERT INTO point_ledger
+             (store_code, member_id, entry_type, amount, points, counted_visit,
+              status, source, manual_reason, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $gMid, 6, 20.00, 60, 3, 1, 2, '测试造数', $db->now()]);
+
+// 把这张卡改成「过期很久」——超出宽限期
+$longAgo = date('Y-m-d', strtotime('-' . (CardRepo::GRACE_MONTHS + 3) . ' months'));
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND card_no = ?',
+    [$longAgo, SMOKE_STORE, CardNumber::normalize($gb[0]['card_no'])]);
+
+$lk = $svc->lookup($gb[0]['card_no']);
+eq('expired', $lk['state'], '超期卡仍然认得出是 expired');
+ok($lk['grace_over'] === true, '★ lookup 会告诉前端「已超宽限期」');
+
+$clerk   = ['id' => 1, 'name' => '收银员', 'role' => 1, 'device' => 'SMOKE'];
+$manager = ['id' => 2, 'name' => '经理',   'role' => 2, 'device' => 'SMOKE'];
+
+$g1 = $svc->replaceCard($gMid, $gb[1]['card_no'], '超期换卡', $clerk);
+ok(!$g1['ok'] && $g1['error'] === 'grace_over', '★ 超过宽限期：普通换卡被拒');
+eq($longAgo, $g1['old_valid_to'], '拒绝时带回判定依据（哪天过期的）');
+eq(CardRepo::GRACE_MONTHS, $g1['grace_months'], '也带回当前宽限期，前端才能把话说清楚');
+eq(CardNumber::normalize($gb[0]['card_no']),
+   $app->members()->findById($gMid)['card_no'], '被拒时旧卡没被动过');
+
+$g2 = $svc->replaceCard($gMid, $gb[1]['card_no'], '超期换卡', $clerk, ['reason' => '客人坚持']);
+ok(!$g2['ok'] && $g2['error'] === 'forbidden', '★ 收银员就算带了原因也破不了例');
+
+$g3 = $svc->replaceCard($gMid, $gb[1]['card_no'], '超期换卡', $manager, ['reason' => '  ']);
+ok(!$g3['ok'] && $g3['error'] === 'reason_required', '★ 经理也必须填原因，空白不算');
+
+$g4 = $svc->replaceCard($gMid, $gb[1]['card_no'], '超期换卡', $manager,
+    ['reason' => '老客户，经理同意保留']);
+ok($g4['ok'] && ($g4['forced'] ?? false) === true, '★ 经理带原因可强制换发');
+
+$afterG = $app->members()->findById($gMid);
+eq(60, (int)$afterG['points_balance'], '★ 强制换发后积分照样保留');
+eq(CardNumber::normalize($gb[1]['card_no']), $afterG['card_no'], '会员行指向新卡');
+
+$flog = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'card_replace_forced']);
+ok($flog !== null, '★ 强制换发记的是单独的 card_replace_forced 事件（后台能筛出全部破例）');
+ok(str_contains((string)$flog['detail'], '经理同意保留'), '原因写进了审计明细');
+ok(str_contains((string)$flog['detail'], 'grace_months'), '当时的宽限期设置也一并留档');
+
+// 宽限期【之内】不需要经理 —— 别把正常换卡也拦了
+$bindH = $svc->bindNewMember($gb[2]['card_no'], null, null, null, $opStub);
+$hMid  = (int)$bindH['member']['id'];
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND card_no = ?',
+    [$past, SMOKE_STORE, CardNumber::normalize($gb[2]['card_no'])]);
+$hb = $cards->generateBatch('SMOKEGR2', 1, $farNew);
+$g5 = $svc->replaceCard($hMid, $hb[0]['card_no'], '刚过期换卡', $clerk);
+ok($g5['ok'] && ($g5['forced'] ?? false) === false,
+   '★ 还在宽限期内的卡，普通收银员照样能换，不用惊动经理');
 
 step('⑬ 不变量总校验');
 
