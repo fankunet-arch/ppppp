@@ -193,11 +193,37 @@ function enterMain(op, settings) {
   if (op.lang) { I18N.set(op.lang, { remember: false }); }
   applySettings();
   renderLangSwitch();
-  $('#op-name').textContent = op.name + (op.is_manager ? T('top.manager') : '');
+  renderOpName();
   $('#view-login').classList.remove('active');
   $('#view-main').classList.add('active');
   resetFlow();
-  checkHealth();
+  /**
+   * 带参数的那几处文字是 JS 填的（「放宽到 N 分钟再找」「查找最近 N 分钟…」），
+   * 登录后必须先填一次 —— 漏了的话那个按钮上一个字都没有，
+   * 界面上看起来就是「按钮不见了」。
+   *
+   * refreshDynamicText 里已经带了 checkHealth，不要再单独调一次。
+   */
+  refreshDynamicText();
+}
+
+/**
+ * 顶栏那个人名。
+ *
+ * 名字本身也要跟着语言走 —— 否则会出现「系统管理员 (encargado)」
+ * 这种中西混排。两个名字在登录时一并下发（op.names），
+ * 所以切语言时就地换掉即可，不用再请求一次服务器。
+ *
+ * 老账号可能没填西语名，服务端已经在 names 里回落成中文名了，
+ * 这里不需要再判一次。
+ */
+function renderOpName() {
+  const el = $('#op-name');
+  if (!el) return;
+  const op = S.operator;
+  if (!op) { el.textContent = ''; return; }
+  const name = (op.names && op.names[I18N.lang]) || op.name || '';
+  el.textContent = name + (op.is_manager ? T('top.manager') : '');
 }
 
 /**
@@ -241,9 +267,7 @@ async function switchLang(lang, persist) {
 function refreshDynamicText() {
   $('#table-hint').textContent = T('lookup.tableHint', { min: S.window || 30 });
   $('#btn-widen').textContent  = T('lookup.widen', { min: S.widenTo || 60 });
-  if (S.operator) {
-    $('#op-name').textContent = S.operator.name + (S.operator.is_manager ? T('top.manager') : '');
-  }
+  renderOpName();
   if (S.orders && S.orders.length) { renderOrders(S.orders); }
   if (S.order) {
     renderSummary(S.order);
@@ -423,8 +447,10 @@ async function locate(windowMinutes) {
   if (!table) return showErr('#locate-err', T('lookup.needTable'));
   try {
     const d = await api('/order/locate', { table_name: table, window_minutes: windowMinutes || 0 });
-    $('#win-label').textContent = d.window;
-    $('#fallback-label').textContent = d.fallback_window;
+    S.window  = d.window;
+    S.widenTo = d.fallback_window;
+    $('#table-hint').textContent = T('lookup.tableHint', { min: d.window });
+    $('#btn-widen').textContent  = T('lookup.widen', { min: d.fallback_window });
     if (!d.candidates.length) {
       showErr('#locate-err', T('lookup.noneInWindow', { min: d.window, table }));
       $('#locate-fallback').hidden = false;
@@ -440,7 +466,7 @@ async function locate(windowMinutes) {
 }
 $('#btn-locate').onclick = () => locate(0);
 $('#table-input').addEventListener('keydown', e => { if (e.key === 'Enter') locate(0); });
-$('#btn-widen').onclick = () => locate(parseInt($('#fallback-label').textContent, 10) || 60);
+$('#btn-widen').onclick = () => locate(S.widenTo || 60);
 $('#btn-manual').onclick = () => { openManual(); };
 
 /**
@@ -1302,16 +1328,25 @@ function stopScan() {
 
 $('#btn-scan-cancel').onclick = stopScan;
 
-$('#btn-scan').onclick = async () => {
-  showErr('#member-err', '');
+/**
+ * 打开取景框扫码。
+ *
+ * 两处在用：会员弹层里的「扫卡」，和「查一张卡」里的「扫卡」。
+ * 所以把目标参数化 —— 扫到之后往哪个输入框写、报错往哪儿显示、
+ * 拿到码之后做什么，都由调用方给。
+ *
+ * 不支持扫码时【不硬撑】：直接引导手工输入（卡面本来就印着人可读号码），
+ * 而不是弹一个空取景框卡在那里。
+ */
+async function launchScan(errSel, onCode) {
+  showErr(errSel, '');
   showErr('#scan-err', '');
 
   if (typeof window.BarcodeDetector !== 'function') {
-    return showErr('#member-err',
-      T('scan.unsupported'));
+    return showErr(errSel, T('scan.unsupported'));
   }
   if (!window.SushiVIP || !SushiVIP.cameraSupported()) {
-    return showErr('#member-err',
+    return showErr(errSel,
       window.isSecureContext === false
         ? T('scan.needHttps')
       : T('scan.noCamera'));
@@ -1329,7 +1364,7 @@ $('#btn-scan').onclick = async () => {
     $('#scan-msg').textContent = T('scan.aim');
   } catch (e) {
     stopScan();
-    return showErr('#member-err', T('scan.failed', { err: (e && e.message ? e.message : e) }));
+    return showErr(errSel, T('scan.failed', { err: (e && e.message ? e.message : e) }));
   }
 
   const det = new BarcodeDetector({ formats: ['qr_code'] });
@@ -1340,15 +1375,117 @@ $('#btn-scan').onclick = async () => {
       if (codes && codes.length) {
         const raw = String(codes[0].rawValue || '').trim();
         stopScan();
-        $('#member-input').value = raw;
-        // 扫到什么就查什么，交给服务端判断是不是本店的卡
-        return doCardLookup(raw);
+        // 扫到什么就交给调用方，是不是本店的卡由服务端判断
+        return onCode(raw);
       }
     } catch (e) { /* 单帧识别失败无所谓，下一帧继续 */ }
     scanTimer = setTimeout(tick, 200);
   };
   tick();
-};
+}
+
+$('#btn-scan').onclick = () => launchScan('#member-err', (raw) => {
+  $('#member-input').value = raw;
+  return doCardLookup(raw);
+});
+
+/* ── 查一张卡：客人当面问「我这卡还能用吗」 ──────────
+ *
+ * 后台也有同样的功能，两个都留：客人问的是【服务员】，
+ * 让服务员转告经理再回话，既麻烦又没必要；而经理仍然需要在后台查
+ * （对账、处理投诉、看作废原因）。
+ *
+ * 这里只读：不写库、不留痕、不要卡背 PIN。
+ * 防线加在会掉钱的地方（核销），不是加在所有地方。
+ */
+function openAskCard() {
+  $('#ask-input').value = '';
+  $('#ask-result').innerHTML = '';
+  showErr('#ask-err', '');
+  $('#ask-modal').hidden = false;
+  UI.back.sync();
+  setTimeout(() => $('#ask-input').focus(), 50);
+}
+
+function closeAskCard() {
+  $('#ask-modal').hidden = true;
+  UI.back.sync();
+}
+
+$('#btn-ask-card').onclick   = openAskCard;
+$('#btn-ask-close').onclick  = closeAskCard;
+$('#btn-ask-go').onclick     = () => doAskCard($('#ask-input').value.trim());
+$('#ask-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { doAskCard($('#ask-input').value.trim()); }
+});
+$('#btn-ask-scan').onclick = () => launchScan('#ask-err', (raw) => {
+  $('#ask-modal').hidden = false;      // 扫码弹层盖在上面，关掉后要回到这里
+  $('#ask-input').value = raw;
+  return doAskCard(raw);
+});
+
+async function doAskCard(value) {
+  showErr('#ask-err', '');
+  $('#ask-result').innerHTML = '';
+  if (!value) { return showErr('#ask-err', T('member.needCard')); }
+
+  let d;
+  try {
+    d = await api('/card/status', { card_no: value });
+  } catch (e) {
+    return showErr('#ask-err', e.message);
+  }
+  $('#ask-result').innerHTML = askVerdict(d);
+}
+
+/**
+ * 把服务端的状态翻成一句【服务员能照着念给客人听】的话。
+ *
+ * 顺序即优先级：作废 > 过期 > 未启用 > 快到期 > 正常。
+ * 每一句都要说清「下一步该怎么办」，不能只说「不行」。
+ */
+function askVerdict(d) {
+  const m = d.member;
+  let headline, cls = 'found';
+
+  if (d.status === 2) {                                  // 已作废
+    headline = T('ask.void');
+    cls = 'frozen';
+  } else if (d.expired && !m) {
+    headline = T('ask.expiredUnused', { date: d.valid_to });
+    cls = 'frozen';
+  } else if (d.expired && d.grace_over) {
+    headline = T('ask.expiredTooLate', { date: d.valid_to });
+    cls = 'frozen';
+  } else if (d.expired) {
+    headline = T('ask.expiredCanRenew', { date: d.valid_to });
+    cls = 'frozen';
+  } else if (d.state === 'stock') {
+    headline = T('ask.notActivated');
+  } else if (d.days_left !== null && d.days_left <= expiringSoonDays()) {
+    headline = T('ask.okButSoon', { days: d.days_left });
+  } else {
+    headline = T('ask.okUse');
+  }
+
+  const lines = [];
+  if (m) {
+    lines.push(T('ask.points',  { points: m.points_balance }));
+    lines.push(T('ask.visits',  { n: m.visit_count }));
+    lines.push(m.coupons > 0 ? T('ask.coupons', { n: m.coupons }) : T('ask.noCoupons'));
+  }
+  lines.push(d.valid_to ? T('ask.validTo', { date: d.valid_to }) : T('ask.noExpiry'));
+
+  return `
+    <div class="${cls}"><b>${escapeHtml(d.card_no)}</b>
+      <div style="margin:8px 0">${escapeHtml(headline)}</div>
+      <div class="muted small">${lines.map(escapeHtml).join(' · ')}</div>
+      ${m && m.progress ? `<div class="muted small">${escapeHtml(m.progress.text || '')}</div>` : ''}
+      ${m && m.points_frozen ? `<div class="frozen">${T('member.frozen')}</div>` : ''}
+      ${d.status === 2 && d.void_reason
+          ? `<div class="muted small">${escapeHtml(T('ask.voidWhy', { reason: d.void_reason }))}</div>` : ''}
+    </div>`;
+}
 
 function useMember(m) {
   if (S.memberTarget === 'manual') {
@@ -1435,11 +1572,13 @@ UI.back.register({
   deep: () => !$('#scan-modal').hidden
             || !$('#pin-modal').hidden
             || !$('#member-modal').hidden
+            || !$('#ask-modal').hidden
             || CURRENT_STEP !== 'step-table',
   back: () => {
     // 扫码弹层排在最上面，且必须走 stopScan —— 直接隐藏会把相机留着不关
     if (!$('#scan-modal').hidden) { stopScan(); return true; }
     if (!$('#member-modal').hidden) { $('#member-modal').hidden = true; return true; }
+    if (!$('#ask-modal').hidden)    { $('#ask-modal').hidden    = true; return true; }
     if (!$('#pin-modal').hidden)    { $('#pin-modal').hidden    = true; return true; }
     const prev = STEP_BACK[CURRENT_STEP];
     if (prev) { step(prev); return true; }

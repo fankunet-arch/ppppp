@@ -475,6 +475,63 @@ $api->on('POST', '/member/create', static function () use ($app, $requireOperato
  * 这是「卡片有有效期、而积分不因此损失」这条规则的落地点：
  * 卡面印着到期日作为告知证据，客人到店换一张就什么都不损失。
  */
+/**
+ * 查一张卡现在什么状态 —— 客人当面问「我这卡还能用吗」。
+ *
+ * 后台也有一个（CP 的 /cards/lookup），两个都要留：
+ *   · 客人问的是【服务员】，让服务员转告经理再回话，既麻烦又没必要
+ *   · 经理仍然需要在后台查（对账、处理投诉、看作废原因）
+ *
+ * ★ 与后台那个的关键差别：这里【不返回手机号和邮箱】。
+ *   卡片本来就是不实名的，服务员没有任何理由看到客人的联系方式 ——
+ *   同一个道理，后台关闭「允许收集联系方式」时 Pad 上连输入框都不渲染。
+ *   查卡是为了回答「还能用吗」，不是为了翻客人的档案。
+ *
+ * 只读：不写库、不留痕、不需要卡背 PIN。防线加在会掉钱的地方（核销），
+ * 不是加在所有地方。
+ */
+$api->on('POST', '/card/status', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $raw = Api::str(Api::body(), 'card_no', '') ?: '';
+    if (trim($raw) === '') {
+        Api::fail('card_required');
+    }
+
+    $r    = $app->cardService()->lookup($raw);
+    $card = $r['card'] ?? null;
+    // 过期卡、作废卡都【要能查到】—— 客人拿着卡来问，
+    // 回一句「查无此卡」是错的，得告诉他为什么不能用
+    if ($card === null) {
+        Api::fail((string)($r['error'] ?? 'card_unknown'), Api::NOT_FOUND);
+    }
+
+    $out = [
+        'state'       => $r['state'],
+        'card_no'     => $app->cardNumber()->format((string)$card['card_no']),
+        'status'      => (int)$card['status'],
+        'valid_to'    => $card['valid_to'],
+        'days_left'   => \Vip\Repo\CardRepo::daysLeft($card),
+        'expired'     => \Vip\Repo\CardRepo::isExpired($card),
+        'grace_over'  => \Vip\Repo\CardRepo::graceOver($card, $app->cardService()->graceMonths()),
+        'void_reason' => $card['void_reason'],
+    ];
+
+    $m = $r['member'] ?? null;
+    if ($m !== null) {
+        $mid = (int)$m['id'];
+        $out['member'] = [
+            'points_balance' => (int)$m['points_balance'],
+            'visit_count'    => (int)$m['visit_count'],
+            'points_frozen'  => (int)$m['consent_status'] !== 1,
+            // 「我还能换免费餐吗」才是客人真正想问的
+            'coupons'        => count($app->rewards()->availableFor($mid)),
+            'progress'       => $app->rewards()->progress($mid),
+        ];
+        $out['rule'] = $app->rewards()->ruleText();
+    }
+    Api::ok($out);
+});
+
 $api->on('POST', '/card/replace', static function () use ($app, $requireOperator): void {
     $op     = $requireOperator();
     $b      = Api::body();

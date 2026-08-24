@@ -299,6 +299,41 @@
     'card.graceDone':     { zh: '已强制换发 {card}，积分已保留',
                             es: 'Cambiada por {card}, puntos conservados' },
 
+    /* ── 查一张卡（客人当面问「我这卡还能用吗」） ────────── */
+    'ask.entry':          { zh: '查一张卡',    es: 'Consultar una tarjeta' },
+    'ask.title':          { zh: '这张卡还能用吗',
+                            es: '¿Sigue siendo válida esta tarjeta?' },
+    'ask.hint':           { zh: '扫客人的卡，或照着卡面输卡号。只是查看，不会改动任何东西。',
+                            es: 'Escanee la tarjeta del cliente o escriba el número. Solo consulta, no cambia nada.' },
+    'ask.query':          { zh: '查询',        es: 'Consultar' },
+    'ask.again':          { zh: '再查一张',    es: 'Consultar otra' },
+
+    // 一句话结论 —— 服务员照着念给客人听
+    'ask.okUse':          { zh: '可以正常使用', es: 'Sí, se puede usar' },
+    'ask.okButSoon':      { zh: '可以用，但还有 {days} 天到期 —— 建议现在就换一张新卡，积分会全部转过去',
+                            es: 'Sí, pero caduca en {days} días — mejor cámbiela ahora por una nueva; los puntos se traspasan' },
+    'ask.notActivated':   { zh: '这张卡还没启用 —— 客人下次消费时扫一下就能开通',
+                            es: 'Esta tarjeta aún no está activada — se activa escaneándola en la próxima consumición' },
+    'ask.expiredCanRenew':{ zh: '已过期（{date}），但现在换一张新卡还来得及 —— 积分与未用的券全部转过去',
+                            es: 'Caducada el {date}, pero todavía se puede cambiar por una nueva — los puntos y los vales se traspasan' },
+    'ask.expiredTooLate': { zh: '已过期太久（{date}），积分按规则已失效。如需破例换发，请找经理',
+                            es: 'Caducada hace demasiado ({date}); los puntos han caducado según las condiciones. Para una excepción, avise al encargado' },
+    'ask.expiredUnused':  { zh: '这张卡没启用过就过期了（{date}），请另取一张发给客人',
+                            es: 'Esta tarjeta caducó sin llegar a activarse ({date}); entregue otra al cliente' },
+    'ask.void':           { zh: '这张卡已作废，不能再用',
+                            es: 'Esta tarjeta está anulada y ya no se puede usar' },
+    'ask.voidWhy':        { zh: '作废原因：{reason}', es: 'Motivo: {reason}' },
+
+    // 明细
+    'ask.points':         { zh: '{points} 分', es: '{points} pts' },
+    'ask.visits':         { zh: '已消费 {n} 次', es: '{n} visitas' },
+    'ask.coupons':        { zh: '有 {n} 张免费餐券可用', es: '{n} vales de comida gratis disponibles' },
+    'ask.noCoupons':      { zh: '暂无可用券',  es: 'Sin vales disponibles' },
+    'ask.validTo':        { zh: '有效期至 {date}', es: 'Válida hasta {date}' },
+    'ask.noExpiry':       { zh: '不设有效期',  es: 'Sin fecha de caducidad' },
+    'ask.frozen':         { zh: '积分照常累计，但客人尚未完成确认，暂不可兑换',
+                            es: 'Acumula puntos, pero el cliente aún no ha confirmado y todavía no puede canjearlos' },
+
     /* ── 现场确认码 ───────────────────────────────────── */
     'consent.notSent':    { zh: '确认码没发出去，积分会先冻结（可稍后在会员处重发）',
                             es: 'No se pudo enviar el código; los puntos quedan bloqueados (puede reenviarlo más tarde)' },

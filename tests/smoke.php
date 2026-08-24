@@ -1454,6 +1454,39 @@ eq('es', $lg['operator']['lang'] ?? null, '★ 登录响应里带着语言');
 $me = $auth->resolve((string)$lg['token']);
 eq('es', $me['lang'] ?? null, '★ 会话恢复那条路也带着语言（最容易漏的一条）');
 
+/**
+ * 显示名也要跟着语言走 —— 否则顶栏会是「系统管理员 (encargado)」
+ * 这种中西混排（现场照片上就是这样）。
+ *
+ * 名字本身没法翻译（店家填的可能是「小王」也可能是「María」），
+ * 所以一个账号存两个名字。西语留空则回落中文名。
+ */
+$auth->renameOperator($langOp, '语言测试', 'Prueba de idioma');
+$row = $db->one('SELECT display_name, display_name_es FROM operator WHERE store_code=? AND id=?',
+    [SMOKE_STORE, $langOp]);
+eq('语言测试', $row['display_name'], '中文名存下了');
+eq('Prueba de idioma', $row['display_name_es'], '西语名也存下了');
+
+$names = \Vip\Service\AuthService::names($row);
+eq('语言测试', $names['zh'], '按 zh 取到中文名');
+eq('Prueba de idioma', $names['es'], '★ 按 es 取到西语名 —— 顶栏才不会中西混排');
+
+// 西语留空：回落中文名，绝不能变成空白
+$auth->renameOperator($langOp, '语言测试', '');
+$row2 = $db->one('SELECT display_name, display_name_es FROM operator WHERE store_code=? AND id=?',
+    [SMOKE_STORE, $langOp]);
+ok($row2['display_name_es'] === null, '西语名留空存成 NULL，不是空字符串');
+$names2 = \Vip\Service\AuthService::names($row2);
+eq('语言测试', $names2['es'], '★★ 没填西语名的账号，西语界面回落到中文名而不是空白');
+
+ok(!$auth->renameOperator($langOp, '   ', 'Algo'), '★ 中文名不能改成空白');
+
+// 登录响应里要带上两个名字，前端切语言才不用再请求一次
+$lg2 = $auth->login('smokelang', '778899', 'SMOKEPAD', '127.0.0.1');
+$op2 = $lg2['operator'] ?? [];
+ok(isset($op2['names']['zh'], $op2['names']['es']),
+   '★ 登录响应带着两种语言的名字（切语言时前端就地换掉，不用再往返一次）');
+
 $db->exec('DELETE FROM operator_session WHERE store_code = ? AND operator_id = ?', [SMOKE_STORE, $langOp]);
 $db->exec('DELETE FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
 

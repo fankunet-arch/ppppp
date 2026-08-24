@@ -440,8 +440,8 @@ $api->on('POST', '/report/daily', static function () use ($app, $requireManager)
 $api->on('GET', '/operators', static function () use ($app, $requireManager): void {
     $requireManager();
     Api::ok(['operators' => $app->localDb()->all(
-        'SELECT id, login_name, display_name, role, enabled, failed_count,
-                locked_until, last_login_at, created_at
+        'SELECT id, login_name, display_name, display_name_es, lang, role, enabled,
+                failed_count, locked_until, last_login_at, created_at
            FROM operator WHERE store_code = ? ORDER BY role DESC, id ASC',
         [$app->storeCode()]
     )]);
@@ -450,10 +450,11 @@ $api->on('GET', '/operators', static function () use ($app, $requireManager): vo
 $api->on('POST', '/operators/create', static function () use ($app, $requireAdmin): void {
     $op    = $requireAdmin();
     $b     = Api::body();
-    $login = Api::str($b, 'login_name', '') ?: '';
-    $name  = Api::str($b, 'display_name', '') ?: '';
-    $pin   = Api::str($b, 'pin', '') ?: '';
-    $role  = Api::int($b, 'role', AuthService::ROLE_STAFF);
+    $login  = Api::str($b, 'login_name', '') ?: '';
+    $name   = Api::str($b, 'display_name', '') ?: '';
+    $nameEs = Api::str($b, 'display_name_es', '') ?: '';
+    $pin    = Api::str($b, 'pin', '') ?: '';
+    $role   = Api::int($b, 'role', AuthService::ROLE_STAFF);
 
     if ($login === '' || $name === '' || strlen($pin) < 4) {
         Api::fail('bad_request', 400, ['hint' => 'PIN 至少 4 位']);
@@ -462,7 +463,7 @@ $api->on('POST', '/operators/create', static function () use ($app, $requireAdmi
         Api::fail('bad_request');
     }
     try {
-        $id = $app->auth()->createOperator($login, $name, $pin, $role);
+        $id = $app->auth()->createOperator($login, $name, $pin, $role, $nameEs);
     } catch (\PDOException $e) {
         Api::fail('bad_request', 400, ['hint' => '工号已存在']);
     }
@@ -472,6 +473,43 @@ $api->on('POST', '/operators/create', static function () use ($app, $requireAdmi
         'detail' => ['login_name' => $login, 'role' => $role],
     ]);
     Api::ok(['id' => $id]);
+});
+
+/**
+ * 改显示名 —— 两种语言各一个。
+ *
+ * 顶栏要么全中文要么全西文，靠的就是这两个名字。
+ * 西语留空则回落中文名（人名本来就常常两边一样）。
+ *
+ * 限管理员：改名会改变审计日志里「谁做的」这件事在界面上的呈现。
+ */
+$api->on('POST', '/operators/rename', static function () use ($app, $requireAdmin): void {
+    $op   = $requireAdmin();
+    $b    = Api::body();
+    $id   = Api::int($b, 'id', 0);
+    $zh   = Api::str($b, 'display_name', '') ?: '';
+    $es   = Api::str($b, 'display_name_es', '') ?: '';
+
+    if ($id <= 0 || trim($zh) === '') {
+        Api::fail('bad_request', 400, ['hint' => '中文显示名不能为空']);
+    }
+    $row = $app->localDb()->one(
+        'SELECT display_name, display_name_es FROM operator WHERE store_code = ? AND id = ?',
+        [$app->storeCode(), $id]
+    );
+    if ($row === null) {
+        Api::fail('not_found', Api::NOT_FOUND);
+    }
+    $app->auth()->renameOperator($id, $zh, $es);
+    $app->audit()->log('operator_rename', [
+        'target_type' => 'operator', 'target_id' => (string)$id,
+        'operator_id' => $op['id'], 'operator_name' => $op['name'],
+        'detail' => [
+            'from' => [$row['display_name'], $row['display_name_es']],
+            'to'   => [$zh, $es !== '' ? $es : null],
+        ],
+    ]);
+    Api::ok(['renamed' => true]);
 });
 
 /**

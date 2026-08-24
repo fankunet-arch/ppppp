@@ -1,13 +1,16 @@
 -- ============================================================
--- 009 · 操作员的界面语言
+-- 010 · 账号的西班牙语显示名
 --
--- 收银台上中文和西班牙语的员工混着用，语言必须跟着【账号】走，
--- 不能跟着平板走 —— 同一台 Pad 换个人登录就该换语言。
+-- 顶栏原本长这样：「系统管理员 (encargado)」——「(经理)」跟着语言走了，
+-- 名字本身没有，中西混排。要么全中文，要么全西文，才像话。
 --
--- NULL = 这个账号还没选过，登录时用后台配置的默认语言（default_lang）。
--- 不给 NOT NULL 默认值就是为了区分「没选过」和「选了中文」：
--- 店里把默认语言改成西班牙语时，没选过的人应该跟着变，
--- 已经明确选过中文的人不应该被改掉。
+-- 为什么不在词典里翻：display_name 是【店家自己填的】，
+-- 可能是「小王」也可能是「María」。翻译一个人名是没有意义的，
+-- 只能让填的人两边都填。填一边的话，另一边就用这一边（见 §回落）。
+--
+-- 回落：display_name_es 为空 → 显示 display_name。
+-- 所以老账号不改也不会坏，只是西语界面下仍显示中文名 —— 这是可接受的，
+-- 且店家在后台把西语名补上就好了。
 --
 -- 非破坏性：只加列，不动任何现有数据。
 -- ============================================================
@@ -28,8 +31,8 @@
 
 SET @sql := IF(
   (SELECT COUNT(*) FROM information_schema.COLUMNS
-     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'operator' AND COLUMN_NAME = 'lang') > 0,
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'operator' AND COLUMN_NAME = 'display_name_es') > 0,
   'DO 0',
-  'ALTER TABLE `operator` ADD COLUMN `lang` VARCHAR(5) DEFAULT NULL COMMENT ''界面语言 zh|es；NULL=跟随后台默认'' AFTER `role`');
+  'ALTER TABLE `operator` ADD COLUMN `display_name_es` VARCHAR(40) DEFAULT NULL COMMENT ''西班牙语显示名；为空则回落到 display_name'' AFTER `display_name`');
 PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
 

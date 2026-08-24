@@ -444,9 +444,12 @@ const ROLE = { 1: '服务员', 2: '经理', 3: '管理员' };
 async function loadOperators() {
   const d = await api('/operators', undefined, 'GET');
   $('#operators-list').innerHTML = `<table>
-    <tr><th>工号</th><th>显示名</th><th>角色</th><th>状态</th><th>最后登录</th>${window.IS_ADMIN ? '<th></th>' : ''}</tr>${
+    <tr><th>工号</th><th>显示名（中文）</th><th>显示名（西语）</th><th>角色</th><th>状态</th><th>最后登录</th>${window.IS_ADMIN ? '<th></th>' : ''}</tr>${
     d.operators.map(o => `<tr>
       <td>${esc(o.login_name)}</td><td>${esc(o.display_name)}</td>
+      <td>${o.display_name_es
+            ? esc(o.display_name_es)
+            : '<span class="muted small">未填 · 西语界面显示中文名</span>'}</td>
       <td>${ROLE[o.role] || o.role}</td>
       <td>${+o.enabled ? '<span class="tag on">启用</span>' : '<span class="tag off">停用</span>'}
           ${o.locked_until ? '<span class="tag err">锁定中</span>' : ''}
@@ -454,12 +457,33 @@ async function loadOperators() {
       <td class="muted small">${esc(o.last_login_at || '从未')}</td>
       ${window.IS_ADMIN ? `<td>
         <button class="tiny" data-ot="${o.id}">${+o.enabled ? '停用' : '启用'}</button>
+        <button class="tiny" data-rn="${o.id}" data-rnz="${esc(o.display_name)}" data-rne="${esc(o.display_name_es || '')}">改名</button>
         <button class="tiny" data-rp="${o.id}" data-rpn="${esc(o.login_name)}">重置 PIN</button>
       </td>` : ''}</tr>`).join('')
   }</table>`;
   $$('[data-ot]').forEach(b => b.onclick = async () => {
     try { await api('/operators/toggle', { id: +b.dataset.ot }); toast('已更新', 'ok'); loadOperators(); }
     catch (e) { toast(e.message, 'err'); }
+  });
+
+  /**
+   * 改显示名 —— 两种语言各问一次。
+   *
+   * 这个入口是必需的：功能刚上线时，店里【已有的】账号都没有西语名，
+   * 只能在这里补。没有它的话，这个功能对老账号等于不存在。
+   */
+  $$('[data-rn]').forEach(b => b.onclick = async () => {
+    const zh = await UI.input('显示名（中文）：', { value: b.dataset.rnz, okText: '下一步' });
+    if (zh === null) return;
+    if (!zh.trim()) return toast('中文显示名不能为空', 'err');
+    const es = await UI.input('显示名（西语）—— 留空则西语界面下也显示中文名：',
+                              { value: b.dataset.rne, okText: '保存', required: false });
+    if (es === null) return;
+    try {
+      await api('/operators/rename', { id: +b.dataset.rn, display_name: zh, display_name_es: es });
+      toast('已改名', 'ok');
+      loadOperators();
+    } catch (e) { toast(e.message, 'err'); }
   });
 
   // 管理员重置他人 PIN —— 不需要旧 PIN，同时解掉连续失败锁定
@@ -497,11 +521,14 @@ $('#btn-change-pin').onclick = async () => {
 $('#btn-add-op').onclick = async () => {
   try {
     await api('/operators/create', {
-      login_name: $('#op-login').value.trim(), display_name: $('#op-name-new').value.trim(),
+      login_name: $('#op-login').value.trim(),
+      display_name: $('#op-name-new').value.trim(),
+      display_name_es: $('#op-name-es').value.trim(),
       pin: $('#op-pin').value, role: +$('#op-role').value,
     });
     toast('已创建', 'ok');
-    $('#op-login').value = ''; $('#op-name-new').value = ''; $('#op-pin').value = '';
+    $('#op-login').value = ''; $('#op-name-new').value = '';
+    $('#op-name-es').value = ''; $('#op-pin').value = '';
     loadOperators();
   } catch (e) { toast(e.message + (e.detail?.hint ? '：' + e.detail.hint : ''), 'err'); }
 };

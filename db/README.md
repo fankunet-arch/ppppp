@@ -63,6 +63,44 @@ ENGINE=InnoDB ROW_FORMAT=DYNAMIC
 
 ---
 
+### 1.5 🔴 迁移必须能重复执行
+
+`bin/init.php migrate` 用 `schema_migration` 表记录跑过哪些文件，
+正常情况下不会重跑。但**那张表可能丢**（换库、导入部分备份、手工清理），
+这时它会从 001 重新跑一遍 —— 所以每个文件都要经得起重跑。
+
+两类表的处理方式不同，写新迁移时先分清楚：
+
+| 表怎么建的 | 重跑时 | 对它的 ALTER |
+|---|---|---|
+| `DROP TABLE` + `CREATE`（001/002） | 表被重建，列自然没了 | **裸 ALTER 就行** |
+| `CREATE TABLE IF NOT EXISTS`（006 的 `card`） | 表**原样保留** | **必须写成幂等的** |
+
+`card` 之所以不能 DROP：一 DROP，已经发出去的实体卡就全没了。
+
+**现场事故**：008 原本是裸的 `ALTER TABLE card ADD COLUMN valid_to`，
+遇上「表还在、登记表没了」的库，直接
+`SQLSTATE[42S21] 1060 Duplicate column name 'valid_to'`，
+整条迁移链停在第 8 个，后面的 009/010 永远跑不到。
+
+幂等写法（**两种库都吃这一套** —— MariaDB 有 `ADD COLUMN IF NOT EXISTS`，
+MySQL 8 没有，所以统一用 `information_schema`）：
+
+```sql
+SET @sql := IF(
+  (SELECT COUNT(*) FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'card' AND COLUMN_NAME = 'valid_to') > 0,
+  'DO 0',
+  'ALTER TABLE `card` ADD COLUMN `valid_to` DATE DEFAULT NULL AFTER `batch_no`');
+PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
+```
+
+加索引同理，把 `information_schema.COLUMNS` 换成 `.STATISTICS`、
+`COLUMN_NAME` 换成 `INDEX_NAME`。
+
+> `tests/cases/SchemaCompatTest.php` 里有断言守着这条规则：
+> 对「不会被重建的表」写裸 ALTER，测试会直接红。
+
 ## 2. 应用层 SQL 约定
 
 ### 2.1 禁用的语法

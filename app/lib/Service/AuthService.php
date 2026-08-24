@@ -99,7 +99,7 @@ final class AuthService
             return null;
         }
         $s = $this->db->one(
-            'SELECT s.*, o.display_name, o.role, o.enabled, o.lang
+            'SELECT s.*, o.display_name, o.display_name_es, o.role, o.enabled, o.lang
                FROM operator_session s
                JOIN operator o ON o.id = s.operator_id AND o.store_code = s.store_code
               WHERE s.store_code = ? AND s.token_hash = ?',
@@ -118,6 +118,7 @@ final class AuthService
         return [
             'id'         => (int)$s['operator_id'],
             'name'       => (string)$s['display_name'],
+            'names'      => self::names($s),
             'role'       => (int)$s['role'],
             'is_manager' => (int)$s['role'] >= self::ROLE_MANAGER,
             'lang'       => $s['lang'],   // NULL = 没选过，由调用方回落到后台默认
@@ -248,16 +249,23 @@ final class AuthService
     }
 
     /** 建操作员（CP 后台与初始化脚本用） */
-    public function createOperator(string $loginName, string $displayName, string $pin, int $role): int
+    public function createOperator(
+        string $loginName,
+        string $displayName,
+        string $pin,
+        int $role,
+        ?string $displayNameEs = null,
+    ): int
     {
         if (strlen($pin) < self::MIN_PIN) {
             throw new \InvalidArgumentException('PIN 至少 ' . self::MIN_PIN . ' 位');
         }
+        $es = trim((string)$displayNameEs);
         $this->db->exec(
             'INSERT INTO operator
-               (store_code, login_name, display_name, pin_hash, role, created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?)',
-            [$this->storeCode, $loginName, $displayName,
+               (store_code, login_name, display_name, display_name_es, pin_hash, role, created_at, updated_at)
+             VALUES (?,?,?,?,?,?,?,?)',
+            [$this->storeCode, $loginName, $displayName, $es !== '' ? $es : null,
              password_hash($pin, PASSWORD_DEFAULT), $role, $this->db->now(), $this->db->now()]
         );
         return $this->db->lastInsertId();
@@ -277,11 +285,51 @@ final class AuthService
         return [
             'id'         => (int)$op['id'],
             'name'       => (string)$op['display_name'],
+            'names'      => self::names($op),
             'role'       => (int)$op['role'],
             'is_manager' => (int)$op['role'] >= self::ROLE_MANAGER,
             'lang'       => $op['lang'] ?? null,   // NULL = 没选过
             'device'     => $device,
         ];
+    }
+
+    /**
+     * 两种语言的显示名。
+     *
+     * 两个都下发给前端，是为了【切换语言时不用再请求一次服务器】——
+     * 顶栏的名字要立刻跟着变，多一次往返既慢又可能失败。
+     *
+     * 西语名为空就回落到中文名：display_name 是店家自己填的，
+     * 可能是「小王」也可能是「María」，翻译人名没有意义，
+     * 只能让填的人两边都填；只填一边时，另一边就用这一边。
+     */
+    public static function names(array $op): array
+    {
+        $zh = (string)($op['display_name'] ?? '');
+        $es = trim((string)($op['display_name_es'] ?? ''));
+        return [
+            \Vip\Lang::ZH => $zh,
+            \Vip\Lang::ES => $es !== '' ? $es : $zh,
+        ];
+    }
+
+    /**
+     * 改显示名。两种语言各一个，西语留空即回落中文。
+     *
+     * 没有这个入口的话，这个功能对【已经存在的账号】等于不存在 ——
+     * 而店里的账号本来就都是先建好的。
+     */
+    public function renameOperator(int $operatorId, string $zh, ?string $es): bool
+    {
+        $zh = trim($zh);
+        if ($zh === '') { return false; }
+        $es = trim((string)$es);
+        $this->db->exec(
+            'UPDATE operator SET display_name = ?, display_name_es = ?, updated_at = ?
+              WHERE store_code = ? AND id = ?',
+            [$zh, $es !== '' ? $es : null, $this->db->now(), $this->storeCode, $operatorId]
+        );
+        return true;
     }
 
     /**

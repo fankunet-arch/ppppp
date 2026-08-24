@@ -106,6 +106,10 @@ $appVersion = vip_app_version([
       <button id="btn-widen" class="ghost"></button>
       <button id="btn-manual" class="ghost warn" data-i18n="lookup.useManual">改用手工录入</button>
     </div>
+
+    <!-- 客人当面问「我这卡还能用吗」。放在第一步：这种问题都发生在两单之间，
+         服务员不该为了回一句话去打断记账流程，更不该转给经理。 -->
+    <button id="btn-ask-card" class="link" data-i18n="ask.entry">查一张卡</button>
   </div>
 
   <!-- 步骤 2：选订单 -->
@@ -222,6 +226,22 @@ $appVersion = vip_app_version([
     </details>
     <p id="member-err" class="err" hidden></p>
     <button id="btn-member-close" class="ghost" data-i18n="common.cancel">取消</button>
+  </div>
+</div>
+
+<!-- ══ 查一张卡（只读，不改动任何东西） ══════════════════ -->
+<div id="ask-modal" class="modal" hidden>
+  <div class="modal-box">
+    <h3 data-i18n="ask.title">这张卡还能用吗</h3>
+    <div class="row">
+      <input id="ask-input" type="text" autocomplete="off" data-i18n-ph="member.phCard">
+      <button id="btn-ask-scan" class="primary" data-i18n="member.scan">扫卡</button>
+      <button id="btn-ask-go" class="primary" data-i18n="ask.query">查询</button>
+    </div>
+    <p class="muted small" data-i18n="ask.hint"></p>
+    <div id="ask-result"></div>
+    <p id="ask-err" class="err" hidden></p>
+    <button id="btn-ask-close" class="ghost" data-i18n="common.cancel">取消</button>
   </div>
 </div>
 

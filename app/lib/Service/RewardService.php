@@ -69,15 +69,30 @@ final class RewardService
         ];
     }
 
-    /** 规则的人话描述，后台与 Pad 都直接显示这句 */
+    /**
+     * 规则的人话描述，后台与 Pad 都直接显示这句。
+     *
+     * ★ 按当前请求的语言出。
+     *   这是服务端【生成】的句子（数字要填进去），不是界面上的静态标签，
+     *   所以按既定分工归服务端翻 —— 与 Api::MESSAGES 同一个道理：
+     *   前端再存一份必然漂移，而漂移的表现是西语界面里冒出一句中文。
+     *   （真发生过：「查一张卡」上线时，进度那句就是中文漏进西语界面的。）
+     */
     public function ruleText(): string
     {
-        $r = $this->rule();
+        $r  = $this->rule();
+        $es = \Vip\Http\Api::lang() === \Vip\Lang::ES;
+
         if (!$r['enabled']) {
-            return '奖励功能已关闭';
+            return $es ? 'El programa de puntos está desactivado' : '奖励功能已关闭';
         }
-        return $r['mode'] === 'visits'
-            ? sprintf('每满 %d 次送 1 次', $r['threshold_visits'])
+        if ($r['mode'] === 'visits') {
+            return $es
+                ? sprintf('1 gratis cada %d visitas', $r['threshold_visits'])
+                : sprintf('每满 %d 次送 1 次', $r['threshold_visits']);
+        }
+        return $es
+            ? sprintf('1 gratis por cada € %s de consumo', Money::toStr($r['threshold_cents']))
             : sprintf('累计消费每满 € %s 送 1 次', Money::toStr($r['threshold_cents']));
     }
 
@@ -128,12 +143,25 @@ final class RewardService
             'earned'    => $earned,
             'pending'   => $pending,
             'remain'    => $remain,
-            'text'      => $r['mode'] === 'amount'
-                ? sprintf('已累计 € %s / 每 € %s 送 1 次，还差 € %s',
-                    Money::toStr($progress), Money::toStr($threshold), Money::toStr($remain))
-                : sprintf('已累计 %d 次 / 每 %d 次送 1 次，还差 %d 次',
-                    $progress, $threshold, $remain),
+            // 同 ruleText()：服务端生成的句子，按当前请求的语言出
+            'text'      => self::progressText($r['mode'], $progress, $threshold, $remain),
         ];
+    }
+
+    /** 进度那句话，两种语言各一版 */
+    private static function progressText(string $mode, int $progress, int $threshold, int $remain): string
+    {
+        $es = \Vip\Http\Api::lang() === \Vip\Lang::ES;
+        if ($mode === 'amount') {
+            return $es
+                ? sprintf('Lleva € %s de € %s — faltan € %s',
+                    Money::toStr($progress), Money::toStr($threshold), Money::toStr($remain))
+                : sprintf('已累计 € %s / 每 € %s 送 1 次，还差 € %s',
+                    Money::toStr($progress), Money::toStr($threshold), Money::toStr($remain));
+        }
+        return $es
+            ? sprintf('Lleva %d visitas de %d — faltan %d', $progress, $threshold, $remain)
+            : sprintf('已累计 %d 次 / 每 %d 次送 1 次，还差 %d 次', $progress, $threshold, $remain);
     }
 
     /**
