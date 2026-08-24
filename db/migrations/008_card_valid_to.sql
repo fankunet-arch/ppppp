@@ -23,14 +23,40 @@
 
 SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 
-ALTER TABLE `card`
-  ADD COLUMN `valid_to` DATE DEFAULT NULL
-      COMMENT '有效期至（含当天）。必须与卡面印刷的日期一致；NULL = 不设有效期'
-      AFTER `batch_no`,
-  ADD COLUMN `points_cleared_at` DATETIME DEFAULT NULL
-      COMMENT '过期宽限结束后清零积分的时间；留痕供客人申诉时查'
-      AFTER `voided_at`;
+
+-- ────────────────────────────────────────────────────────────
+-- ★ 下面每一步都写成【可重复执行】的。
+--
+--   现场栽过：006_card.sql 用的是 CREATE TABLE IF NOT EXISTS，
+--   card 表已存在时它什么都不做；而这里原本是裸的 ALTER ADD COLUMN，
+--   列已存在时直接报 1060 Duplicate column name，整条迁移链就停在这。
+--   两者不对称，导致「库还在、登记表没了」的情况下永远跑不完。
+--
+--   MariaDB 有 ADD COLUMN IF NOT EXISTS，MySQL 8 没有，所以用
+--   information_schema 判一下再动态执行 —— 两种库都吃这一套。
+--   （列已存在时执行 DO 0，即什么都不做。）
+-- ────────────────────────────────────────────────────────────
+
+SET @sql := IF(
+  (SELECT COUNT(*) FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'card' AND COLUMN_NAME = 'valid_to') > 0,
+  'DO 0',
+  'ALTER TABLE `card` ADD COLUMN `valid_to` DATE DEFAULT NULL COMMENT ''有效期至（含当天）。必须与卡面印刷的日期一致；NULL = 不设有效期'' AFTER `batch_no`');
+PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
+
+SET @sql := IF(
+  (SELECT COUNT(*) FROM information_schema.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'card' AND COLUMN_NAME = 'points_cleared_at') > 0,
+  'DO 0',
+  'ALTER TABLE `card` ADD COLUMN `points_cleared_at` DATETIME DEFAULT NULL COMMENT ''过期宽限结束后清零积分的时间；留痕供客人申诉时查'' AFTER `voided_at`');
+PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
 
 -- 按有效期扫的夜间任务要走索引
-ALTER TABLE `card`
-  ADD KEY `idx_valid` (`store_code`,`valid_to`);
+
+SET @sql := IF(
+  (SELECT COUNT(*) FROM information_schema.STATISTICS
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'card' AND INDEX_NAME = 'idx_valid') > 0,
+  'DO 0',
+  'ALTER TABLE `card` ADD KEY `idx_valid` (`store_code`,`valid_to`)');
+PREPARE st FROM @sql; EXECUTE st; DEALLOCATE PREPARE st;
+

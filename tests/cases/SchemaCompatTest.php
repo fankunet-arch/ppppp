@@ -806,3 +806,88 @@ T::eq(422, \Vip\Http\Api::NOT_FOUND,
 T::true((bool)preg_match("/fail\('not_found',\s*404\)/",
         $phpCode(__DIR__ . '/../../app/lib/Http/Api.php')),
     '接口不存在仍然是 404（那是真的路径不存在，语义正确）');
+
+T::group('迁移 · 重跑一遍不能卡住');
+
+/**
+ * ★ 现场事故：`php bin/init.php migrate` 停在
+ *     SQLSTATE[42S21] Duplicate column name 'valid_to'
+ *
+ *   起因是两类迁移的对称性被打破了：
+ *     · 001/002 是 DROP TABLE + CREATE —— 重跑时表被重建，列自然没了，
+ *       后面对这些表的 ALTER 照样能跑（003/004/005/007 就属于这一类）
+ *     · 006 的 card 表是 CREATE TABLE IF NOT EXISTS（不能 DROP，
+ *       一 DROP 已发出去的实体卡就全没了）—— 重跑时表【原样保留】，
+ *       于是 008 那句裸 ALTER ADD COLUMN 撞上已存在的列，1060 报错，
+ *       整条迁移链停在这里，后面的 009/010 永远跑不到。
+ *
+ *   所以规则不是「所有 ALTER 都要幂等」，而是：
+ *     对一张【不会被重建】的表做 ALTER，那句 ALTER 必须幂等。
+ *
+ *   MariaDB 有 ADD COLUMN IF NOT EXISTS，MySQL 8 没有 ——
+ *   两种库都要跑，所以统一用 information_schema 判一下再动态执行。
+ */
+$migrations = glob(__DIR__ . '/../../db/migrations/*.sql') ?: [];
+sort($migrations);
+T::true(count($migrations) >= 10, '找得到迁移文件（' . count($migrations) . ' 个）');
+
+/**
+ * 只剥注释，【不要动反引号】。
+ *
+ * 不能用 SqlText::stripComments —— 它把反引号当字符串定界符，
+ * 会把 `card`、`pos_order` 这些标识符一起抹成空白，
+ * 于是「ALTER TABLE `pos_order` ADD …」被读成「ALTER TABLE  ADD」，
+ * 表名变成了 ADD。（这条测试第一版就是这么错的。）
+ */
+$sqlBody = static function (string $file): string {
+    $raw = (string)file_get_contents($file);
+    $raw = preg_replace('#/\*.*?\*/#s', ' ', $raw) ?? $raw;      // 块注释
+    $raw = preg_replace('/^\s*--.*$/m', '', $raw) ?? $raw;        // 整行的 -- 注释
+    return $raw;
+};
+
+/** 每张表是在哪个迁移里被「重建」的（DROP + CREATE），没有则为 null */
+$rebuiltAt = [];
+/** 每张表是在哪个迁移里被「软建」的（CREATE IF NOT EXISTS —— 重跑时原样保留） */
+$softAt = [];
+
+foreach ($migrations as $idx => $f) {
+    $sql = $sqlBody($f);
+    preg_match_all('/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?`?(\w+)`?/i', $sql, $d);
+    preg_match_all('/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`?(\w+)`?/i', $sql, $c);
+    foreach ($d[1] as $t) { $rebuiltAt[$t] = $idx; }
+    foreach ($c[1] as $t) { if (!isset($rebuiltAt[$t])) { $softAt[$t] = $idx; } }
+}
+
+T::true($softAt !== [],
+    '确实有不会被重建的表（' . implode(', ', array_keys($softAt)) . '）—— 对它们的 ALTER 才是风险点');
+T::true(isset($softAt['card']), '★ card 就是其中之一（实体卡不能 DROP，一 DROP 已发的卡全没了）');
+
+$risky = [];
+foreach ($migrations as $idx => $f) {
+    $sql  = $sqlBody($f);
+    $name = basename($f);
+    // 这个文件里对哪些表做了 ADD 类 DDL
+    preg_match_all('/ALTER\s+TABLE\s+`?(\w+)`?([^;]*)/is', $sql, $m, PREG_SET_ORDER);
+    foreach ($m as $one) {
+        $tbl  = $one[1];
+        $body = $one[2];
+        if (!preg_match('/\bADD\s+(COLUMN|KEY|INDEX|UNIQUE)\b/i', $body)) { continue; }
+        // 表在这一步之前会被重建 → 重跑时列本来就没了，裸 ALTER 是安全的
+        if (isset($rebuiltAt[$tbl]) && $rebuiltAt[$tbl] < $idx) { continue; }
+        // 否则必须幂等
+        $guarded = str_contains($sql, 'information_schema')
+                || (bool)preg_match('/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS/i', $sql);
+        if (!$guarded) { $risky[] = "{$name} → ALTER `{$tbl}`"; }
+    }
+}
+T::true($risky === [],
+    '★★ 对「不会被重建的表」的 ALTER 都是幂等的 —— 否则重跑迁移会 1060/1061 卡死'
+    . ($risky ? "\n      " . implode("\n      ", $risky) : ''));
+
+// 008/009/010 是这次事故涉及的三个，单独点名，改坏了要立刻看得见
+foreach (['008_card_valid_to.sql', '009_operator_lang.sql', '010_operator_name_es.sql'] as $n) {
+    $f = __DIR__ . '/../../db/migrations/' . $n;
+    T::true(is_file($f) && str_contains((string)file_get_contents($f), 'information_schema'),
+        "{$n} 用 information_schema 做了存在性判定");
+}
