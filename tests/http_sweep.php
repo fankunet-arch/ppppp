@@ -36,6 +36,8 @@ if (PHP_SAPI !== 'cli') {
 }
 
 $BASE = getenv('BASE') ?: 'http://127.0.0.1:8910';
+/** 业务性的「没找到」用的状态码，与 Api::NOT_FOUND 一致（探针不加载 app/） */
+const Api_NOT_FOUND = 422;
 $PIN  = getenv('SWEEP_PIN') ?: 'admin123';
 $USER = getenv('SWEEP_USER') ?: 'admin';
 
@@ -267,6 +269,12 @@ ok(($j['error'] ?? '') === 'card_unknown', '  └ 错误码是 card_unknown');
 
 [$st, $raw, $j] = req($BASE . '/api.php/card/lookup', 'POST', ['card_no' => 'https://example.com/x'], $padJar);
 ok(($j['error'] ?? '') === 'card_malformed', '扫错二维码 → card_malformed', brief($st, $raw, $j));
+
+// 前台「查一张卡」—— 客人当面问「我这卡还能用吗」
+[$st, $raw, $j] = req($BASE . '/api.php/card/status', 'POST', ['card_no' => 'TK-99999999-ZZZ'], $padJar);
+ok($st === Api_NOT_FOUND, '/card/status 查不到的卡也回 422', brief($st, $raw, $j));
+[$st, $raw, $j] = req($BASE . '/api.php/card/status', 'POST', [], $padJar);
+ok(($j['error'] ?? '') === 'card_required', '/card/status 不给卡号时提示要先扫卡', brief($st, $raw, $j));
 
 // ── 6. 语言：服务端按请求头回话 ──────────────────────────
 group('⑦ 服务端按 X-Lang 回话');
