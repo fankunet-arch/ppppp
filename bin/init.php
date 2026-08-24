@@ -88,8 +88,12 @@ function doCheck(App $app, array $config): void
         foreach ($db->all('SHOW TABLES') as $r) {
             $tables[] = (string)array_values($r)[0];
         }
-        $need = ['pos_order','member','point_ledger','meal_item_rule','sys_config',
-                 'sync_cursor','audit_log','alert','operator','operator_session'];
+        // ★ 加表时这里必须跟着加，否则自检会漏 —— 曾经漏掉 card 与 coupon，
+        //   结果 migrate 没跑的库照样报「全部 10 张表已存在」，
+        //   现场看到这句以为没问题，实际点发卡直接报错
+        $need = ['pos_order','member','point_ledger','coupon','meal_item_rule','meal_period',
+                 'sys_config','sync_cursor','audit_log','alert','operator','operator_session',
+                 'card'];
         $miss = array_diff($need, $tables);
         $miss ? warn('缺少表：' . implode(', ', $miss) . ' —— 请执行 migrate')
               : ok('全部 ' . count($need) . ' 张表已存在');
