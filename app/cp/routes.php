@@ -396,7 +396,7 @@ $api->on('POST', '/members/erase', static function () use ($app, $requireAdmin):
     $b  = Api::body();
     $id = Api::int($b, 'member_id', 0);
     if ($id <= 0 || $app->members()->findById($id) === null) {
-        Api::fail('member_not_found', 404);
+        Api::fail('member_not_found', Api::NOT_FOUND);
     }
     $app->members()->pseudonymize($id);
     $app->audit()->log('data_erase', [
@@ -642,7 +642,7 @@ $api->on('POST', '/cards/lookup', static function () use ($app, $requireManager)
     $r    = $app->cardService()->lookup($raw);
     $card = $r['card'] ?? null;
     if ($card === null) {
-        Api::fail((string)($r['error'] ?? 'card_unknown'), 404);
+        Api::fail((string)($r['error'] ?? 'card_unknown'), Api::NOT_FOUND);
     }
 
     $out = [
@@ -686,7 +686,7 @@ $api->on('POST', '/cards/void', static function () use ($app, $requireManager): 
 
     $card = $app->cards()->findByCardNo($raw);
     if ($card === null) {
-        Api::fail('card_unknown', 404);
+        Api::fail('card_unknown', Api::NOT_FOUND);
     }
     if ((int)$card['status'] === \Vip\Repo\CardRepo::STATUS_VOID) {
         Api::fail('card_void', 400);

@@ -200,7 +200,7 @@ $api->on('POST', '/order/free-meal', static function () use ($app, $requireOpera
         Api::fail('bad_request');
     }
     if ($app->orders()->findBySerial($serial) === null) {
-        Api::fail('order_not_found', 404);
+        Api::fail('order_not_found', Api::NOT_FOUND);
     }
     $app->orders()->markFreeMeal($serial, $isFree);
     $app->audit()->log('coupon_redeem', [
@@ -267,7 +267,7 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator)
 
     $r = $app->cardService()->lookup($raw);
     if (!$r['ok']) {
-        Api::fail((string)$r['error'], 404);
+        Api::fail((string)$r['error'], Api::NOT_FOUND);
     }
 
     $card = $r['card'];
@@ -528,7 +528,7 @@ $api->on('POST', '/points/split', static function () use ($app, $requireOperator
     }
     $o = $app->orders()->findBySerial($serial);
     if ($o === null) {
-        Api::fail('order_not_found', 404);
+        Api::fail('order_not_found', Api::NOT_FOUND);
     }
     $remainCents = Money::toCents($o['total_amount']) - Money::toCents($o['allocated_amount']);
     $remainPort  = (int)$o['portions_counted'] - (int)$o['allocated_portions'];

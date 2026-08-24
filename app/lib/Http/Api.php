@@ -18,6 +18,23 @@ final class Api
     public const COOKIE = 'vip_session';
 
     /** 错误码 → 收银员能看懂的中文。前端也有一份，这里是兜底。 */
+    /**
+     * 业务层「没找到」用的状态码。
+     *
+     * ★ 不要改回 404。现场踩过：nginx 开着 fastcgi_intercept_errors，
+     *   配合 error_page 404，会把我们的 JSON 响应体【整个换成它自己的
+     *   404 页面】。收银员看到的是「服务器返回的不是 JSON…404 Not Found
+     *   nginx」，于是以为系统坏了，而实际上只是卡号打错了。
+     *
+     *   而且 404 在语义上本来就不对：接口是存在的，不存在的是那张卡。
+     *   422（请求格式没问题，但内容处理不了）更贴切，也不在任何常见
+     *   error_page 配置的拦截名单里。
+     *
+     *   这条防线放在应用层而不是靠运维配对 nginx —— 换一台机器、
+     *   换一个面板，配置就可能又变回去。
+     */
+    public const NOT_FOUND = 422;
+
     private const MESSAGES = [
         'unauthorized'           => '登录已过期，请重新登录',
         'forbidden'              => '当前账号没有此操作权限',
@@ -99,6 +116,8 @@ final class Api
                     self::fail('method_not_allowed', 405);
                 }
             }
+            // 这一处保留 404：它确实是「这个 URL 上没有东西」。
+            // 业务层的「没找到」用 Api::NOT_FOUND(422)，理由见那里的注释。
             self::fail('not_found', 404);
         }
 

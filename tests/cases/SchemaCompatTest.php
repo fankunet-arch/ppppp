@@ -754,3 +754,55 @@ T::true(str_contains($routes, 'pii_disabled'),
 $pad = (string)file_get_contents(__DIR__ . '/../../wwwroot/assets/pad.js');
 T::true(str_contains($pad, 'box.remove()'),
     '★ 前端是把那一栏从 DOM 移除，不是 hidden（隐藏的字段仍然存在）');
+
+T::group('业务错误不能用会被 nginx 拦掉的状态码');
+
+/**
+ * 现场踩过：卡号不存在时应用返回 JSON + HTTP 404，而 nginx 开着
+ * fastcgi_intercept_errors，配合 error_page 404，把响应体【整个换成】
+ * 它自己的 404 页面。收银员看到「服务器返回的不是 JSON…404 Not Found
+ * nginx」，以为系统坏了，实际只是卡号打错。
+ *
+ * 影响面比看上去大：order_not_found 也是 404，而输错桌号/小票号
+ * 是收银员最常遇到的情况 —— 全系统最高频的错误路径全被吞掉。
+ *
+ * 修法放在应用层而不是靠运维配对 nginx：换台机器、换个面板，
+ * 配置就可能又变回去。
+ */
+
+/**
+ * 剥掉 PHP 注释，保留代码与字符串。
+ *
+ * ★ 不能用 SqlText —— 那是 SQL 的剥离器：它不认 PHP 的 // 注释，
+ *   还会把字符串内容清空。第一版就是这么写的，结果
+ *   fail('not_found', 404) 里的字符串被抹掉，断言永远匹配不上。
+ */
+$phpCode = static function (string $file): string {
+    $out = '';
+    foreach (token_get_all((string)file_get_contents($file)) as $t) {
+        if (is_array($t)) {
+            if (in_array($t[0], [T_COMMENT, T_DOC_COMMENT], true)) {
+                $out .= ' ';
+                continue;
+            }
+            $out .= $t[1];
+            continue;
+        }
+        $out .= $t;
+    }
+    return $out;
+};
+
+foreach (['app/api/routes.php', 'app/cp/routes.php'] as $rel) {
+    $code = $phpCode(__DIR__ . '/../../' . $rel);
+    T::false((bool)preg_match('/Api::fail\([^;]*?,\s*404\s*\)/', $code),
+        "★ {$rel} 里没有业务级 404（业务「没找到」要用 Api::NOT_FOUND）");
+}
+
+T::eq(422, \Vip\Http\Api::NOT_FOUND,
+    '★ 业务「没找到」用 422 —— 不在任何常见 error_page 的拦截名单里');
+
+// 路由层自己那个 404 是对的：那确实是「这个 URL 上没东西」
+T::true((bool)preg_match("/fail\('not_found',\s*404\)/",
+        $phpCode(__DIR__ . '/../../app/lib/Http/Api.php')),
+    '接口不存在仍然是 404（那是真的路径不存在，语义正确）');
