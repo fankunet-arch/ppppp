@@ -162,6 +162,16 @@ $$('#btn-refresh, #btn-refresh-login').forEach(b => {
 $('#btn-logout').onclick = async () => {
   try { await api('/auth/logout', {}); } catch {}
   S.operator = null;
+  /**
+   * 退回登录页 = 回到「没有人登录」的状态，语言也该回到【这台平板】的设置，
+   * 而不是留着上一个人的。
+   *
+   * 不这么做的话，登录页的语言会跟着「最后一个用的人」漂 ——
+   * 那正是我们在账号这一层特意避开的「谁最后用算谁的」。
+   * （下一个人登录时照样会切成他自己的，所以这只影响登录页本身。）
+   */
+  I18N.set(I18N.initial(S.settings.default_lang || 'zh'), { remember: false });
+  renderLangSwitch();
   $('#view-main').classList.remove('active');
   $('#view-login').classList.add('active');
   $('#login-pin').value = '';

@@ -28,7 +28,7 @@
 | `app/` | 业务逻辑（网络不可见）：`lib/` 核心、`api/` Pad 路由、`cp/` 后台路由 |
 | `bin/` | CLI 入口：`init.php` 初始化/建表/重置 PIN、`cron.php` 定时任务、`diag.php` 连接诊断 |
 | `db/` | DDL、种子、MySQL/MariaDB 双兼容约定 |
-| `tests/` | `run.php` 纯逻辑（722 项）、`smoke.php` 真本地库冒烟（300 项，需**专用空库**）、`e2e_pos.php` 真 POS+真本地库端到端（95 项）、`browser/` 真浏览器（199 项，仅开发机）、`sim/` 模拟环境搭建 |
+| `tests/` | `run.php` 纯逻辑（722 项）、`smoke.php` 真本地库冒烟（300 项，需**专用空库**）、`e2e_pos.php` 真 POS+真本地库端到端（95 项）、`browser/` 真浏览器（217 项，仅开发机）、`sim/` 模拟环境搭建 |
 
 ## 核心前提（不可动摇）
 
