@@ -143,7 +143,7 @@ if (hasBD) {
   ok(true, '（本机支持 BarcodeDetector，跳过降级检查）');
 } else {
   const msg = await page.locator('#member-err').textContent();
-  ok(/手工输入/.test(msg), `★ 不支持扫码时引导手输而不是卡住：「${msg}」`);
+  ok(/手工输入卡号/.test(msg), `★ 不支持扫码时引导手输而不是卡住：「${msg.slice(0, 30)}…」`);
   ok(await page.locator('#scan-modal').isHidden(), '不弹出空的取景框');
 }
 

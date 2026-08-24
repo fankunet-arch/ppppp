@@ -950,7 +950,8 @@ $('#btn-scan').onclick = async () => {
 
   if (typeof window.BarcodeDetector !== 'function') {
     return showErr('#member-err',
-      '本设备不支持扫码，请照着卡面手工输入卡号（O 当 0 输没关系）');
+      '本设备不支持扫码，请照着卡面手工输入卡号。'
+    + '不用纠结哪个是字母哪个是数字，看着像什么就输什么，系统会自动纠正');
   }
   if (!window.SushiVIP || !SushiVIP.cameraSupported()) {
     return showErr('#member-err',
