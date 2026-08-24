@@ -713,14 +713,10 @@ $('#btn-submit').onclick = async () => {
 /* ── 会员弹层 ────────────────────────────────────── */
 function openMemberModal(personIndex) {
   S.memberTarget = personIndex;
-  S.pendingCard  = null;
   $('#member-input').value = '';
-  $('#member-result').innerHTML = '';
-  $('#new-card-hint').innerHTML = '';
-  $('#member-new').open = false;
+  resetLookupState();                    // 里面已经清了错误提示
   const contact = $('#new-contact');
   if (contact) { contact.open = false; }
-  showErr('#member-err', '');
   $('#member-modal').hidden = false;
   UI.back.sync();
   setTimeout(() => $('#member-input').focus(), 50);
@@ -741,8 +737,31 @@ $$('#search-type button').forEach(b => b.onclick = () => {
 $('#btn-member-search').onclick = doMemberSearch;
 $('#member-input').addEventListener('keydown', e => { if (e.key === 'Enter') doMemberSearch(); });
 
-async function doMemberSearch() {
+/**
+ * 每次查询前把上一次的痕迹清干净。
+ *
+ * 不清会出两种问题，第二种是真的会记错账：
+ *
+ *   ① 先查一张有效的库存卡（显示「这张卡尚未启用：TK-xxx」），
+ *      再查一个不存在的卡号 —— 错误提示出来了，可上一张卡的提示还挂在
+ *      旁边，收银员同时看到「卡号错误」和一个卡号，不知道该信哪个。
+ *
+ *   ② 扫了卡 A 之后切到手机号档查找，没找到 → 建卡表单展开，
+ *      而 S.pendingCard 还是卡 A —— 点「启用」就把卡 A 绑给了这个人。
+ *      收银员此刻根本没在想卡 A。
+ *
+ * 所以：每条查询路径开头都调它，最后一次操作说了算。
+ */
+function resetLookupState() {
   showErr('#member-err', '');
+  S.pendingCard = null;
+  $('#member-result').innerHTML = '';
+  $('#new-card-hint').innerHTML = '';
+  $('#member-new').open = false;
+}
+
+async function doMemberSearch() {
+  resetLookupState();
   const type = $('#search-type button.on').dataset.type;
   const value = $('#member-input').value.trim();
   if (!value) return showErr('#member-err', '请输入查询内容');
@@ -777,13 +796,11 @@ async function doMemberSearch() {
  *   其它   → 报错（不是本店的卡 / 已作废 / 卡号不完整）
  */
 async function doCardLookup(value) {
-  showErr('#member-err', '');
+  resetLookupState();
   try {
     const d = await api('/card/lookup', { card_no: value });
 
     if (d.state === 'active') {
-      S.pendingCard = null;
-      $('#member-new').open = false;
       const m = d.member;
       $('#member-result').innerHTML = `
         <div class="found"><b>${escapeHtml(m.card_no)}</b>
@@ -796,14 +813,12 @@ async function doCardLookup(value) {
 
     // 库存卡 —— 这张卡是新的，引导建会员
     S.pendingCard = d.card_no;
-    $('#member-result').innerHTML = '';
     $('#new-card-hint').innerHTML =
       `这张卡尚未启用：<b>${escapeHtml(d.card_no)}</b>`;
     $('#member-new').open = true;
     setTimeout(() => $('#btn-member-create').focus(), 50);
   } catch (e) {
-    S.pendingCard = null;
-    $('#member-result').innerHTML = '';
+    // 复位已在开头做过，这里只负责报错
     showErr('#member-err', e.message);
   }
 }

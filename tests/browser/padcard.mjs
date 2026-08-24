@@ -74,6 +74,31 @@ await lookup('https://example.com/whatever');
 err = await page.locator('#member-err').textContent();
 ok(/卡号不完整/.test(err), `扫错二维码：「${err}」`);
 
+// ── 查过一张有效卡之后再查无效的，不能残留 ──
+// 现场反馈：先查对的卡（显示「这张卡尚未启用：TK-xxx」）再查错的卡，
+// 上一张的提示还挂在错误旁边，收银员不知道该信哪个。
+await lookup(CARD_A);
+ok((await page.locator('#new-card-hint').textContent()).includes(CARD_A), '先查一张有效的库存卡');
+await lookup('TK-99999999-ABC');
+ok((await page.locator('#new-card-hint').textContent()).trim() === '',
+   '★ 再查无效卡时，上一张卡的提示被清掉');
+ok(await page.locator('#member-new').evaluate(el => !el.open), '建卡表单也收起来了');
+ok(await page.evaluate(() => S.pendingCard) === null,
+   '★ 待绑定的卡号也一并清空（否则点启用会绑错卡）');
+
+// ── 扫了卡之后改用手机号查找，卡不能还留着 ──
+// 这条比上面那条危险：pendingCard 残留时点「启用」会把上一张卡绑给这个人
+await lookup(CARD_A);
+ok(await page.evaluate(() => S.pendingCard) !== null, '扫卡后 pendingCard 已设置');
+await page.click('#search-type button[data-type="phone"]');
+await page.fill('#member-input', '600000000000');
+await page.click('#btn-member-search');
+await page.waitForTimeout(600);
+ok(await page.evaluate(() => S.pendingCard) === null,
+   '★ 改用手机号查找后，上一张卡的 pendingCard 被清空');
+ok((await page.locator('#new-card-hint').textContent()).trim() === '', '卡号提示也清了');
+await page.click('#search-type button[data-type="card"]');
+
 // ── 库存卡 → 引导建会员 ──
 await lookup(CARD_A);
 ok(await page.locator('#member-new').evaluate(el => el.open), '★ 库存卡自动展开建卡表单');
