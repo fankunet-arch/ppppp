@@ -135,7 +135,7 @@ foreach ($jsFiles as $rel) {
         "$rel 无 Blob 下载（容器未实现 setDownloadListener）");
 }
 
-foreach (['index.html', 'cp/index.html'] as $rel) {
+foreach (['index.php', 'cp/index.php'] as $rel) {
     $html = html_strip(file_get_contents($root . $rel));
     T::false((bool)preg_match('/<a[^>]+\bdownload\b/i', $html), "$rel 无 <a download> 下载链接");
     T::false((bool)preg_match('/target\s*=\s*["\']_blank/i', $html), "$rel 无 target=\"_blank\"");
@@ -144,7 +144,7 @@ foreach (['index.html', 'cp/index.html'] as $rel) {
 
 T::group('容器兼容 · 平板必需的页面设置');
 
-foreach (['index.html', 'cp/index.html'] as $rel) {
+foreach (['index.php', 'cp/index.php'] as $rel) {
     $html = file_get_contents($root . $rel);
     T::true((bool)preg_match('/<meta\s+name=["\']viewport["\'][^>]*viewport-fit=cover/i', $html),
         "$rel 的 viewport 含 viewport-fit=cover（容器是全面屏沉浸模式）");
@@ -160,21 +160,39 @@ T::group('容器兼容 · 脚本加载顺序（顺序即依赖）');
  * 会静默回落到浏览器兜底 ID —— 表现为「设备 ID 一直是 PAD-xxxx」，
  * 而不会报任何错。
  */
-$pad = file_get_contents($root . 'index.html');
-$posBridge = strpos($pad, 'sushivip-bridge.js');
-$posUi     = strpos($pad, '/assets/ui.js');
-$posPad    = strpos($pad, '/assets/pad.js');
-T::true($posBridge !== false, 'Pad 页引入了桥接封装');
-T::true($posUi !== false, 'Pad 页引入了 ui.js');
-T::true($posBridge !== false && $posPad !== false && $posBridge < $posPad,
-    '★ 桥接排在 pad.js 之前（晚了就取不到原生设备 ID，且不报错）');
-T::true($posUi !== false && $posPad !== false && $posUi < $posPad,
-    '★ ui.js 排在 pad.js 之前');
+/**
+ * 页面是 PHP 发的，src 写成 `<?= vip_asset('assets/pad.js') ?>`（带缓存版本号），
+ * 所以不能再对着字面量 `/assets/pad.js` 做 strpos —— 两种写法都要认。
+ */
+function script_order(string $html): array
+{
+    preg_match_all(
+        '/<script[^>]+src="(?:<\?=\s*vip_asset\(\s*\x27([^\x27]+)\x27\s*\)\s*\?>|([^"]+))"/',
+        $html, $m, PREG_SET_ORDER
+    );
+    $out = [];
+    foreach ($m as $one) {
+        $out[] = basename($one[1] !== '' ? $one[1] : $one[2]);
+    }
+    return $out;
+}
 
-$cp = file_get_contents($root . 'cp/index.html');
-T::true(strpos($cp, '/assets/ui.js') !== false
-    && strpos($cp, '/assets/ui.js') < strpos($cp, '/cp/cp.js'),
-    '★ 后台 ui.js 排在 cp.js 之前');
+$padOrder = script_order(file_get_contents($root . 'index.php'));
+$iBridge  = array_search('sushivip-bridge.js', $padOrder, true);
+$iUi      = array_search('ui.js',  $padOrder, true);
+$iPad     = array_search('pad.js', $padOrder, true);
+T::true($iBridge !== false, 'Pad 页引入了桥接封装');
+T::true($iUi !== false, 'Pad 页引入了 ui.js');
+T::true($iBridge !== false && $iPad !== false && $iBridge < $iPad,
+    '★ 桥接排在 pad.js 之前（晚了就取不到原生设备 ID，且不报错）');
+T::true($iUi !== false && $iPad !== false && $iUi < $iPad,
+    '★ ui.js 排在 pad.js 之前（实际顺序：' . implode(' → ', $padOrder) . '）');
+
+$cpOrder = script_order(file_get_contents($root . 'cp/index.php'));
+$cUi  = array_search('ui.js',  $cpOrder, true);
+$cCp  = array_search('cp.js',  $cpOrder, true);
+T::true($cUi !== false && $cCp !== false && $cUi < $cCp,
+    '★ 后台 ui.js 排在 cp.js 之前（实际顺序：' . implode(' → ', $cpOrder) . '）');
 
 T::group('容器兼容 · 设备标识');
 
@@ -233,3 +251,30 @@ foreach (['assets/pad.css', 'cp/cp.css'] as $rel) {
     T::true((bool)preg_match('/padding:\s*\d+px/', $css),
         "$rel 保留了不带 env() 的普通 padding 作兜底");
 }
+
+T::group('容器兼容 · 桥接副本不能漂移');
+
+/**
+ * 桥接封装有两份：容器方维护的原件在 apk/doc/，我们部署的副本在
+ * wwwroot/assets/。两份必须逐字节相同 —— 它是 Web 与容器之间唯一的契约层，
+ * 一边改了另一边没跟上，表现是「功能悄悄退化但什么都不报错」。
+ *
+ * 实际发生过：容器方把 UA 正则从 [\d.]+ 改成 [\w.-]+ 以保留 "-debug" 后缀
+ * （debug 与 release 包的 ANDROID_ID 不同，必须能分辨），
+ * 而我们部署的那份还是旧的，diagnose() 里两种包看起来一模一样。
+ *
+ * apk/ 目录不部署到门店服务器，所以那里跑测试时这一组自动跳过。
+ */
+$apkBridge = __DIR__ . '/../../apk/doc/sushivip-bridge.js';
+$webBridge = $root . 'assets/sushivip-bridge.js';
+
+T::true(is_file($webBridge), '部署副本存在（缺了就取不到原生设备 ID）');
+
+if (!is_file($apkBridge)) {
+    echo "  \033[33m–\033[0m 跳过副本比对：apk/ 不在（门店服务器上属正常）\n";
+} else {
+    T::eq(md5_get($apkBridge), md5_get($webBridge),
+        '★ wwwroot 里的桥接与 apk/doc/ 的原件逐字节一致');
+}
+
+function md5_get(string $f): string { return md5((string)file_get_contents($f)); }

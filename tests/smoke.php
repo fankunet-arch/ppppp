@@ -17,6 +17,18 @@ declare(strict_types=1);
  *      SMOKE_DB_USER / SMOKE_DB_PASS
  *   2) app/config/config.php 的 local_db
  *
+ * 🔴 --fresh 请给它一个【专用空库】，不要指着开发库跑：
+ *
+ *     CREATE DATABASE vip_smoke DEFAULT CHARSET utf8mb4
+ *            COLLATE utf8mb4_unicode_ci;
+ *
+ *     SMOKE_DB_HOST=127.0.0.1 SMOKE_DB_NAME=vip_smoke \
+ *     SMOKE_DB_USER=... SMOKE_DB_PASS=... php tests/smoke.php --fresh
+ *
+ *   开发库里有种子数据和浏览器测试留下的卡（store_code != 'SMOKE'），
+ *   下面那道安全检查会直接拒绝执行 —— 这是对的，不要去绕过它，
+ *   换一个空库就行。
+ *
  * ★ 安全设计
  *   · 全程使用独立门店码 SMOKE，绝不触碰生产数据；
  *   · --fresh 会执行 DROP TABLE，因此若库中存在 store_code != 'SMOKE'
@@ -65,6 +77,8 @@ spl_autoload_register(static function (string $class): void {
 
 use Vip\App;
 use Vip\LocalDb;
+use Vip\CardNumber;
+use Vip\Repo\CardRepo;
 use Vip\PointsEngine as PE;
 use Vip\Test\FakePosSource;
 
@@ -116,7 +130,7 @@ ok(in_array($flavor, ['mysql', 'mariadb'], true), "识别数据库类型：{$fla
 
 // ── 2. 安全闸门 + 建表 ───────────────────────────────────────
 $tables = ['pos_order','member','point_ledger','coupon','meal_item_rule',
-           'meal_period','sys_config','sync_cursor','audit_log','alert'];
+           'meal_period','sys_config','sync_cursor','audit_log','alert','card'];
 
 $existing = [];
 foreach ($db->all('SHOW TABLES') as $row) {
@@ -147,6 +161,22 @@ if ($fresh) {
     ok(true, '库中无非 SMOKE 数据，可以安全建表');
 
     step('执行 migrations 与 seeds');
+
+    /**
+     * ★ 先把表全删干净，别指望迁移自己清场。
+     *
+     * 早先这里直接跑迁移，靠 001/002 里的 DROP TABLE 来清空。但后来新增的
+     * 表用的是 CREATE TABLE IF NOT EXISTS（为了不触发 init.php 的破坏性
+     * 迁移闸门）—— 没有任何东西会删它们。于是重跑 --fresh 时，表还在、
+     * 列也还在，后面某个 ALTER 就撞上「Duplicate column」，
+     * 报错指向迁移文件，看着像迁移写错了，其实是没清干净。
+     *
+     * --fresh 就该是 fresh。
+     */
+    foreach (array_merge($tables, ['schema_migration']) as $t) {
+        $db->pdo()->exec("DROP TABLE IF EXISTS `{$t}`");
+    }
+
     // ★ 必须扫目录而不是写死文件名 —— 早先这里硬编码了 001_init.sql，
     //   于是每加一个迁移（002、003…）冒烟测试都会因为缺列而崩，
     //   且报错指向业务代码，看不出真正原因是建表少跑了迁移。
@@ -171,7 +201,7 @@ if ($fresh) {
     if ($missing) {
         die_('缺少表：' . implode(', ', $missing) . "\n请先用 --fresh 建表。");
     }
-    ok(true, '10 张表均已存在');
+    ok(true, count($tables) . ' 张表均已存在');
 }
 
 // ── 3. 清理上次残留 ──────────────────────────────────────────
@@ -187,6 +217,30 @@ step('灌入 SMOKE 门店的配置与套餐规则');
 
 $app = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
 $app->setLocalDb($db);   // 与断言共用同一条连接
+
+/**
+ * 建会员的测试辅助。
+ *
+ * 改发实体卡之后，会员不能凭空创建 —— 必须绑一张 card 库存表里真实存在
+ * 的卡。这里预生成一批库存卡按需取用，让不关心卡片的那些测试保持原样，
+ * 只是把 $newMember(...) 换成 $newMember(...)。
+ */
+$cardPool  = [];
+$newMember = static function (?string $phone = null, ?string $email = null, ?string $bday = null)
+        use ($app, &$cardPool): array {
+    if (!$cardPool) {
+        $cardPool = $app->cards()->generateBatch('SMOKEPOOL', 40);
+    }
+    $c = array_shift($cardPool);
+    $r = $app->cardService()->bindNewMember(
+        $c['card_no'], $phone, $email, $bday,
+        ['id' => null, 'name' => 'smoke', 'device' => null]
+    );
+    if (!$r['ok']) {
+        die_('测试辅助建会员失败：' . ($r['error'] ?? '?'));
+    }
+    return $r['member'];
+};
 
 $cfgSeed = [
     'order_lookup_window_min' => '30',
@@ -303,8 +357,8 @@ eq(1, $ctxB['portions_counted'], '计次份数 1（BOX 不计次）');
 // ── 7. 会员 ──────────────────────────────────────────────────
 step('③ 建会员');
 
-$mA = $app->members()->create('+34600000001', null, null);
-$mB = $app->members()->create(null, 'b@example.com', '1990-05-20');
+$mA = $newMember('+34600000001', null, null);
+$mB = $newMember(null, 'b@example.com', '1990-05-20');
 ok((int)$mA['id'] > 0 && (int)$mB['id'] > 0, '建立 2 名会员');
 eq(0, (int)$mA['consent_status'], '新会员 consent_status=0（pending，积分入账但冻结）');
 ok(!empty($mA['consent_token']), '生成 double opt-in 令牌');
@@ -373,7 +427,7 @@ eq(2, (int)$db->value('SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND 
 // ── 10. AA 分摊 ──────────────────────────────────────────────
 step('⑦ 撤销后改记 AA —— 3 人均摊（其中一人现场新建会员）');
 
-$mC = $app->members()->create('+34600000003', null, null);   // 客人没卡，现场建
+$mC = $newMember('+34600000003', null, null);   // 客人没卡，现场建
 $split = PE::splitEvenly(7170, 3, 3);
 eq(7170, array_sum(array_column($split, 'amount_cents')), 'AA 金额合计不丢分');
 eq(3, array_sum(array_column($split, 'portions')), 'AA 份数合计不丢');
@@ -525,7 +579,7 @@ foreach (['reward_enabled' => '1', 'reward_mode' => 'visits',
         [SMOKE_STORE, $k, $v, $db->now()]);
 }
 
-$rwMember = $app->members()->create('600990001', null, null);
+$rwMember = $newMember('600990001', null, null);
 $rwId     = (int)$rwMember['id'];
 $db->exec('UPDATE member SET visit_count = 10 WHERE id = ?', [$rwId]);
 
@@ -590,7 +644,7 @@ $ctx10 = $loc10['candidates'][0];
 eq(10, $ctx10['portions_counted'], '10 人 10 份 → 计次份数 10');
 
 // 全新会员，从 0 次起算，好判断到底加了几次
-$mid10 = (int)$app->members()->create('+34600000010', null, null)['id'];
+$mid10 = (int)$newMember('+34600000010', null, null)['id'];
 $g10 = $svc->grant('2608130090',
     [['member_id' => $mid10, 'amount_cents' => 23900, 'portions' => 10]],
     PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
@@ -626,7 +680,7 @@ $svcL = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => 
 $svcL->setLocalDb($db);
 $svcL->setPosSource($pos);
 $svcL->points()->locate('51');
-$midL = (int)$app->members()->create('+34600000011', null, null)['id'];
+$midL = (int)$newMember('+34600000011', null, null)['id'];
 $gL = $svcL->points()->grant('2608130091',
     [['member_id' => $midL, 'amount_cents' => 23900, 'portions' => 10]],
     PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
@@ -790,7 +844,7 @@ ok($ctxMx['eligible'], '★ 混合单可以发分（早先是整单拒绝，3 �
 ok($ctxMx['is_redeemed'], '仍标记为含核销，审计能看出来');
 
 // 整单记给一人 → 应计 3 次
-$midMx = (int)$app->members()->create('+34600000012', null, null)['id'];
+$midMx = (int)$newMember('+34600000012', null, null)['id'];
 $gMx = $appMx->points()->grant('2608130096',
     [['member_id' => $midMx, 'amount_cents' => 6670, 'portions' => 3]],
     PE::MODE_WHOLE, ['id' => 1, 'name' => '收银员甲']);
@@ -816,6 +870,593 @@ eq(0, $ctxAll['portions_counted'],  '★ 整桌兑换 → 可计次 0 份');
 ok(!$ctxAll['eligible'], '★ 整单兑换仍不可发分（原有口径不变）');
 
 // ── 13. 不变量总校验 ─────────────────────────────────────────
+step('⑭ 实体卡库存 —— 真伪只由 card 表说了算');
+
+$cards  = $app->cards();
+$cardNo = $app->cardNumber();
+
+// ── 批次生成 ──
+$batch = $cards->generateBatch('SMOKEB1', 8);
+eq(8, count($batch), '生成 8 张卡');
+eq(8, count(array_unique(array_column($batch, 'card_no'))), '卡号互不重复');
+eq(8, count(array_unique(array_column($batch, 'serial'))), '顺序号互不重复');
+
+$first = $batch[0];
+ok($cardNo->isWellFormed($first['card_no']), "卡号结构合法（{$first['display']}）");
+eq(6, strlen($first['pin']), 'PIN 是 6 位');
+ok(ctype_digit($first['pin']), 'PIN 是纯数字（好印、好念、报的时候没字母歧义）');
+
+// ── 明文 PIN 绝不入库 ──
+$row = $cards->findByCardNo($first['card_no']);
+ok($row !== null, '卡能按卡号查到');
+ok(!str_contains((string)$row['pin_hash'], $first['pin']),
+   '★ 库里存的是 hash，不含明文 PIN');
+ok(str_starts_with((string)$row['pin_hash'], '$2y$'),
+   '★ 用 bcrypt（与收银员 PIN 同一套做法）');
+eq(0, (int)$row['status'], '新卡状态是「库存中」');
+eq(null, $row['member_id'], '新卡未绑定任何会员');
+
+// 同一个 PIN 在不同卡上存出来的 hash 不同（每条独立加盐，防彩虹表）
+$sameP = password_hash($first['pin'], PASSWORD_BCRYPT);
+ok($sameP !== $row['pin_hash'], '★ 相同 PIN 的两次 hash 不相等（每条独立加盐）');
+
+// ── 这一层才是防伪造的真正防线 ──
+$forged = $cardNo->make(99999999);
+ok($cardNo->isWellFormed($forged), '伪造的卡号结构上完全合法');
+eq(null, $cards->findByCardNo($forged),
+   '★ 但库里没有 → 查不到。结构合法 ≠ 卡存在，真伪只由 card 表说了算');
+
+// ── 手输容错 ──
+$typed = str_replace('0', 'O', $first['display']);          // 照卡面把 0 读成 O
+ok($cards->findByCardNo($typed) !== null, "★ 手输把 0 打成 O 也能找到（{$typed}）");
+ok($cards->findByCardNo(strtolower($first['display'])) !== null, '小写也能找到');
+
+// ── PIN 校验与锁定 ──
+$row = $cards->findByCardNo($first['card_no']);
+ok($cards->verifyPin($row, $first['pin'])['ok'], '正确 PIN 通过');
+
+$row = $cards->findByCardNo($first['card_no']);
+$bad = $cards->verifyPin($row, '000000');
+ok(!$bad['ok'] && $bad['error'] === 'pin_wrong', '错误 PIN 被拒');
+
+// 连错到阈值要锁定 —— 卡背 PIN 是静态的，不锁就能慢慢穷举 100 万种
+// 注意上面那次 '000000' 已经算一次失败，所以这里从第 2 次开始数
+$row      = $cards->findByCardNo($first['card_no']);
+$failSoFar = (int)$row['pin_fail'];
+$lockAt   = null;
+for ($i = 0; $i < 8; $i++) {
+    $row = $cards->findByCardNo($first['card_no']);
+    $r   = $cards->verifyPin($row, '999999');
+    if (($r['error'] ?? '') === 'pin_locked') { $lockAt = $failSoFar + $i + 1; break; }
+}
+eq(CardRepo::PIN_MAX_FAIL, $lockAt,
+   '★ 累计错到第 ' . CardRepo::PIN_MAX_FAIL . ' 次时锁定');
+
+$row = $cards->findByCardNo($first['card_no']);
+$still = $cards->verifyPin($row, $first['pin']);
+ok(!$still['ok'] && $still['error'] === 'pin_locked',
+   '★ 锁定期内即使 PIN 正确也拒绝（否则锁了等于没锁）');
+
+$cards->resetPinFail((int)$row['id']);
+$row = $cards->findByCardNo($first['card_no']);
+ok($cards->verifyPin($row, $first['pin'])['ok'], '解锁后正确 PIN 恢复通过');
+
+// ── 扫卡建会员：走真实流程 ──
+$svc   = $app->cardService();
+$opStub = ['id' => null, 'name' => 'smoke', 'device' => null];
+
+$look = $svc->lookup($first['card_no']);
+ok($look['ok'] && $look['state'] === 'stock', '库存卡 lookup → state=stock（该弹建卡表单）');
+
+$bind = $svc->bindNewMember($first['card_no'], '600100200', null, null, $opStub);
+ok($bind['ok'], '扫库存卡 + 填手机号 → 建会员并绑卡');
+$m = $bind['member'];
+eq(CardNumber::normalize($first['card_no']), $m['card_no'], '会员行上的卡号与实体卡一致');
+
+$look = $svc->lookup($first['card_no']);
+ok($look['ok'] && $look['state'] === 'active', '再扫同一张 → state=active（直接进该会员）');
+eq((int)$m['id'], (int)$look['member']['id'], '认出的是同一位会员');
+
+// 已绑定的卡不能再拿去建新会员 —— 该走「直接进入该会员」
+$again = $svc->bindNewMember($first['card_no'], '600100201', null, null, $opStub);
+ok(!$again['ok'] && $again['error'] === 'card_taken', '★ 已绑定的卡不能再建新会员');
+
+// 同一个会员不能再绑第二张卡 —— 数据库唯一键挡住，不靠应用层自觉
+$second = $batch[1];
+$row2   = $cards->findByCardNo($second['card_no']);
+$twoCards = false;
+try { $cards->activate((int)$row2['id'], (int)$m['id'], null); }
+catch (\Throwable $e) { $twoCards = true; }
+ok($twoCards, '★ 一人一卡由 uk_member 唯一键在数据库层保证');
+
+// ── 卡片默认不实名 ──
+/**
+ * 凭卡号 + 卡背 PIN 即可积分与兑换，系统里不存任何可识别到人的数据。
+ * 没有个人数据就没有可同意的对象 —— 积分当场生效，不冻结。
+ *
+ * 留联系方式那条路【保留】着，为的是以后要上实名时链路是通的：
+ * 一旦填了手机号或邮箱，这条记录重新落入个人数据范畴，
+ * 双重确认那套照旧（待确认 + 积分冻结）。
+ */
+$anonCard = $batch[2];
+$anon = $svc->bindNewMember($anonCard['card_no'], null, null, null, $opStub);
+ok($anon['ok'], '不填任何联系方式也能绑卡');
+eq(1, (int)$anon['member']['consent_status'],
+   '★ 匿名卡直接置为已生效（没有个人数据就没有可同意的对象）');
+eq(null, $anon['member']['phone'], '库里没有手机号');
+eq(null, $anon['member']['email'], '库里没有邮箱');
+ok($anon['member']['consent_at'] !== null, '同意时间记为创建时间');
+
+$piiCard = $batch[3];
+$pii = $svc->bindNewMember($piiCard['card_no'], '600888777', null, null, $opStub);
+ok($pii['ok'], '留手机号也能绑卡');
+eq(0, (int)$pii['member']['consent_status'],
+   '★ 留了联系方式则回到待确认（实名那条路仍然通着，供日后启用）');
+eq('600888777', $pii['member']['phone'], '手机号已存');
+
+// ── 不在库存里的卡 ──
+$forgedLook = $svc->lookup($forged);
+ok(!$forgedLook['ok'] && $forgedLook['error'] === 'card_unknown',
+   '★ 结构合法但不在库存 → card_unknown（防伪造的真正防线）');
+$junk = $svc->lookup('随便扫到的别的二维码');
+ok(!$junk['ok'] && $junk['error'] === 'card_malformed',
+   '扫错二维码 → card_malformed（提示「卡号不完整」比「查无此卡」有用）');
+
+// ── 挂失换卡：走真实流程 ──
+$rep = $svc->replaceCard((int)$m['id'], $second['card_no'], '客人报失', $opStub);
+ok($rep['ok'], '挂失换卡成功');
+
+$row = $cards->findByCardNo($first['card_no']);
+eq(2, (int)$row['status'], '旧卡状态变为「已作废」');
+eq(null, $row['member_id'],
+   '★ 作废时必须清空 member_id，否则唯一键会挡住这位会员绑新卡');
+
+$row2 = $cards->findByCardNo($second['card_no']);
+eq((int)$m['id'], (int)$row2['member_id'], '★ 新卡已绑到同一位会员');
+eq(CardNumber::normalize($second['card_no']),
+   $app->members()->findById((int)$m['id'])['card_no'],
+   '★ 会员行上的 card_no 也同步到新卡（冗余字段必须有人负责同步）');
+
+$voidLook = $svc->lookup($first['card_no']);
+ok(!$voidLook['ok'] && $voidLook['error'] === 'card_void', '扫已作废的旧卡 → card_void');
+
+// ── 批次统计 ──
+$b = null;
+foreach ($cards->batches() as $x) { if ($x['batch_no'] === 'SMOKEB1') { $b = $x; } }
+ok($b !== null, '批次能查到');
+eq(8, (int)$b['total'], '批次共 8 张');
+eq(3, (int)$b['active'],
+   '其中 3 张已激活（换发的新卡 + 匿名卡 + 留了手机号的卡）——\n    这条断言在确认码那一段【之前】执行，后面还会再激活两张');
+eq(1, (int)$b['void_cnt'], '其中 1 张已作废（挂失的旧卡）');
+
+// ── 拒绝不合理的批次参数 ──
+foreach ([[0, '数量为 0'], [5001, '数量超上限']] as [$n, $why]) {
+    $threw = false;
+    try { $cards->generateBatch('SMOKEB2', $n); }
+    catch (\InvalidArgumentException $e) { $threw = true; }
+    ok($threw, "{$why}时拒绝生成");
+}
+$threw = false;
+try { $cards->generateBatch('SMOKEB1', 1); }
+catch (\InvalidArgumentException $e) { $threw = true; }
+ok($threw, '★ 批次号重复时拒绝（否则盘点时对不上账）');
+
+step('⑮ 核销验卡背 PIN —— 唯一真正会造成损失的一步');
+
+/**
+ * 二维码印在卡正面可被拍照复制，PIN 藏在刮开层下只有真正拿到卡的人知道。
+ * 所以核销要验 PIN，而积分入账那一侧不验 ——
+ * 被人抄卡去攒分，店家没有损失，受害者反而多了分。
+ */
+$pinBatch = $app->cards()->generateBatch('SMOKEPIN', 2);
+$pinCard  = $pinBatch[0];
+$bindR    = $app->cardService()->bindNewMember(
+    $pinCard['card_no'], '600777001', null, null, $opStub
+);
+ok($bindR['ok'], '备一位持卡会员');
+$pinMid = (int)$bindR['member']['id'];
+
+// 发一张券给他
+$rw = $app->rewards();
+$db->exec('INSERT INTO coupon (store_code, member_id, coupon_type, source, code, status, created_at)
+           VALUES (?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $pinMid, 1, 3, 'SMOKEPINC1', 1, $db->now()]);
+$couponId = (int)$db->lastInsertId();
+
+$cashier = ['id' => 9, 'name' => '收银员', 'role' => 1];
+$manager = ['id' => 8, 'name' => '经理',   'role' => 2];
+
+// ── 不给 PIN ──
+$r = $rw->redeem($couponId, null, $cashier);
+ok(!$r['ok'] && $r['error'] === 'pin_required', '★ 不给 PIN 不给核销');
+eq(1, (int)$db->value('SELECT status FROM coupon WHERE id=?', [$couponId]), '券仍未使用');
+
+// ── PIN 不对 ──
+$r = $rw->redeem($couponId, null, $cashier, '000000');
+ok(!$r['ok'] && $r['error'] === 'pin_wrong', 'PIN 不对不给核销');
+eq(1, (int)$db->value('SELECT status FROM coupon WHERE id=?', [$couponId]), '券仍未使用');
+
+// ── 收银员不能强制核销 ──
+$r = $rw->redeem($couponId, null, $cashier, null, ['reason' => '想跳过']);
+ok(!$r['ok'] && $r['error'] === 'forbidden', '★ 收银员强制核销被拒（需经理及以上）');
+
+// ── 经理强制核销必须填原因 ──
+$r = $rw->redeem($couponId, null, $manager, null, ['reason' => '  ']);
+ok(!$r['ok'] && $r['error'] === 'reason_required', '★ 强制核销必须填原因');
+
+// ── 正确 PIN ──
+$app->cards()->resetPinFail((int)$app->cards()->findByCardNo($pinCard['card_no'])['id']);
+$r = $rw->redeem($couponId, 'SER001', $cashier, $pinCard['pin']);
+ok($r['ok'], '★ 正确 PIN 核销成功');
+ok(!$r['forced'], '走的是正常路径，不是强制');
+eq(2, (int)$db->value('SELECT status FROM coupon WHERE id=?', [$couponId]), '券状态变为已核销');
+
+$audit = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'coupon_redeem']);
+ok($audit !== null, '正常核销记 coupon_redeem 审计事件');
+
+// ── 经理强制核销（另一张券）──
+$db->exec('INSERT INTO coupon (store_code, member_id, coupon_type, source, code, status, created_at)
+           VALUES (?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $pinMid, 1, 3, 'SMOKEPINC2', 1, $db->now()]);
+$couponId2 = (int)$db->lastInsertId();
+
+$r = $rw->redeem($couponId2, null, $manager, null, ['reason' => '客人忘记卡背 PIN']);
+ok($r['ok'] && $r['forced'], '★ 经理带原因可强制核销');
+eq(2, (int)$db->value('SELECT status FROM coupon WHERE id=?', [$couponId2]), '券已核销');
+
+$forcedLog = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'coupon_redeem_forced']);
+ok($forcedLog !== null, '★ 强制核销记的是单独的 coupon_redeem_forced 事件');
+ok(str_contains((string)$forcedLog['detail'], '客人忘记'), '原因写进了审计明细');
+
+// ── 挂失后没有卡 ──
+$db->exec('INSERT INTO coupon (store_code, member_id, coupon_type, source, code, status, created_at)
+           VALUES (?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $pinMid, 1, 3, 'SMOKEPINC3', 1, $db->now()]);
+$couponId3 = (int)$db->lastInsertId();
+$app->cards()->void((int)$app->cards()->findByCardNo($pinCard['card_no'])['id'], '测试挂失');
+
+$r = $rw->redeem($couponId3, null, $cashier, '123456');
+ok(!$r['ok'] && $r['error'] === 'card_missing',
+   '★ 会员当前没有卡时说清楚（别让人对着 PIN 框干瞪眼）');
+
+// 但经理仍可强制核销 —— 补卡之前不该卡住客人
+$r = $rw->redeem($couponId3, null, $manager, null, ['reason' => '卡已挂失待补发']);
+ok($r['ok'] && $r['forced'], '★ 没有卡时经理仍可强制核销');
+
+step('⑯ 现场确认码 —— 双重确认改成不依赖公网入口');
+
+/**
+ * 原方案是「客人点短信里的链接」，那需要一个公网可达的端点接收点击，
+ * 而门店网络是单向的（能出去、进不来）—— 这条路根本走不通，
+ * 而这个矛盾在原设计里没被发现。
+ *
+ * 改成现场输码：只发一个 6 位码（纯出站），客人当场报给收银员。
+ * 举证靠审计日志：发送时间、发到哪个渠道、校验通过时间、经手的操作员。
+ */
+
+/** 发送器替身 —— 不真发，只把最后一条消息记下来供断言 */
+$fakeMsg = new class([]) extends \Vip\Service\Messaging {
+    public array $sent = [];
+    public function ready(string $channel): bool { return true; }
+    public function readyChannels(): array { return ['sms', 'email']; }
+    public function send(string $channel, string $to, string $subject, string $text): array
+    {
+        $this->sent[] = compact('channel', 'to', 'subject', 'text');
+        return ['ok' => true];
+    }
+};
+
+$consent = new \Vip\Service\ConsentService(
+    $db, $app->members(), $fakeMsg, $app->cfg(), $app->audit(), SMOKE_STORE, '冒烟店'
+);
+$opC = ['id' => 7, 'name' => '收银员', 'device' => 'PAD-S'];
+
+// 备一位留了手机号的会员
+$cCard = $batch[4];
+$cBind = $svc->bindNewMember($cCard['card_no'], '600666555', null, null, $opStub);
+ok($cBind['ok'], '备一位留了手机号的会员');
+$cMid = (int)$cBind['member']['id'];
+eq(0, (int)$cBind['member']['consent_status'], '留了联系方式 → 待确认');
+
+// ── 发码 ──
+$r = $consent->sendCode($cMid, $opC);
+ok($r['ok'] && $r['channel'] === 'sms', '★ 有手机号 → 走短信');
+eq(1, count($fakeMsg->sent), '发出了一条');
+
+$msgText = $fakeMsg->sent[0]['text'];
+ok(preg_match('/\b(\d{6})\b/', $msgText, $mm) === 1, '消息里有 6 位码');
+$realCode = $mm[1];
+ok(str_contains($msgText, '冒烟店'), '消息里带店名（客人要知道是谁发的）');
+eq('600666555', $fakeMsg->sent[0]['to'], '发到客人留的手机号');
+
+$row = $db->one('SELECT * FROM member WHERE id = ?', [$cMid]);
+ok(!str_contains((string)$row['consent_code_hash'], $realCode),
+   '★ 库里存的是 hash，不含明文码');
+eq('sms', $row['consent_channel'], '记下走的哪个渠道（举证要说清发到哪里）');
+ok($row['consent_code_sent_at'] !== null, '记下发送时间');
+
+$log = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'consent_code_sent']);
+ok($log !== null, '发码留了审计');
+ok(!str_contains((string)$log['detail'], '600666555'),
+   '★ 审计里的收件人做了掩码 —— 日志本身不该成为一份联系方式清单');
+
+// ── 校验 ──
+$bad = $consent->verifyCode($cMid, '000000', $opC);
+ok(!$bad['ok'] && $bad['error'] === 'code_wrong', '码错了不给过');
+ok(($bad['left'] ?? null) !== null, '告诉还能试几次');
+
+$good = $consent->verifyCode($cMid, $realCode, $opC, '192.168.2.9');
+ok($good['ok'], '★ 正确的码通过');
+
+$row = $db->one('SELECT * FROM member WHERE id = ?', [$cMid]);
+eq(1, (int)$row['consent_status'], '★ 积分解冻（consent_status = 1）');
+eq(null, $row['consent_code_hash'], '通过后码立即作废，不留在库里');
+eq('192.168.2.9', $row['consent_ip'], '记下确认来源 IP，举证用');
+
+$log = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'consent_confirmed']);
+ok($log !== null, '★ 确认通过留了审计（这就是举证链条）');
+
+// 幂等：已确认的再确认一次不报错
+ok($consent->verifyCode($cMid, 'whatever', $opC)['ok'], '已确认的会员重复确认不报错');
+
+// ── 连错锁定 ──
+$cCard2 = $batch[5];
+$cBind2 = $svc->bindNewMember($cCard2['card_no'], '600666444', null, null, $opStub);
+$cMid2  = (int)$cBind2['member']['id'];
+$consent->sendCode($cMid2, $opC);
+
+$lockAt = null;
+for ($i = 1; $i <= 8; $i++) {
+    $rr = $consent->verifyCode($cMid2, '111111', $opC);
+    if (($rr['error'] ?? '') === 'code_locked') { $lockAt = $i; break; }
+}
+eq(\Vip\Service\ConsentService::MAX_FAIL + 1, $lockAt,
+   '★ 连错 ' . \Vip\Service\ConsentService::MAX_FAIL . ' 次后锁定（防穷举 6 位码）');
+
+// 重发换新码，并解掉锁
+$before = count($fakeMsg->sent);
+$r2 = $consent->sendCode($cMid2, $opC);
+ok($r2['ok'], '★ 锁住之后可以重发');
+eq($before + 1, count($fakeMsg->sent), '确实又发了一条');
+preg_match('/\b(\d{6})\b/', $fakeMsg->sent[count($fakeMsg->sent) - 1]['text'], $m2);
+ok($consent->verifyCode($cMid2, $m2[1], $opC)['ok'], '★ 新码可用（重发会重置失败计数）');
+
+// ── 匿名会员没有可确认的对象 ──
+$anonR = $consent->sendCode((int)$anon['member']['id'], $opC);
+ok(!$anonR['ok'] && $anonR['error'] === 'consent_already_done',
+   '★ 匿名卡本来就是已生效状态，不需要也不能再确认');
+
+step('⑰ 卡片有效期 —— 卡面日期是唯一的告知证据');
+
+/**
+ * 为什么用「固定日期印在卡上」而不是「N 个月不活跃就清零」：
+ * 客人查不到任何线上信息，手里只有一张卡。不活跃期这种规则他无从判断
+ * 自己处在什么位置，一旦投诉，店家拿不出「已告知」的证据。
+ * 而固定日期印在卡面 —— 卡片本身就是证据。
+ *
+ * 缺陷是常客也会被清零，补法是「有效期属于卡片，不属于积分」：
+ * 到店换卡则积分全部结转。以下把这条链路钉住。
+ */
+$today    = date('Y-m-d');
+$past     = date('Y-m-d', strtotime('-1 day'));
+$soon     = date('Y-m-d', strtotime('+10 days'));
+$far      = date('Y-m-d', strtotime('+3 years'));
+
+// ── 生成时的有效期校验 ──
+foreach ([[$past, '已经过去的日期'], [$today, '就是今天'], ['2026-13-45', '格式不对']] as [$bad, $why]) {
+    $threw = false;
+    try { $cards->generateBatch('SMOKEVT' . substr(md5($bad), 0, 4), 1, $bad); }
+    catch (\InvalidArgumentException $e) { $threw = true; }
+    ok($threw, "{$why}的有效期被拒绝");
+}
+
+$vb = $cards->generateBatch('SMOKEVAL', 3, $far);
+eq($far, $vb[0]['valid_to'], '★ 有效期写进了卡（印刷清单里也要有这一列）');
+eq($far, (string)$cards->findByCardNo($vb[0]['card_no'])['valid_to'], '库里存下来了');
+
+// ── 判定 ──
+$live = $cards->findByCardNo($vb[0]['card_no']);
+ok(!CardRepo::isExpired($live), '未到期的卡不算过期');
+ok(CardRepo::daysLeft($live) > 300, '剩余天数算得出来');
+
+$fake = ['valid_to' => $past];
+ok(CardRepo::isExpired($fake), '★ 过了 valid_to 就算过期');
+ok(CardRepo::daysLeft($fake) < 0, '过期后剩余天数是负的');
+ok(!CardRepo::isExpired(['valid_to' => null]), '不设有效期的卡永不过期');
+$G = $svc->graceMonths();
+eq(CardRepo::GRACE_MONTHS, $G, '宽限期默认取到 ' . CardRepo::GRACE_MONTHS . ' 个月');
+ok(!CardRepo::graceOver(['valid_to' => $past], $G), '刚过期还在宽限期内');
+ok(CardRepo::graceOver(['valid_to' => date('Y-m-d', strtotime('-8 months'))], $G),
+   '★ 超过 ' . $G . ' 个月宽限才算彻底失效');
+
+/**
+ * 宽限期是后台可调的 —— 改了必须【当场】生效。
+ *
+ * 用同一个 $svc 验，不新建对象：真实现场就是后台改完、Pad 下一次请求就该
+ * 按新值判。ConfigRepo 有缓存，set() 里清了 —— 这条断言守的正是那一句，
+ * 漏了的话表现是「后台数字改了但行为不变」，最难查的一类。
+ */
+$app->cfg()->set('card_grace_months', '1');
+eq(1, $svc->graceMonths(), '★ 后台把宽限期改成 1 个月，服务层当场读到 1');
+ok(CardRepo::graceOver(['valid_to' => date('Y-m-d', strtotime('-3 months'))], $svc->graceMonths()),
+   '★ 按新的 1 个月判定，3 个月前过期的卡已超宽限');
+$app->cfg()->set('card_grace_months', '0');
+eq(0, $svc->graceMonths(), '0 是有意义的取值（过期即不能换），不该被兜底吃掉');
+$app->cfg()->set('card_expiring_soon_days', '45');
+eq(45, $svc->expiringSoonDays(), '提醒天数同样可调');
+$app->cfg()->set('card_grace_months', (string)CardRepo::GRACE_MONTHS);
+$app->cfg()->set('card_expiring_soon_days', (string)CardRepo::EXPIRING_SOON_DAYS);
+eq(CardRepo::GRACE_MONTHS, $svc->graceMonths(), '改回默认值');
+
+// ── 过期卡不能发给客人 ──
+$expBatch = $cards->generateBatch('SMOKEEXP', 2, $far);
+// 直接把库里的日期改成过去，模拟「库存里躺过期了」
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND batch_no = ?',
+    [$past, SMOKE_STORE, 'SMOKEEXP']);
+
+$r = $svc->bindNewMember($expBatch[0]['card_no'], null, null, null, $opStub);
+ok(!$r['ok'] && $r['error'] === 'card_expired',
+   '★ 库存里躺过期的卡不能发给客人（发了他拿回家就是废卡）');
+
+$look = $svc->lookup($expBatch[0]['card_no']);
+eq('expired', $look['state'], '扫过期卡 → state=expired');
+
+// ── 换卡结转：这是整条规则成立的关键 ──
+$oldCard = $vb[1];
+$bindR   = $svc->bindNewMember($oldCard['card_no'], null, null, null, $opStub);
+ok($bindR['ok'], '先发一张正常的卡并激活');
+$vMid = (int)$bindR['member']['id'];
+
+/**
+ * 攒点积分与计次，再把这张卡改成已过期。
+ *
+ * ★ 必须同时写流水。applyDelta 只动余额，而 ⑬ 段有一条不变量
+ *   「每名会员的积分余额与其流水合计一致」—— 只改余额不写流水，
+ *   那条断言会红，而它是对的：造假数据的是测试，不是产品。
+ */
+$app->members()->applyDelta($vMid, 120, 7, 5000);
+$db->exec('INSERT INTO point_ledger
+             (store_code, member_id, entry_type, amount, points, counted_visit,
+              status, source, manual_reason, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $vMid, 6, 50.00, 120, 7, 1, 2, '测试造数', $db->now()]);
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND card_no = ?',
+    [$past, SMOKE_STORE, CardNumber::normalize($oldCard['card_no'])]);
+
+$before = $app->members()->findById($vMid);
+eq(120, (int)$before['points_balance'], '换卡前有 120 分');
+eq(7,   (int)$before['visit_count'],    '换卡前已消费 7 次');
+
+$look = $svc->lookup($oldCard['card_no']);
+eq('expired', $look['state'], '过期卡扫出来是 expired');
+ok(($look['member']['id'] ?? 0) === $vMid,
+   '★ 过期卡要把「绑的是谁」一并带回 —— Pad 才能直接进换卡，不用再查一遍');
+
+$newCard = $vb[2];
+$rep = $svc->replaceCard($vMid, $newCard['card_no'], '原卡到期', $opStub);
+ok($rep['ok'], '★ 过期卡可以换发新卡');
+
+$after = $app->members()->findById($vMid);
+eq(120, (int)$after['points_balance'], '★ 积分完整结转');
+eq(7,   (int)$after['visit_count'],    '★ 计次完整结转');
+eq(CardNumber::normalize($newCard['card_no']), $after['card_no'], '会员行指向新卡');
+eq(2, (int)$cards->findByCardNo($oldCard['card_no'])['status'], '旧卡已作废');
+
+$log = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'card_replace']);
+ok($log !== null && str_contains((string)$log['detail'], 'old_valid_to'),
+   '★ 换卡审计里记下新旧卡的有效期（客人申诉时要查的就是这个）');
+
+// 新卡本身过期的话不能拿来换
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND batch_no = ?',
+    [$past, SMOKE_STORE, 'SMOKEVAL']);
+$r2 = $svc->replaceCard($vMid, $expBatch[1]['card_no'], '再换', $opStub);
+ok(!$r2['ok'] && $r2['error'] === 'card_expired', '★ 不能换成另一张过期卡（换了个寂寞）');
+
+/**
+ * ── 超过宽限期：前台换不了，经理带原因才行 ──────────────
+ *
+ * 这一段守的是「宽限期真的会拦」。之前 graceOver() 写了也测了，
+ * 但没有任何一处调用它 —— 一张 2019 年过期的卡照样能换。
+ * 光测工具函数不够，必须测到 replaceCard 这一层。
+ */
+$farNew  = date('Y-m-d', strtotime('+2 years'));
+$gb      = $cards->generateBatch('SMOKEGRC', 3, $farNew);
+$bindG   = $svc->bindNewMember($gb[0]['card_no'], null, null, null, $opStub);
+ok($bindG['ok'], '再发一张卡用于宽限期测试');
+$gMid = (int)$bindG['member']['id'];
+$app->members()->applyDelta($gMid, 60, 3, 2000);
+$db->exec('INSERT INTO point_ledger
+             (store_code, member_id, entry_type, amount, points, counted_visit,
+              status, source, manual_reason, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)',
+    [SMOKE_STORE, $gMid, 6, 20.00, 60, 3, 1, 2, '测试造数', $db->now()]);
+
+// 把这张卡改成「过期很久」——超出宽限期
+$longAgo = date('Y-m-d', strtotime('-' . (CardRepo::GRACE_MONTHS + 3) . ' months'));
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND card_no = ?',
+    [$longAgo, SMOKE_STORE, CardNumber::normalize($gb[0]['card_no'])]);
+
+$lk = $svc->lookup($gb[0]['card_no']);
+eq('expired', $lk['state'], '超期卡仍然认得出是 expired');
+ok($lk['grace_over'] === true, '★ lookup 会告诉前端「已超宽限期」');
+
+$clerk   = ['id' => 1, 'name' => '收银员', 'role' => 1, 'device' => 'SMOKE'];
+$manager = ['id' => 2, 'name' => '经理',   'role' => 2, 'device' => 'SMOKE'];
+
+$g1 = $svc->replaceCard($gMid, $gb[1]['card_no'], '超期换卡', $clerk);
+ok(!$g1['ok'] && $g1['error'] === 'grace_over', '★ 超过宽限期：普通换卡被拒');
+eq($longAgo, $g1['old_valid_to'], '拒绝时带回判定依据（哪天过期的）');
+eq(CardRepo::GRACE_MONTHS, $g1['grace_months'], '也带回当前宽限期，前端才能把话说清楚');
+eq(CardNumber::normalize($gb[0]['card_no']),
+   $app->members()->findById($gMid)['card_no'], '被拒时旧卡没被动过');
+
+$g2 = $svc->replaceCard($gMid, $gb[1]['card_no'], '超期换卡', $clerk, ['reason' => '客人坚持']);
+ok(!$g2['ok'] && $g2['error'] === 'forbidden', '★ 收银员就算带了原因也破不了例');
+
+$g3 = $svc->replaceCard($gMid, $gb[1]['card_no'], '超期换卡', $manager, ['reason' => '  ']);
+ok(!$g3['ok'] && $g3['error'] === 'reason_required', '★ 经理也必须填原因，空白不算');
+
+$g4 = $svc->replaceCard($gMid, $gb[1]['card_no'], '超期换卡', $manager,
+    ['reason' => '老客户，经理同意保留']);
+ok($g4['ok'] && ($g4['forced'] ?? false) === true, '★ 经理带原因可强制换发');
+
+$afterG = $app->members()->findById($gMid);
+eq(60, (int)$afterG['points_balance'], '★ 强制换发后积分照样保留');
+eq(CardNumber::normalize($gb[1]['card_no']), $afterG['card_no'], '会员行指向新卡');
+
+$flog = $db->one('SELECT * FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC',
+    [SMOKE_STORE, 'card_replace_forced']);
+ok($flog !== null, '★ 强制换发记的是单独的 card_replace_forced 事件（后台能筛出全部破例）');
+ok(str_contains((string)$flog['detail'], '经理同意保留'), '原因写进了审计明细');
+ok(str_contains((string)$flog['detail'], 'grace_months'), '当时的宽限期设置也一并留档');
+
+// 宽限期【之内】不需要经理 —— 别把正常换卡也拦了
+$bindH = $svc->bindNewMember($gb[2]['card_no'], null, null, null, $opStub);
+$hMid  = (int)$bindH['member']['id'];
+$db->exec('UPDATE card SET valid_to = ? WHERE store_code = ? AND card_no = ?',
+    [$past, SMOKE_STORE, CardNumber::normalize($gb[2]['card_no'])]);
+$hb = $cards->generateBatch('SMOKEGR2', 1, $farNew);
+$g5 = $svc->replaceCard($hMid, $hb[0]['card_no'], '刚过期换卡', $clerk);
+ok($g5['ok'] && ($g5['forced'] ?? false) === false,
+   '★ 还在宽限期内的卡，普通收银员照样能换，不用惊动经理');
+
+step('⑱ 界面语言 —— 跟着账号走，不跟着平板走');
+
+/**
+ * 收银台的平板是共用的，中文和西语的员工换班轮着用同一台。
+ * 语言存在 operator 行上，所以「换台平板还是我的语言」「换个人就换语言」
+ * 这两件事才成立。存在平板本地的话就变成「谁后切的算谁的」。
+ */
+$auth   = $app->auth();
+$langOp = $auth->createOperator('smokelang', '语言测试', '778899', 1);
+ok($langOp > 0, "建一个测试账号");
+
+$row = $db->one('SELECT lang FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+ok($row['lang'] === null, '★ 新账号的 lang 是 NULL —— 「没选过」要能和「选了中文」区分开');
+
+ok($auth->setLang($langOp, 'es'), '设成西语');
+$row = $db->one('SELECT lang FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+eq('es', $row['lang'], '★ 落到了 operator 行上');
+
+ok(!$auth->setLang($langOp, 'fr'), '★ 不支持的语言码直接拒绝');
+$row = $db->one('SELECT lang FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+eq('es', $row['lang'], '★ 被拒时不改动原值 —— 宁可保持原样，也别把人的选择改坏');
+
+// 登录与会话恢复两条路都要带上语言，漏一条就是「刷新之后语言变了」
+$lg = $auth->login('smokelang', '778899', 'SMOKEPAD', '127.0.0.1');
+ok($lg['ok'], '能登录');
+eq('es', $lg['operator']['lang'] ?? null, '★ 登录响应里带着语言');
+$me = $auth->resolve((string)$lg['token']);
+eq('es', $me['lang'] ?? null, '★ 会话恢复那条路也带着语言（最容易漏的一条）');
+
+$db->exec('DELETE FROM operator_session WHERE store_code = ? AND operator_id = ?', [SMOKE_STORE, $langOp]);
+$db->exec('DELETE FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

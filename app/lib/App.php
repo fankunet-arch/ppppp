@@ -4,6 +4,7 @@ declare(strict_types=1);
 namespace Vip;
 
 use Vip\Repo\AlertRepo;
+use Vip\Repo\CardRepo;
 use Vip\Repo\AuditRepo;
 use Vip\Repo\ConfigRepo;
 use Vip\Repo\CursorRepo;
@@ -11,6 +12,9 @@ use Vip\Repo\LedgerRepo;
 use Vip\Repo\MealRuleRepo;
 use Vip\Repo\MemberRepo;
 use Vip\Repo\OrderRepo;
+use Vip\Service\CardService;
+use Vip\Service\ConsentService;
+use Vip\Service\Messaging;
 use Vip\Service\AuthService;
 use Vip\Service\MaintenanceService;
 use Vip\Service\PointsService;
@@ -113,6 +117,49 @@ final class App
         return $this->once('members', fn() => new MemberRepo($this->localDb(), $this->storeCode()));
     }
 
+    /**
+     * 实体卡号的生成与结构校验。前缀来自配置，留空则回落到 'TK'。
+     * 真伪判定不在这里 —— 那是 cards()（card 表）的事。
+     */
+    public function cardNumber(): CardNumber
+    {
+        return $this->once('cardNumber', fn() => new CardNumber(
+            (string)($this->config['card_prefix'] ?? 'TK')
+        ));
+    }
+
+    public function cards(): CardRepo
+    {
+        return $this->once('cards', fn() => new CardRepo(
+            $this->localDb(), $this->storeCode(), $this->cardNumber()
+        ));
+    }
+
+    public function messaging(): Messaging
+    {
+        return $this->once('messaging', fn() => new Messaging([
+            'sms'  => $this->config['sms']  ?? [],
+            'mail' => $this->config['mail'] ?? [],
+        ]));
+    }
+
+    public function consent(): ConsentService
+    {
+        return $this->once('consent', fn() => new ConsentService(
+            $this->localDb(), $this->members(), $this->messaging(),
+            $this->cfg(), $this->audit(), $this->storeCode(),
+            (string)($this->config['store_name'] ?? '本店')
+        ));
+    }
+
+    public function cardService(): CardService
+    {
+        return $this->once('cardService', fn() => new CardService(
+            $this->localDb(), $this->cards(), $this->members(),
+            $this->cardNumber(), $this->audit(), $this->storeCode(), $this->cfg()
+        ));
+    }
+
     public function ledger(): LedgerRepo
     {
         return $this->once('ledger', fn() => new LedgerRepo($this->localDb(), $this->storeCode()));
@@ -183,7 +230,7 @@ final class App
     {
         return $this->once('rewards', fn() => new RewardService(
             $this->localDb(), $this->storeCode(), $this->cfg(),
-            $this->members(), $this->audit(),
+            $this->members(), $this->audit(), $this->cards(),
         ));
     }
 

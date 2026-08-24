@@ -51,6 +51,8 @@ $('#btn-login').onclick = async () => {
     const d = await api('/auth/login', {
       login_name: $('#login-name').value.trim(), pin: $('#login-pin').value,
     });
+    window.SMS_READY = !!d.sms_ready;
+    renderWarnings(d.warnings);
     enterMain(d.operator);
   } catch (e) {
     $('#login-err').textContent = e.error === 'forbidden' ? '该账号无后台权限（需经理及以上）' : e.message;
@@ -70,6 +72,20 @@ $('#btn-logout').onclick = async () => {
   $('#view-login').classList.add('active');
 };
 
+/**
+ * 渲染常驻提醒。
+ *
+ * 「开了实名但确认短信还没接入」这类问题不会自己暴露 —— 客人收不到确认
+ * 链接，积分默默冻结着，等有人来投诉才发现。所以让它一直挂在顶栏下面，
+ * 直到问题解决为止。
+ */
+function renderWarnings(list) {
+  const box = $('#cp-warnings');
+  if (!box) return;
+  box.innerHTML = (list || []).map(w =>
+    `<div class="warnbar"><b>⚠ 待处理</b>　${esc(w.text)}</div>`).join('');
+}
+
 function enterMain(op) {
   $('#op-name').textContent = op.name + '（' + ({ 2: '经理', 3: '管理员' }[op.role] || '') + '）';
   $('#view-login').classList.remove('active');
@@ -83,6 +99,7 @@ const LOADERS = {
   dashboard: loadDashboard, alerts: loadAlerts, reviews: loadReviews,
   rules: loadRules, members: () => {}, report: loadReport,
   config: loadConfig, operators: loadOperators, audit: loadAudit, coupons: loadCoupons,
+  cards: loadCards,
 };
 $$('.tab').forEach(t => t.onclick = () => {
   $$('.tab').forEach(x => x.classList.toggle('on', x === t));
@@ -341,8 +358,27 @@ function cfgRow(it, ro) {
 async function saveCfg(key) {
   const el = $(`[data-ck="${key}"]`);
   const val = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+
+  /**
+   * 开启「收集客人联系方式」而确认短信还没接入 —— 先拦一下。
+   *
+   * 这种状态不会自己暴露：客人留了手机号却收不到确认链接，积分默默冻结着，
+   * 等有人来投诉才发现。所以开启时明确告知，开启之后后台再挂一条常驻红条。
+   */
+  if (key === 'member_collect_pii' && val === '1' && window.SMS_READY === false) {
+    const go = await UI.confirm(
+      '确认短信/邮件目前尚未接入。\n\n' +
+      '现在开启的话，留了手机号或邮箱的客人【收不到确认链接】，' +
+      '他们的积分会一直冻结、无法兑换。\n\n' +
+      '确定要开启吗？',
+      { okText: '仍然开启', danger: true }
+    );
+    if (!go) { loadConfig(); return; }   // 取消 → 把复选框状态复原
+  }
+
   try {
-    await api('/config/save', { key, value: val });
+    const r = await api('/config/save', { key, value: val });
+    if (r && r.warnings) renderWarnings(r.warnings);
     toast('已保存', 'ok');
     loadConfig();          // 重载：奖励规则那句话要跟着变
   } catch (e) {
@@ -470,6 +506,135 @@ $('#btn-add-op').onclick = async () => {
   } catch (e) { toast(e.message + (e.detail?.hint ? '：' + e.detail.hint : ''), 'err'); }
 };
 
+
+/* ── 实体卡发放 ───────────────────────────────────── */
+
+async function loadCards() {
+  const d = await api('/cards/batches', undefined, 'GET');
+
+  const tot = d.batches.reduce((a, b) => ({
+    total: a.total + b.total, stock: a.stock + b.stock,
+    active: a.active + b.active, void: a.void + b.void,
+  }), { total: 0, stock: 0, active: 0, void: 0 });
+
+  $('#card-stats').innerHTML = `
+    <div class="stat"><b>${tot.total}</b><span>已印制</span></div>
+    <div class="stat"><b>${tot.stock}</b><span>库存待发</span></div>
+    <div class="stat"><b>${tot.active}</b><span>已激活</span></div>
+    <div class="stat"><b>${tot.void}</b><span>已作废</span></div>
+    <div class="stat"><b>${esc(d.prefix)}</b><span>卡号前缀</span></div>
+    <div class="stat"><b>${d.next_serial}</b><span>下一个顺序号</span></div>`;
+
+  const today = new Date().toISOString().slice(0, 10);
+  $('#card-batches').innerHTML = d.batches.length ? `<table>
+    <tr><th>批次</th><th>有效期至</th><th>顺序号区间</th><th class="num">共</th><th class="num">库存</th>
+        <th class="num">已激活</th><th class="num">已作废</th><th>生成时间</th></tr>${
+    d.batches.map(b => {
+      // 库存里还躺着的过期卡要显眼 —— 发出去客人拿回家就是一张废卡
+      const dead = b.valid_to && b.valid_to < today;
+      return `<tr>
+      <td><b>${esc(b.batch_no)}</b></td>
+      <td class="${dead ? 'err' : 'muted small'}">${b.valid_to ? esc(b.valid_to) : '不设'}${
+        dead && b.stock > 0 ? `　⚠ 库存 ${b.stock} 张已过期` : ''}</td>
+      <td class="muted small">${b.serial_from} ~ ${b.serial_to}</td>
+      <td class="num">${b.total}</td>
+      <td class="num">${b.stock}</td>
+      <td class="num">${b.active}</td>
+      <td class="num">${b.void || ''}</td>
+      <td class="muted small">${esc(b.created_at)}</td></tr>`;
+    }).join('')
+  }</table>` : '<div class="empty">还没有生成过任何批次</div>';
+
+  // 生成批次是管理员才有的动作 —— 它能一次拿到整批明文 PIN
+  const box = $('#cd-gen-box');
+  if (box) box.hidden = !window.IS_ADMIN;
+}
+
+$('#btn-card-look').onclick = async () => {
+  const no = $('#cd-look').value.trim();
+  if (!no) return toast('请输入卡号', 'err');
+  const box = $('#card-look-result');
+  try {
+    const c = await api('/cards/lookup', { card_no: no });
+    const stateText = { stock: '库存中，尚未发给客人', active: '已激活，正常使用中',
+                        void: '已作废/挂失' }[c.state] || c.state;
+    box.innerHTML = `<table>
+      <tr><th>卡号</th><td><b>${esc(c.card_no)}</b></td></tr>
+      <tr><th>状态</th><td>${esc(stateText)}</td></tr>
+      <tr><th>批次</th><td>${esc(c.batch_no)}　顺序号 ${c.serial}</td></tr>
+      <tr><th>有效期至</th><td class="${c.expired ? 'err' : ''}">${
+        c.valid_to ? esc(c.valid_to) + (c.expired ? '　⚠ 已过期，可到店换发新卡（积分结转）' : '') : '不设'}</td></tr>
+      ${c.activated_at ? `<tr><th>激活时间</th><td>${esc(c.activated_at)}</td></tr>` : ''}
+      ${c.voided_at ? `<tr><th>作废</th><td>${esc(c.voided_at)}　${esc(c.void_reason || '')}</td></tr>` : ''}
+      ${c.pin_locked_until ? `<tr><th class="warn">PIN 锁定至</th><td>${esc(c.pin_locked_until)}</td></tr>` : ''}
+      ${c.member ? `<tr><th>持卡会员</th><td>#${c.member.id}　${esc(c.member.phone || c.member.email || '')}
+        　积分 ${c.member.points_balance}　计次 ${c.member.visit_count}</td></tr>` : ''}
+    </table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+};
+
+$('#btn-card-void').onclick = async () => {
+  const no = $('#cd-void').value.trim(), why = $('#cd-void-why').value.trim();
+  if (!no || !why) return toast('卡号与原因都必填', 'err');
+  if (!await UI.confirm(`确认作废这张卡？\n\n${no}\n\n作废后该会员会暂时没有卡，积分与流水都保留，下次到店扫新卡即可换发。`,
+                        { okText: '确认作废', danger: true })) return;
+  try {
+    const r = await api('/cards/void', { card_no: no, reason: why });
+    toast(`${r.card_no} 已作废`, 'ok');
+    $('#cd-void').value = ''; $('#cd-void-why').value = '';
+    loadCards();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+$('#btn-card-gen').onclick = async () => {
+  const batch = $('#cd-batch').value.trim();
+  const count = +$('#cd-count').value || 0;
+  const valid = $('#cd-valid').value;
+  if (count < 1) return toast('数量必须大于 0', 'err');
+  if (!valid)   return toast('必须填写有效期 —— 它要印在卡面上', 'err');
+  if (valid <= new Date().toISOString().slice(0, 10)) {
+    return toast('有效期必须晚于今天', 'err');
+  }
+
+  /**
+   * 有效期单独确认一遍，而且把它放在最前面。
+   *
+   * 卡面那行日期是唯一的告知证据（客人查不到任何线上信息），
+   * 一旦印错，整批卡的合规基础就没了 —— 而且是印完才发现。
+   * 多按一次确认，换的是这个。
+   */
+  if (!await UI.confirm(
+    `请再核对一次有效期：\n\n` +
+    `        ${valid}\n\n` +
+    `这个日期会印在卡面上，也是客人唯一能看到的告知。\n` +
+    `与印刷稿不一致的话，整批卡都得重印。`,
+    { okText: '日期没错', cancelText: '我再看看' })) return;
+
+  if (!await UI.confirm(
+    `生成 ${count} 张新卡（有效期至 ${valid}）？\n\n` +
+    `生成后会一次性显示全部卡号与 PIN，这是明文 PIN 唯一出现的时刻 ——\n` +
+    `库里只存不可还原的 hash，关掉就再也取不回来，只能作废整批重来。\n\n` +
+    `请准备好立刻复制保存。`,
+    { okText: '生成并显示清单' })) return;
+
+  try {
+    const d = await api('/cards/generate', { batch_no: batch, count, valid_to: valid });
+    // 制表符分隔：直接粘进 Excel 就是四列，不用做 CSV 转义。
+    // 有效期也放进去 —— 给印刷厂的稿子要按这一列排版
+    const lines = ['卡号\t二维码内容\tPIN\t有效期至']
+      .concat(d.rows.map(r => `${r.display}\t${r.card_no}\t${r.pin}\t${r.valid_to || ''}`));
+    $('#card-gen-csv').value = lines.join('\n');
+    $('#card-gen-warn').textContent = d.warning;
+    $('#card-gen-result').hidden = false;
+    $('#card-gen-csv').focus();
+    $('#card-gen-csv').select();
+    toast(`批次 ${d.batch_no} 已生成 ${d.count} 张`, 'ok');
+    loadCards();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
 /* ── 审计 ─────────────────────────────────────────── */
 $('#btn-audit').onclick = loadAudit;
 async function loadAudit() {
@@ -486,5 +651,12 @@ async function loadAudit() {
 
 /* 启动 */
 (async () => {
-  try { enterMain((await api('/auth/me', undefined, 'GET')).operator); } catch {}
+  // 会话还在时走这条路恢复。红条与 sms_ready 必须在这里一并处理 ——
+  // 只在登录处理里渲染的话，刷新一次页面提醒就没了，等于白提醒。
+  try {
+    const d = await api('/auth/me', undefined, 'GET');
+    window.SMS_READY = !!d.sms_ready;
+    renderWarnings(d.warnings);
+    enterMain(d.operator);
+  } catch {}
 })();

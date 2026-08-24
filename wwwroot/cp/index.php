@@ -1,3 +1,21 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * 后台入口。
+ *
+ * 与 Pad 端同理：改成 .php 只是为了让资源 URL 能带上版本号，
+ * 避免「代码传上去了，浏览器里还是旧页面」。说明见 wwwroot/_assets.php。
+ *
+ * 后台在普通浏览器里开，Ctrl+F5 还能救；Pad 上没有这个办法，
+ * 所以那边更要紧 —— 但两边用同一套机制，省得日后只修一边。
+ *
+ * 🔴 nginx 要放行本文件，见 docs/06 §5。
+ */
+require __DIR__ . '/../_assets.php';
+
+vip_no_store();
+?>
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -5,7 +23,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="referrer" content="same-origin">
 <title>会员积分 · 管理后台</title>
-<link rel="stylesheet" href="/cp/cp.css">
+<link rel="stylesheet" href="<?= vip_asset('cp/cp.css') ?>">
 </head>
 <body>
 
@@ -33,6 +51,7 @@
       <button class="tab" data-tab="report">报表</button>
       <button class="tab" data-tab="config">配置</button>
       <button class="tab" data-tab="coupons">奖励券</button>
+      <button class="tab" data-tab="cards">发卡</button>
       <button class="tab" data-tab="operators">操作员</button>
       <button class="tab" data-tab="audit">审计</button>
     </nav>
@@ -40,6 +59,9 @@
     <button id="btn-refresh" class="link" title="重新加载页面">刷新</button>
     <button id="btn-logout" class="link">退出</button>
   </header>
+
+  <!-- 常驻提醒：开了实名但确认短信还没接入之类，长期挂着直到解决 -->
+  <div id="cp-warnings"></div>
 
   <!-- 概览 -->
   <div id="tab-dashboard" class="panel active">
@@ -125,6 +147,63 @@
     <div id="coupon-list"></div>
   </div>
 
+  <div id="tab-cards" class="panel">
+    <h3>实体卡发放</h3>
+    <div id="card-stats" class="stats"></div>
+
+    <details class="add-box">
+      <summary>查一张卡（客人问「我这卡还能用吗」）</summary>
+      <div class="row">
+        <label>卡号<input id="cd-look" type="text" placeholder="扫码或手输，如 TK-00000123-4Q7"></label>
+        <button id="btn-card-look" class="primary">查询</button>
+      </div>
+      <div id="card-look-result"></div>
+    </details>
+
+    <details class="add-box">
+      <summary>挂失 / 作废一张卡</summary>
+      <div class="row">
+        <label>卡号<input id="cd-void" type="text" placeholder="卡号"></label>
+        <label>原因（必填）<input id="cd-void-why" type="text" placeholder="如：客人报失"></label>
+      </div>
+      <button id="btn-card-void" class="primary">作废</button>
+      <p class="muted small">
+        作废后该会员会暂时没有卡，积分与流水都保留。下次到店扫一张新卡即可换发。
+      </p>
+    </details>
+
+    <details class="add-box" id="cd-gen-box">
+      <summary>生成新批次（交给印刷厂）</summary>
+      <div class="row">
+        <label>批次号<input id="cd-batch" type="text" placeholder="留空自动按日期生成"></label>
+        <label>数量<input id="cd-count" type="number" min="1" max="5000" value="200"></label>
+        <label>有效期至（必填）<input id="cd-valid" type="date"></label>
+      </div>
+      <button id="btn-card-gen" class="primary">生成</button>
+      <p class="err" style="font-weight:600">
+        ⚠ 有效期必须与卡面印刷的日期<b>完全一致</b>。
+      </p>
+      <p class="muted small">
+        客人查不到任何线上信息，手里只有一张卡 —— <b>卡面那行日期就是唯一的告知证据</b>。
+        库里和卡面对不上，等于没有告知过。<br>
+        建议取 <b>3 年后的 12 月 31 日</b>，与印刷稿一起定下来再回来填。
+        单批最多 5000 张，顺序号自动接上一批，不会重号。
+      </p>
+    </details>
+
+    <div id="card-gen-result" hidden>
+      <p class="err" id="card-gen-warn"></p>
+      <p class="muted small">
+        全选下面的内容复制，粘进 Excel 即可（制表符分隔）。
+        <b>关掉这一块之后 PIN 就再也取不回来了</b>，只能作废整批重新生成。
+      </p>
+      <textarea id="card-gen-csv" rows="14" style="width:100%;font-family:monospace;font-size:12px"></textarea>
+    </div>
+
+    <h3 style="margin-top:24px">已有批次</h3>
+    <div id="card-batches"></div>
+  </div>
+
   <div id="tab-operators" class="panel">
     <h3>操作员</h3>
     <div id="operators-list"></div>
@@ -176,7 +255,7 @@
 
 <div id="toast" class="toast" hidden></div>
 <!-- 顺序即依赖：ui.js 必须先于 cp.js 加载 -->
-<script src="/assets/ui.js"></script>
-<script src="/cp/cp.js"></script>
+<script src="<?= vip_asset('assets/ui.js') ?>"></script>
+<script src="<?= vip_asset('cp/cp.js') ?>"></script>
 </body>
 </html>

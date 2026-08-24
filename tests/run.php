@@ -78,6 +78,29 @@ require __DIR__ . '/cases/BusinessDayTest.php';
 require __DIR__ . '/cases/AllocationTest.php';
 require __DIR__ . '/cases/SchemaCompatTest.php';
 require __DIR__ . '/cases/BootGuardTest.php';
+require __DIR__ . '/cases/SqlTextTest.php';
+require __DIR__ . '/cases/CardNumberTest.php';
 require __DIR__ . '/cases/ContainerCompatTest.php';
+require __DIR__ . '/cases/I18nTest.php';
+require __DIR__ . '/cases/CacheBustTest.php';
+
+/**
+ * 上面这份名单是手写的，所以它自己会漏 —— 新加一个用例文件却忘了登记，
+ * 表现是「测试全绿但那个文件根本没跑」，比红更糟。
+ * 这里对着目录核一遍。
+ */
+T::group('用例文件都登记了');
+$onDisk = array_map(
+    static fn(string $p): string => basename($p),
+    glob(__DIR__ . '/cases/*Test.php') ?: []
+);
+$loaded = array_map(
+    static fn(string $p): string => basename($p),
+    array_filter(get_included_files(), static fn(string $p): bool => str_contains($p, '/cases/'))
+);
+sort($onDisk);
+$forgotten = array_values(array_diff($onDisk, $loaded));
+T::true($forgotten === [], '★ cases/ 下每个用例文件都在 run.php 里登记了'
+    . ($forgotten ? '（漏了：' . implode(', ', $forgotten) . '）' : ''));
 
 exit(T::summary());

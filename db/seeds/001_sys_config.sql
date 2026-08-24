@@ -63,6 +63,17 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 自由撤销时间窗，超出需经理权限
 
 -- ── 合规 ──────────────────────────────────────────────────
+(@store,'member_collect_pii','0',@now),
+  -- 默认【关闭】：卡片不实名，凭卡号 + 卡背 PIN 即可积分与兑换。
+  -- 关闭时 Pad 上完全看不到手机号/邮箱/生日的输入框，后端也拒收 ——
+  -- 系统在技术上就收不了个人信息，既不给收银员向客人索要的机会，
+  -- 也不必为一个根本没在用的采集表单去应付合规检查。
+  -- 注意：本种子是 ON DUPLICATE KEY UPDATE config_value，重跑 seed 会把它
+  -- 重置回 0。方向是安全的（回到不收集），但门店若已开启需重新打开。
+(@store,'consent_channel','auto',@now),
+  -- 确认码渠道：auto = 有手机号发短信，否则发邮件。凭据在 config.php
+(@store,'privacy_policy_url','',@now),
+  -- 附在确认码消息里的隐私政策网址。留空则不附，但现场仍须口头告知
 (@store,'consent_expire_days','30',@now),
   -- 未同意的会员：积分冻结 + PII 假名化的期限
 (@store,'pii_retention_years','3',@now),
@@ -94,6 +105,18 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 实测 -2 折扣行共 4 种名称，只有 TARJETA 10+1 是核销；
   -- CUPON DE 5 EUROS（满50减5 纸质券）/ Dto% / Dto. -15% 都是普通折扣，绝不能误判。
   -- 名称会随店家调整而变（Dto. -20% 已被 Dto. -15% 取代），所以做成可配置。
+
+-- ── 界面语言 ──────────────────────────────────────────────
+,(@store,'default_lang','zh',@now)
+  -- 登录页的语言，以及还没选过语言的账号登录后用哪种。zh | es
+  -- 每个操作员可在 Pad 上自行切换，选择记在 operator.lang，改这里不影响他们。
+
+-- ── 实体卡有效期 ──────────────────────────────────────────
+,(@store,'card_expiring_soon_days','30',@now)
+  -- 卡剩多少天到期时开始提醒收银员换卡。发卡时也用这个天数拦一道。
+,(@store,'card_grace_months','6',@now)
+  -- 过期后还能换卡结转积分的窗口。超过之后前台换不了，需经理强制换发。
+  -- ⚠️ 宽限期内卡本身【不能用】—— 不能积分、不能兑换，只能换卡。
 
 ON DUPLICATE KEY UPDATE
   `config_value` = VALUES(`config_value`),

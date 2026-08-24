@@ -56,7 +56,8 @@ function doCheck(App $app, array $config): void
         ? ok('PHP ' . PHP_VERSION)
         : bad('PHP ' . PHP_VERSION . '，需要 8.2 以上');
     foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读（需要 MYSQLI_OPT_READ_TIMEOUT）',
-              'mbstring' => '多字节字符串', 'json' => 'JSON', 'openssl' => '令牌与加密'] as $ext => $why) {
+              'mbstring' => '多字节字符串', 'json' => 'JSON', 'openssl' => '令牌与加密',
+              'curl' => '出站发送确认短信'] as $ext => $why) {
         extension_loaded($ext) ? ok("扩展 {$ext}（{$why}）") : bad("缺少扩展 {$ext}（{$why}）");
     }
 
@@ -87,8 +88,12 @@ function doCheck(App $app, array $config): void
         foreach ($db->all('SHOW TABLES') as $r) {
             $tables[] = (string)array_values($r)[0];
         }
-        $need = ['pos_order','member','point_ledger','meal_item_rule','sys_config',
-                 'sync_cursor','audit_log','alert','operator','operator_session'];
+        // ★ 加表时这里必须跟着加，否则自检会漏 —— 曾经漏掉 card 与 coupon，
+        //   结果 migrate 没跑的库照样报「全部 10 张表已存在」，
+        //   现场看到这句以为没问题，实际点发卡直接报错
+        $need = ['pos_order','member','point_ledger','coupon','meal_item_rule','meal_period',
+                 'sys_config','sync_cursor','audit_log','alert','operator','operator_session',
+                 'card'];
         $miss = array_diff($need, $tables);
         $miss ? warn('缺少表：' . implode(', ', $miss) . ' —— 请执行 migrate')
               : ok('全部 ' . count($need) . ' 张表已存在');
@@ -132,6 +137,16 @@ function doCheck(App $app, array $config): void
  *   · 老库首次引入本机制时做一次基线登记：已经建好的表说明
  *     对应的破坏性迁移早已执行过，直接标记为已应用，不重跑
  */
+/**
+ * 该迁移文件是否真的执行 DROP TABLE。
+ * 判定逻辑在 Vip\SqlText —— 必须先剥注释与字符串，
+ * 否则注释里提一句就会把整条迁移拦在生产库外面（实测踩过）。
+ */
+function sqlHasDropTable(string $file): bool
+{
+    return \Vip\SqlText::hasDropTable((string)file_get_contents($file));
+}
+
 function doMigrate(App $app): void
 {
     $db = $app->localDb();
@@ -168,7 +183,7 @@ function doMigrate(App $app): void
     // 基线登记：库里已有业务表却没有登记记录 → 破坏性迁移显然早已跑过
     if (!$applied && $rows > 0) {
         foreach ($files as $f) {
-            if (stripos((string)file_get_contents($f), 'DROP TABLE') !== false) {
+            if (sqlHasDropTable($f)) {
                 $db->exec('INSERT INTO schema_migration (filename, applied_at) VALUES (?,?)',
                     [basename($f), $db->now()]);
                 $applied[basename($f)] = true;
@@ -184,8 +199,7 @@ function doMigrate(App $app): void
     }
 
     // 破坏性迁移 + 有数据 = 拒绝
-    $destructive = array_filter($pending,
-        fn($f) => stripos((string)file_get_contents($f), 'DROP TABLE') !== false);
+    $destructive = array_filter($pending, fn($f) => sqlHasDropTable($f));
     if ($destructive && $rows > 0) {
         echo "\n\033[31m拒绝执行：库中已有 {$rows} 行业务数据，而待应用的 "
            . implode(', ', array_map('basename', $destructive))
@@ -350,7 +364,8 @@ function doRepair(App $app, array $config): void
      */
     foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读',
               'mbstring'  => '多字节字符串', 'json' => 'JSON',
-              'openssl'   => '登录令牌'] as $ext => $why) {
+              'openssl'   => '登录令牌',
+              'curl'      => '出站发送确认短信'] as $ext => $why) {
         if (extension_loaded($ext)) {
             ok("{$ext}（{$why}）");
         } else {

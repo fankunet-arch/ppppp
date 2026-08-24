@@ -99,7 +99,7 @@ final class AuthService
             return null;
         }
         $s = $this->db->one(
-            'SELECT s.*, o.display_name, o.role, o.enabled
+            'SELECT s.*, o.display_name, o.role, o.enabled, o.lang
                FROM operator_session s
                JOIN operator o ON o.id = s.operator_id AND o.store_code = s.store_code
               WHERE s.store_code = ? AND s.token_hash = ?',
@@ -120,6 +120,7 @@ final class AuthService
             'name'       => (string)$s['display_name'],
             'role'       => (int)$s['role'],
             'is_manager' => (int)$s['role'] >= self::ROLE_MANAGER,
+            'lang'       => $s['lang'],   // NULL = 没选过，由调用方回落到后台默认
             'device'     => $s['device'],
             'session_id' => (int)$s['id'],
         ];
@@ -278,7 +279,26 @@ final class AuthService
             'name'       => (string)$op['display_name'],
             'role'       => (int)$op['role'],
             'is_manager' => (int)$op['role'] >= self::ROLE_MANAGER,
+            'lang'       => $op['lang'] ?? null,   // NULL = 没选过
             'device'     => $device,
         ];
+    }
+
+    /**
+     * 记住这个人选的界面语言。
+     *
+     * 语言跟着【账号】走而不是跟着平板走 —— 同一台 Pad 换个人登录就该换语言。
+     * 认不出的语言码直接不写，不去猜 —— 宁可保持原样，也别把人的选择改掉。
+     */
+    public function setLang(int $operatorId, string $lang): bool
+    {
+        if (!\Vip\Lang::isValid($lang)) {
+            return false;
+        }
+        $this->db->exec(
+            'UPDATE operator SET lang = ?, updated_at = ? WHERE store_code = ? AND id = ?',
+            [$lang, $this->db->now(), $this->storeCode, $operatorId]
+        );
+        return true;
     }
 }

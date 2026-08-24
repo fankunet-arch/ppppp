@@ -64,14 +64,79 @@ $api->on('GET', '/health', static function () use ($app): void {
         $posOk  = false;
         $posMsg = 'POS 主库暂时无法访问，收银流程可继续（手工录入）';
     }
-    Api::ok(['local_db' => $localOk, 'pos_db' => $posOk, 'pos_note' => $posMsg]);
+    /**
+     * app_version：前端拿它和自己手里的 window.APP_VERSION 比对。
+     *
+     * 对不上就说明这个 Pad 上跑的是旧代码 —— 页面能自己在安全的时机
+     * 刷新掉，不用收银员去点那个「点了也没用」的刷新按钮。
+     * 取值口径与 wwwroot/_assets.php 完全一致，两处必须同源。
+     */
+    require_once __DIR__ . '/../../wwwroot/_assets.php';
+
+    /**
+     * default_lang 也从这里给：登录页要用，而那时还没有会话。
+     *
+     * ★ 必须容错。本接口的全部职责就是「库连不上时也要能答话」，
+     *   为了一个语言默认值把它拖垮，等于把唯一的诊断入口也弄没了。
+     *   （真栽过：加完这一行，库一停 /health 直接 500，
+     *     登录页那句「本地数据库连接异常」再也不出现。）
+     */
+    $defaultLang = \Vip\Lang::FALLBACK;
+    if ($localOk) {
+        try {
+            $defaultLang = \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK));
+        } catch (\Throwable) { /* 保持回落值 */ }
+    }
+
+    Api::ok([
+        'local_db' => $localOk, 'pos_db' => $posOk, 'pos_note' => $posMsg,
+        'default_lang' => $defaultLang,
+        'app_version'  => vip_app_version([
+            'index.php', 'assets/pad.js', 'assets/pad.css',
+            'assets/ui.js', 'assets/i18n.js', 'assets/sushivip-bridge.js',
+        ]),
+    ]);
 });
 
 // ════════════════════════════════════════════════════════════
 // 身份
 // ════════════════════════════════════════════════════════════
 
-$api->on('POST', '/auth/login', static function () use ($auth): void {
+/**
+ * Pad 需要知道的后台开关。
+ *
+ * 跟着登录与 /auth/me 一起下发，前端据此决定界面上出不出现某些东西。
+ * 界面隐藏只是体验层，真正的约束在服务端（见 /member/create 的拒收）——
+ * 两边都做才站得住。
+ */
+$padSettings = static function () use ($app): array {
+    return [
+        // 关闭时 Pad 完全不显示手机号/邮箱/生日输入框，后端也拒收
+        'collect_pii' => $app->cfg()->bool('member_collect_pii', false),
+        // 有效期相关的两个阈值，Pad 拿它决定什么时候提醒换卡
+        'expiring_soon_days' => $app->cardService()->expiringSoonDays(),
+        'grace_months'       => $app->cardService()->graceMonths(),
+        // 还没选过语言的账号用这个；已选过的以 operator.lang 为准
+        'default_lang'       => \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK)),
+        'langs'              => \Vip\Lang::ALL,
+    ];
+};
+
+/**
+ * 这个账号实际该用哪种语言：自己选过的 > 后台默认。
+ *
+ * 回落放在服务端而不是让前端 `op.lang || settings.default_lang` ——
+ * 前端有三处要用（登录、会话恢复、切换后），漏一处就是「换台平板语言变了」，
+ * 而且这种 bug 在开发机上永远复现不出来。
+ */
+$withLang = static function (array $op) use ($app): array {
+    $op['lang'] = \Vip\Lang::isValid($op['lang'] ?? null)
+        ? (string)$op['lang']
+        : \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK));
+    return $op;
+};
+
+$api->on('POST', '/auth/login', static function () use ($auth, $padSettings, $withLang): void {
     $b     = Api::body();
     $login = Api::str($b, 'login_name', '');
     $pin   = Api::str($b, 'pin', '');
@@ -85,7 +150,11 @@ $api->on('POST', '/auth/login', static function () use ($auth): void {
         Api::fail((string)$r['error'], $r['error'] === 'locked' ? 423 : 401, $r['detail'] ?? []);
     }
     Api::setToken((string)$r['token'], 12 * 3600);
-    Api::ok(['operator' => $r['operator']]);
+    $op = $withLang((array)$r['operator']);
+    // 登录响应本身也按这个人的语言回话 —— 否则登录页是中文、
+    // 进去之后第一条提示还是中文，要等下一次请求才切过来
+    Api::setLang($op['lang']);
+    Api::ok(['operator' => $op, 'settings' => $padSettings()]);
 });
 
 /**
@@ -113,8 +182,25 @@ $api->on('POST', '/auth/logout', static function () use ($auth): void {
     Api::ok();
 });
 
-$api->on('GET', '/auth/me', static function () use ($requireOperator): void {
-    Api::ok(['operator' => $requireOperator()]);
+$api->on('GET', '/auth/me', static function () use ($requireOperator, $padSettings, $withLang): void {
+    Api::ok(['operator' => $withLang($requireOperator()), 'settings' => $padSettings()]);
+});
+
+/**
+ * 切换界面语言 —— 记在账号上，换台平板登录也还是这个语言。
+ *
+ * 之所以要落库而不是只存在平板本地：收银台的平板是共用的，
+ * 中文和西语的员工换班轮着用同一台。存本地就变成「谁后切的算谁的」。
+ */
+$api->on('POST', '/auth/lang', static function () use ($app, $requireOperator): void {
+    $op   = $requireOperator();
+    $lang = Api::str(Api::body(), 'lang', '') ?: '';
+    if (!\Vip\Lang::isValid($lang)) {
+        Api::fail('bad_request', 400, ['hint' => '不支持的语言']);
+    }
+    $app->auth()->setLang((int)$op['id'], $lang);
+    Api::setLang($lang);
+    Api::ok(['lang' => $lang]);
 });
 
 // ════════════════════════════════════════════════════════════
@@ -186,7 +272,7 @@ $api->on('POST', '/order/free-meal', static function () use ($app, $requireOpera
         Api::fail('bad_request');
     }
     if ($app->orders()->findBySerial($serial) === null) {
-        Api::fail('order_not_found', 404);
+        Api::fail('order_not_found', Api::NOT_FOUND);
     }
     $app->orders()->markFreeMeal($serial, $isFree);
     $app->audit()->log('coupon_redeem', [
@@ -232,34 +318,242 @@ $api->on('POST', '/member/search', static function () use ($app, $requireOperato
  * 内联新建会员（客人现场没卡）。
  * 积分当场入账但冻结，同时发 double opt-in。
  */
+/**
+ * 扫卡/输卡号后的第一步 —— 系统判断这张卡现在是什么状态，Pad 据此决定下一步。
+ *
+ * 返回的 state 有四种，Pad 端一一对应一个动作：
+ *   active → 直接进入该会员（正常使用）
+ *   stock  → 弹出建卡表单（填手机/邮箱后绑定）
+ *   unknown / void → 报错，不给继续
+ *
+ * ★ 防伪造就在这里：卡号不在 card 库存表里一律拒绝。
+ *   卡号里的随机后缀只让人猜不到，判真伪的是那张表。
+ */
+$api->on('POST', '/card/lookup', static function () use ($app, $requireOperator): void {
+    $requireOperator();
+    $b   = Api::body();
+    $raw = Api::str($b, 'card_no', '');
+    if ($raw === null || trim($raw) === '') {
+        Api::fail('card_required');
+    }
+
+    $r = $app->cardService()->lookup($raw);
+
+    /**
+     * 过期卡是【可以换】的，所以不能只丢一个错误回去 ——
+     * 要把「这张卡绑的是谁」一并带上，Pad 才能直接进入换卡流程，
+     * 收银员不用再查一遍。
+     */
+    if (!$r['ok'] && ($r['state'] ?? '') === 'expired') {
+        $card = $r['card'];
+        $m    = $r['member'] ?? null;
+        Api::ok([
+            'state'      => 'expired',
+            'card_no'    => $app->cardNumber()->format((string)$card['card_no']),
+            'serial'     => (int)$card['serial'],
+            'valid_to'   => $card['valid_to'],
+            'grace_over' => (bool)($r['grace_over'] ?? false),
+            'member'     => $m === null ? null : [
+                'id'             => (int)$m['id'],
+                'points_balance' => (int)$m['points_balance'],
+                'visit_count'    => (int)$m['visit_count'],
+            ],
+        ]);
+    }
+
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], Api::NOT_FOUND);
+    }
+
+    $card = $r['card'];
+    $out  = [
+        'state'     => $r['state'],
+        'card_no'   => $app->cardNumber()->format((string)$card['card_no']),
+        'serial'    => (int)$card['serial'],
+        'valid_to'  => $card['valid_to'],
+        // 发卡前要提醒收银员「这张快到期了」，判断在前端做，天数由后端算
+        'days_left' => \Vip\Repo\CardRepo::daysLeft($card),
+    ];
+
+    if ($r['state'] === 'active') {
+        $m = $r['member'];
+        $out['member'] = [
+            'id'             => (int)$m['id'],
+            'card_no'        => $app->cardNumber()->format((string)$m['card_no']),
+            'phone'          => $m['phone'],
+            'email'          => $m['email'],
+            'points_balance' => (int)$m['points_balance'],
+            'visit_count'    => (int)$m['visit_count'],
+            'consent_status' => (int)$m['consent_status'],
+            'points_frozen'  => (int)$m['consent_status'] !== 1,
+        ];
+    }
+    Api::ok($out);
+});
+
 $api->on('POST', '/member/create', static function () use ($app, $requireOperator): void {
     $op    = $requireOperator();
     $b     = Api::body();
+    $card  = Api::str($b, 'card_no', '');
     $phone = Api::str($b, 'phone');
     $email = Api::str($b, 'email');
     $bday  = Api::str($b, 'birthday');
 
-    if (($phone === null || $phone === '') && ($email === null || $email === '')) {
-        Api::fail('bad_request', 400, ['hint' => '手机号与邮箱至少填一项，否则无法发送双重确认']);
+    // 发实体卡之后，建会员必须先有卡 —— 卡号不再由系统凭空生成，
+    // 而是从 card 库存表里取一张真实存在的绑上去。
+    if ($card === null || trim($card) === '') {
+        Api::fail('card_required');
     }
-    try {
-        $m = $app->members()->create($phone ?: null, $email ?: null, $bday ?: null);
-    } catch (\InvalidArgumentException $e) {
-        Api::fail('bad_request', 400, ['hint' => $e->getMessage()]);
+
+    /**
+     * 手机号与邮箱是否可收，由后台开关 member_collect_pii 决定。
+     *
+     * ★ 关闭时后端【拒收】，不是悄悄丢掉。
+     *   光靠前端隐藏输入框是不够的：字段藏起来而接口照收，
+     *   面对合规检查一样说不清。拒收之后才能说「系统在关闭状态下
+     *   技术上就收不了个人信息」，这句话是站得住的。
+     *   悄悄丢掉也不行 —— 那样收银员以为存进去了，客人也以为留了，
+     *   等到丢卡来找回时才发现什么都没有。
+     *
+     * 开启时：留了联系方式的记录重新落入个人数据范畴，走双重确认
+     * （待确认 + 积分冻结），详见 MemberRepo::create。
+     */
+    $collectPii = $app->cfg()->bool('member_collect_pii', false);
+    if (!$collectPii) {
+        $given = array_filter([$phone, $email, $bday], static fn($v) => $v !== null && trim((string)$v) !== '');
+        if ($given) {
+            Api::fail('pii_disabled', 400);
+        }
     }
+
+    $r = $app->cardService()->bindNewMember(
+        $card, $phone ?: null, $email ?: null, $bday ?: null, $op
+    );
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], 400,
+            isset($r['hint']) ? ['hint' => $r['hint']] : []);
+    }
+    $m = $r['member'];
 
     $app->audit()->log('member_create', [
         'target_type' => 'member', 'target_id' => (string)$m['id'],
         'operator_id' => $op['id'], 'operator_name' => $op['name'], 'device' => $op['device'],
-        'detail' => ['has_phone' => (bool)$phone, 'has_email' => (bool)$email],
+        'detail' => ['has_phone' => (bool)$phone, 'has_email' => (bool)$email,
+                     'card_no' => $m['card_no']],
     ]);
 
-    // TODO(下一批)：出站调用短信/邮件服务商发送 double opt-in
+    /**
+     * 留了联系方式的才需要双重确认；全匿名的卡当场就可用。
+     *
+     * 确认走【现场输码】：短信/邮件只发一个 6 位码（纯出站），客人当场
+     * 报给收银员，Pad 里输入即完成。不用「点链接确认」是因为那需要一个
+     * 公网可达的端点接收点击，而门店网络是单向的 —— 这个矛盾原设计里没发现。
+     */
+    $pending = (int)$m['consent_status'] !== 1;
+    $codeSent = null;
+    if ($pending) {
+        $sent = $app->consent()->sendCode((int)$m['id'], $op);
+        // 发失败不阻断建卡：卡已经绑好了，积分照常入账，
+        // 只是暂时冻结。收银员可以在会员那一栏重发。
+        $codeSent = $sent['ok']
+            ? ['channel' => $sent['channel'], 'expires_at' => $sent['expires_at']]
+            : ['error' => $sent['error']];
+    }
     Api::ok(['member' => [
-        'id' => (int)$m['id'], 'card_no' => $m['card_no'],
+        'id' => (int)$m['id'],
+        'card_no' => $app->cardNumber()->format((string)$m['card_no']),
         'points_balance' => 0, 'visit_count' => 0,
-        'consent_status' => 0, 'points_frozen' => true,
-    ], 'consent_pending' => true]);
+        'consent_status' => (int)$m['consent_status'],
+        'points_frozen'  => $pending,
+    ], 'consent_pending' => $pending, 'consent_code' => $codeSent]);
+});
+
+/**
+ * 换发新卡 —— 过期、损坏、挂失都走这里。
+ *
+ * 积分、计次、未兑换的券全部结转（它们挂在 member 上，卡只是钥匙）。
+ * 这是「卡片有有效期、而积分不因此损失」这条规则的落地点：
+ * 卡面印着到期日作为告知证据，客人到店换一张就什么都不损失。
+ */
+$api->on('POST', '/card/replace', static function () use ($app, $requireOperator): void {
+    $op     = $requireOperator();
+    $b      = Api::body();
+    $mid    = Api::int($b, 'member_id', 0);
+    $newNo  = Api::str($b, 'card_no', '') ?: '';
+    $reason = Api::str($b, 'reason', '') ?: '换发新卡';
+
+    if ($mid <= 0 || trim($newNo) === '') {
+        Api::fail('bad_request', 400, ['hint' => '需要会员与新卡号']);
+    }
+
+    /**
+     * 超过宽限期的卡，前台换不了 —— 经理带原因才放行。
+     * 客户端只有在拿到 grace_over 之后才该带这个字段上来。
+     */
+    $force    = Api::str($b, 'force_reason', '') ?: '';
+    $override = trim($force) === '' ? null : ['reason' => $force];
+
+    $r = $app->cardService()->replaceCard($mid, $newNo, $reason, $op, $override);
+    if (!$r['ok']) {
+        // grace_over 不是「出错了」，是「这一步需要经理」——
+        // 把判定依据一并带回，Pad 才能把话说清楚
+        if (($r['error'] ?? '') === 'grace_over') {
+            Api::fail('grace_over', 409, [
+                'old_valid_to' => $r['old_valid_to'] ?? null,
+                'grace_months' => $r['grace_months'] ?? null,
+            ]);
+        }
+        Api::fail((string)$r['error'], 400);
+    }
+
+    $m = $app->members()->findById($mid);
+    Api::ok([
+        'card_no'  => $app->cardNumber()->format((string)$r['card']['card_no']),
+        'valid_to' => $r['card']['valid_to'],
+        'forced'   => (bool)($r['forced'] ?? false),
+        'member'   => $m === null ? null : [
+            'id'             => (int)$m['id'],
+            'card_no'        => $app->cardNumber()->format((string)$m['card_no']),
+            'points_balance' => (int)$m['points_balance'],
+            'visit_count'    => (int)$m['visit_count'],
+            'consent_status' => (int)$m['consent_status'],
+            'points_frozen'  => (int)$m['consent_status'] !== 1,
+        ],
+    ]);
+});
+
+/**
+ * 重发确认码。客人没收到、码过期、或连续输错锁住时用。
+ * 每次重发都换一个新码，旧码立即作废。
+ */
+$api->on('POST', '/consent/send', static function () use ($app, $requireOperator): void {
+    $op  = $requireOperator();
+    $mid = Api::int(Api::body(), 'member_id', 0);
+    if ($mid <= 0) {
+        Api::fail('bad_request');
+    }
+    $r = $app->consent()->sendCode($mid, $op);
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], 400);
+    }
+    Api::ok(['channel' => $r['channel'], 'expires_at' => $r['expires_at']]);
+});
+
+/** 校验确认码。通过则积分解冻。 */
+$api->on('POST', '/consent/verify', static function () use ($app, $requireOperator): void {
+    $op   = $requireOperator();
+    $b    = Api::body();
+    $mid  = Api::int($b, 'member_id', 0);
+    $code = Api::str($b, 'code', '') ?: '';
+    if ($mid <= 0 || trim($code) === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->consent()->verifyCode($mid, $code, $op, Api::clientIp());
+    if (!$r['ok']) {
+        Api::fail((string)$r['error'], 400,
+            isset($r['left']) ? ['left' => $r['left']] : []);
+    }
+    Api::ok(['consent_status' => 1, 'points_frozen' => false]);
 });
 
 // ════════════════════════════════════════════════════════════
@@ -339,17 +633,40 @@ $api->on('POST', '/member/rewards', static function () use ($app, $requireOperat
 });
 
 /** 核销一张奖励券 */
+/**
+ * 核销免费餐券 —— 整条链路上唯一真正会造成损失的一步。
+ *
+ * 必须验卡背 PIN：二维码印在卡正面可被拍照，PIN 藏在刮开层下，
+ * 只有真正拿到卡的人知道。
+ *
+ * force + reason 是经理强制核销：PIN 用 bcrypt 存、不可还原，
+ * 客人忘了或卡背磨花了谁也查不出来，必须留这条路。它要经理权限、
+ * 必须填原因，并单独记 coupon_redeem_forced 审计事件。
+ */
 $api->on('POST', '/coupon/redeem', static function () use ($app, $requireOperator): void {
     $op  = $requireOperator();
     $b   = Api::body();
     $cid = Api::int($b, 'coupon_id', 0);
     $ser = Api::str($b, 'serial_id');
+    $pin = Api::str($b, 'pin');
+    $force  = !empty($b['force']);
+    $reason = Api::str($b, 'reason', '') ?: '';
+
     if ($cid <= 0) {
         Api::fail('bad_request');
     }
-    $r = $app->rewards()->redeem($cid, $ser ?: null,
-        ['id' => $op['id'], 'name' => $op['name']]);
-    Api::fromResult($r, ['code' => $r['code'] ?? null]);
+
+    $r = $app->rewards()->redeem(
+        $cid, $ser ?: null,
+        ['id' => $op['id'], 'name' => $op['name'], 'role' => $op['role'] ?? 0],
+        $pin,
+        $force ? ['reason' => $reason] : null
+    );
+    Api::fromResult($r, [
+        'code'         => $r['code'] ?? null,
+        'forced'       => $r['forced'] ?? false,
+        'locked_until' => $r['locked_until'] ?? null,
+    ]);
 });
 
 /** 均摊计算 —— 放服务端算，保证与落库口径完全一致（余数给第一位） */
@@ -363,7 +680,7 @@ $api->on('POST', '/points/split', static function () use ($app, $requireOperator
     }
     $o = $app->orders()->findBySerial($serial);
     if ($o === null) {
-        Api::fail('order_not_found', 404);
+        Api::fail('order_not_found', Api::NOT_FOUND);
     }
     $remainCents = Money::toCents($o['total_amount']) - Money::toCents($o['allocated_amount']);
     $remainPort  = (int)$o['portions_counted'] - (int)$o['allocated_portions'];

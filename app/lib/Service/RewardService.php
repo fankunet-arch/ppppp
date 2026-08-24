@@ -6,6 +6,7 @@ namespace Vip\Service;
 use Vip\LocalDb;
 use Vip\Money;
 use Vip\Repo\AuditRepo;
+use Vip\Repo\CardRepo;
 use Vip\Repo\ConfigRepo;
 use Vip\Repo\MemberRepo;
 
@@ -43,6 +44,7 @@ final class RewardService
         private ConfigRepo $cfg,
         private MemberRepo $members,
         private AuditRepo  $audit,
+        private CardRepo   $cards,
     ) {
     }
 
@@ -276,9 +278,30 @@ final class RewardService
      *   订单本身是否计分计次，由 PointsService 依 is_redeemed 判定，
      *   与本方法无关 —— 这里只管券的状态流转。
      */
-    public function redeem(int $couponId, ?string $serialId, array $operator): array
-    {
-        return $this->db->transaction(function () use ($couponId, $serialId, $operator) {
+    /**
+     * 核销一张券。
+     *
+     * ★ 这是整条链路上唯一真正会造成损失的一步 —— 前面所有防护都是为了它。
+     *
+     * 二维码印在卡正面，可以被拍照复制；PIN 藏在卡背刮开层下，只有真正
+     * 拿到卡的人知道。所以核销必须验 PIN —— 抄了码的人兑不走免费餐。
+     * 而积分入账那一侧不验：被人抄卡去攒分，店家没有损失，
+     * 受害者反而多了分，为它加一道门槛得不偿失。
+     *
+     * @param string|null $pin      卡背 PIN
+     * @param array|null  $override 经理强制核销 ['reason' => ...]。
+     *                              PIN 用 bcrypt 存、不可还原，客人忘了
+     *                              或卡背磨花了谁也查不出来，必须留这条路；
+     *                              但它要经理权限、必须填原因、单独记审计。
+     */
+    public function redeem(
+        int $couponId,
+        ?string $serialId,
+        array $operator,
+        ?string $pin = null,
+        ?array $override = null,
+    ): array {
+        return $this->db->transaction(function () use ($couponId, $serialId, $operator, $pin, $override) {
             $c = $this->db->one(
                 'SELECT * FROM coupon WHERE store_code = ? AND id = ? FOR UPDATE',
                 [$this->storeCode, $couponId]
@@ -294,19 +317,48 @@ final class RewardService
                 return ['ok' => false, 'error' => 'coupon_expired'];
             }
 
+            // ── 持卡验证 ──
+            $forced = false;
+            if ($override !== null) {
+                if ((int)($operator['role'] ?? 0) < 2) {
+                    return ['ok' => false, 'error' => 'forbidden'];
+                }
+                if (trim((string)($override['reason'] ?? '')) === '') {
+                    return ['ok' => false, 'error' => 'reason_required'];
+                }
+                $forced = true;
+            } else {
+                $card = $this->cards->findByMemberId((int)$c['member_id']);
+                if ($card === null) {
+                    // 卡挂失后还没换新的 —— 说清楚，别让人对着 PIN 框干瞪眼
+                    return ['ok' => false, 'error' => 'card_missing'];
+                }
+                if ($pin === null || trim($pin) === '') {
+                    return ['ok' => false, 'error' => 'pin_required'];
+                }
+                $v = $this->cards->verifyPin($card, $pin);
+                if (!$v['ok']) {
+                    return ['ok' => false, 'error' => (string)$v['error'],
+                            'locked_until' => $v['locked_until'] ?? null];
+                }
+            }
+
             $this->db->exec(
                 'UPDATE coupon SET status = ?, redeemed_at = ?, redeemed_serial_id = ?, operator_id = ?
                   WHERE id = ?',
                 [self::ST_REDEEMED, $this->db->now(), $serialId, $operator['id'] ?? null, $couponId]
             );
-            $this->audit->log('coupon_redeem', [
+            $this->audit->log($forced ? 'coupon_redeem_forced' : 'coupon_redeem', [
                 'target_type'   => 'coupon', 'target_id' => (string)$couponId,
                 'operator_id'   => $operator['id']   ?? null,
                 'operator_name' => $operator['name'] ?? null,
                 'detail' => ['code' => $c['code'], 'member_id' => (int)$c['member_id'],
-                             'serial_id' => $serialId],
+                             'serial_id' => $serialId]
+                          + ($forced ? ['forced' => true,
+                                        'reason' => (string)$override['reason']] : []),
             ]);
-            return ['ok' => true, 'code' => $c['code'], 'member_id' => (int)$c['member_id']];
+            return ['ok' => true, 'code' => $c['code'], 'member_id' => (int)$c['member_id'],
+                    'forced' => $forced];
         });
     }
 

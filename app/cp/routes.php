@@ -45,7 +45,23 @@ $requireAdmin = static function () use ($requireManager): array {
 // 身份（复用 Pad 的会话）
 // ════════════════════════════════════════════════════════════
 
-$api->on('POST', '/auth/login', static function () use ($auth): void {
+/**
+ * 后台要长期挂出来的提醒。跟着登录与 /auth/me 下发，前端渲染成顶部红条。
+ * 目前只有一条：开了实名但确认短信还没接入。
+ */
+$warnings = static function () use ($app): array {
+    return \Vip\Features::warnings(
+        $app->cfg()->bool('member_collect_pii', false),
+        $app->messaging()->readyChannels()
+    );
+};
+
+/** 有没有配齐可用的发送渠道。前端据此决定开启实名前要不要先拦一下 */
+$smsReady = static function () use ($app): bool {
+    return (bool)$app->messaging()->readyChannels();
+};
+
+$api->on('POST', '/auth/login', static function () use ($auth, $warnings, $smsReady): void {
     $b = Api::body();
     $r = $auth()->login(
         Api::str($b, 'login_name', '') ?: '',
@@ -62,7 +78,8 @@ $api->on('POST', '/auth/login', static function () use ($auth): void {
         Api::fail('forbidden', 403);
     }
     Api::setToken((string)$r['token'], 12 * 3600);
-    Api::ok(['operator' => $r['operator']]);
+    Api::ok(['operator' => $r['operator'], 'warnings' => $warnings(),
+             'sms_ready' => $smsReady()]);
 });
 
 $api->on('POST', '/auth/logout', static function () use ($auth): void {
@@ -71,8 +88,9 @@ $api->on('POST', '/auth/logout', static function () use ($auth): void {
     Api::ok();
 });
 
-$api->on('GET', '/auth/me', static function () use ($requireManager): void {
-    Api::ok(['operator' => $requireManager()]);
+$api->on('GET', '/auth/me', static function () use ($requireManager, $warnings, $smsReady): void {
+    Api::ok(['operator' => $requireManager(), 'warnings' => $warnings(),
+             'sms_ready' => $smsReady()]);
 });
 
 // ════════════════════════════════════════════════════════════
@@ -265,7 +283,7 @@ $api->on('GET', '/config', static function () use ($app, $requireManager): void 
     ]);
 });
 
-$api->on('POST', '/config/save', static function () use ($app, $requireAdmin): void {
+$api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $warnings): void {
     $op  = $requireAdmin();
     $b   = Api::body();
     $key = Api::str($b, 'key', '') ?: '';
@@ -284,7 +302,8 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin): v
         'operator_id' => $op['id'], 'operator_name' => $op['name'],
         'detail' => ['value' => $val],
     ]);
-    Api::ok(['key' => $key, 'value' => $val]);
+    // 顺带把最新提醒带回去，前端不用为了刷新红条再请求一次
+    Api::ok(['key' => $key, 'value' => $val, 'warnings' => $warnings()]);
 });
 
 // ════════════════════════════════════════════════════════════
@@ -377,7 +396,7 @@ $api->on('POST', '/members/erase', static function () use ($app, $requireAdmin):
     $b  = Api::body();
     $id = Api::int($b, 'member_id', 0);
     if ($id <= 0 || $app->members()->findById($id) === null) {
-        Api::fail('member_not_found', 404);
+        Api::fail('member_not_found', Api::NOT_FOUND);
     }
     $app->members()->pseudonymize($id);
     $app->audit()->log('data_erase', [
@@ -540,6 +559,171 @@ $api->on('POST', '/audit', static function () use ($app, $requireManager): void 
         'detail' => $r['detail'] ? json_decode((string)$r['detail'], true) : null,
         'created_at' => $r['created_at'],
     ], $app->localDb()->all($sql, $p))]);
+});
+
+// ════════════════════════════════════════════════════════════
+// 实体卡发放
+// ════════════════════════════════════════════════════════════
+
+$api->on('GET', '/cards/batches', static function () use ($app, $requireManager): void {
+    $requireManager();
+    Api::ok([
+        'prefix'      => $app->cardNumber()->prefix(),
+        'next_serial' => $app->cards()->nextSerial(),
+        'batches'     => array_map(static fn($b) => [
+            'batch_no'    => $b['batch_no'],
+            'total'       => (int)$b['total'],
+            'stock'       => (int)$b['stock'],
+            'active'      => (int)$b['active'],
+            'void'        => (int)$b['void_cnt'],
+            'serial_from' => (int)$b['serial_from'],
+            'serial_to'   => (int)$b['serial_to'],
+            'valid_to'    => $b['valid_to'],
+            'created_at'  => $b['created_at'],
+        ], $app->cards()->batches()),
+    ]);
+});
+
+/**
+ * 生成一批卡，返回给印刷厂的清单。
+ *
+ * 🔴 返回里带【全部卡的明文 PIN】—— 这是一份总钥匙。
+ *    库里存的是 bcrypt hash，不可还原，所以这一次响应是明文 PIN 唯一
+ *    出现的时刻。窗口一关就再也取不回来，只能作废整批重发。
+ *
+ * 仅管理员可用：能拿到全批 PIN 的操作，不该开给经理。
+ */
+$api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin): void {
+    $op    = $requireAdmin();
+    $b     = Api::body();
+    $batch   = Api::str($b, 'batch_no', '') ?: '';
+    $count   = Api::int($b, 'count', 0);
+    $validTo = Api::str($b, 'valid_to', '') ?: '';
+
+    /**
+     * 有效期【必填】。
+     *
+     * 它会直接印在卡面上，而卡面是唯一的告知证据 —— 客人查不到任何线上
+     * 信息，手里只有一张卡。库里的日期与卡面印的必须一致，否则等于没告知。
+     *
+     * 做成必填而不是给个默认值，是为了每次做卡都强制过一遍脑子：
+     * 这批印的是哪个日期？跟发给印刷厂的稿子对得上吗？
+     */
+    if (trim($validTo) === '') {
+        Api::fail('bad_request', 400, ['hint' => '必须填写有效期 —— 它要印在卡面上，是唯一的告知证据']);
+    }
+
+    if (trim($batch) === '') {
+        // 批次号留空时按日期给一个，同一天多批自动加序号
+        $base = 'B' . date('ymd');
+        $batch = $base;
+        for ($i = 2; $app->cards()->batchExists($batch) && $i < 100; $i++) {
+            $batch = $base . '-' . $i;
+        }
+    }
+
+    try {
+        $rows = $app->cards()->generateBatch($batch, $count, $validTo);
+    } catch (\InvalidArgumentException $e) {
+        Api::fail('bad_request', 400, ['hint' => $e->getMessage()]);
+    }
+
+    $app->audit()->log('card_batch_generate', [
+        'target_type' => 'card_batch', 'target_id' => strtoupper(trim($batch)),
+        'operator_id' => $op['id'], 'operator_name' => $op['name'],
+        'detail' => ['count' => count($rows), 'valid_to' => $validTo,
+                     'serial_from' => $rows[0]['serial'] ?? null,
+                     'serial_to' => $rows[count($rows) - 1]['serial'] ?? null],
+    ]);
+
+    Api::ok([
+        'batch_no' => strtoupper(trim($batch)),
+        'count'    => count($rows),
+        'valid_to' => $validTo,
+        'rows'     => $rows,
+        'warning'  => '这份清单包含全部卡的明文 PIN，是一份总钥匙。'
+                    . '库里只存不可还原的 hash，关掉窗口就再也取不回来。'
+                    . '请立刻复制保存并交给印刷厂，印完销毁，不要留在邮箱或网盘里。',
+    ]);
+});
+
+/** 查一张卡现在什么状态 —— 客人来问「我这卡还能用吗」时用 */
+$api->on('POST', '/cards/lookup', static function () use ($app, $requireManager): void {
+    $requireManager();
+    $raw = Api::str(Api::body(), 'card_no', '') ?: '';
+    if (trim($raw) === '') {
+        Api::fail('card_required');
+    }
+
+    $r    = $app->cardService()->lookup($raw);
+    $card = $r['card'] ?? null;
+    // 过期与作废的卡在后台【要能查到】—— 客人拿着一张卡来问「还能用吗」，
+    // 回一句「查无此卡」是错的，得告诉他为什么不能用
+    if ($card === null) {
+        Api::fail((string)($r['error'] ?? 'card_unknown'), Api::NOT_FOUND);
+    }
+
+    $out = [
+        'state'        => $r['state'],
+        'card_no'      => $app->cardNumber()->format((string)$card['card_no']),
+        'serial'       => (int)$card['serial'],
+        'batch_no'     => $card['batch_no'],
+        'valid_to'     => $card['valid_to'],
+        'expired'      => \Vip\Repo\CardRepo::isExpired($card),
+        'status'       => (int)$card['status'],
+        'activated_at' => $card['activated_at'],
+        'voided_at'    => $card['voided_at'],
+        'void_reason'  => $card['void_reason'],
+        'pin_locked_until' => $card['pin_locked_until'],
+    ];
+    if (($r['member'] ?? null) !== null) {
+        $out['member'] = [
+            'id'             => (int)$r['member']['id'],
+            'phone'          => $r['member']['phone'],
+            'email'          => $r['member']['email'],
+            'points_balance' => (int)$r['member']['points_balance'],
+            'visit_count'    => (int)$r['member']['visit_count'],
+        ];
+    }
+    Api::ok($out);
+});
+
+/**
+ * 挂失/作废一张卡。
+ *
+ * 只作废，不自动换新卡 —— 换卡要当面把新卡交给客人，属于 Pad 端的动作。
+ * 这里作废后，该会员会暂时没有卡，下次到店扫新卡时走 replaceCard。
+ */
+$api->on('POST', '/cards/void', static function () use ($app, $requireManager): void {
+    $op     = $requireManager();
+    $b      = Api::body();
+    $raw    = Api::str($b, 'card_no', '') ?: '';
+    $reason = Api::str($b, 'reason', '') ?: '';
+
+    if (trim($raw) === '' || trim($reason) === '') {
+        Api::fail('bad_request', 400, ['hint' => '卡号与作废原因都必填']);
+    }
+
+    $card = $app->cards()->findByCardNo($raw);
+    if ($card === null) {
+        Api::fail('card_unknown', Api::NOT_FOUND);
+    }
+    if ((int)$card['status'] === \Vip\Repo\CardRepo::STATUS_VOID) {
+        Api::fail('card_void', 400);
+    }
+
+    $memberId = $card['member_id'] !== null ? (int)$card['member_id'] : null;
+    $app->cards()->void((int)$card['id'], $reason);
+
+    $app->audit()->log('card_void', [
+        'target_type' => 'card', 'target_id' => (string)$card['card_no'],
+        'operator_id' => $op['id'], 'operator_name' => $op['name'],
+        'detail' => ['reason' => $reason, 'member_id' => $memberId,
+                     'serial' => (int)$card['serial']],
+    ]);
+
+    Api::ok(['card_no' => $app->cardNumber()->format((string)$card['card_no']),
+             'member_id' => $memberId]);
 });
 
 return $api;

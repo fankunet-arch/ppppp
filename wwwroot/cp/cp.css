@@ -153,3 +153,14 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .cfg-adv summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .cfg-adv .cfg-items { margin-top: 12px; }
 @media (max-width: 720px) { .cfg-item { grid-template-columns: 1fr; } }
+
+/* 常驻提醒横幅 —— 开了实名但确认短信没接入这类问题，
+   时间一长一定会忘，所以让它一直挂在最显眼的位置 */
+.warnbar {
+  margin: 0; padding: 12px 20px;
+  padding-left:  calc(20px + env(safe-area-inset-left, 0px));
+  padding-right: calc(20px + env(safe-area-inset-right, 0px));
+  background: #fdecea; color: var(--err); border-bottom: 2px solid var(--err);
+  font-size: 14px; line-height: 1.6;
+}
+.warnbar b { font-weight: 700; }
