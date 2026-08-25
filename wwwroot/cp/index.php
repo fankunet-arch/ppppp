@@ -178,6 +178,7 @@ vip_no_store();
         <label>批次号<input id="cd-batch" type="text" placeholder="留空自动按日期生成"></label>
         <label>数量<input id="cd-count" type="number" min="1" max="5000" value="200"></label>
         <label>有效期至（必填）<input id="cd-valid" type="date"></label>
+        <label>卡片等级<select id="cd-tier"></select></label>
       </div>
       <button id="btn-card-gen" class="primary">生成</button>
       <p class="err" style="font-weight:600">
@@ -188,6 +189,10 @@ vip_no_store();
         库里和卡面对不上，等于没有告知过。<br>
         建议取 <b>3 年后的 12 月 31 日</b>，与印刷稿一起定下来再回来填。
         单批最多 5000 张，顺序号自动接上一批，不会重号。
+      </p>
+      <p class="muted small">
+        <b>卡片等级</b>整批统一 —— 印刷本来就是按批的。等级会印在卡面上，
+        客人扫卡时系统就知道这张卡是什么级别。不用等级就选「不分级」。
       </p>
     </details>
 
@@ -202,6 +207,32 @@ vip_no_store();
 
     <h3 style="margin-top:24px">已有批次</h3>
     <div id="card-batches"></div>
+
+    <h3 style="margin-top:24px">卡片等级</h3>
+    <div id="tier-list"></div>
+    <details class="add-box">
+      <summary>新增 / 修改等级</summary>
+      <div class="row">
+        <label>标识<input id="tier-code" type="text" placeholder="gold" maxlength="20"></label>
+        <label>名称（中文）<input id="tier-name" type="text" placeholder="金卡"></label>
+        <label>名称（西语）<input id="tier-name-es" type="text" placeholder="Oro"></label>
+        <label>积分倍率<input id="tier-mult" type="number" step="0.05" min="0.05" max="10" value="1.00" style="width:6em"></label>
+        <label>排序<input id="tier-sort" type="number" value="10" style="width:5em"></label>
+      </div>
+      <button id="btn-tier-save" class="primary">保存</button>
+      <p class="muted small">
+        <b>标识</b>是给机器认的（小写字母、数字、下划线），定了就别改 ——
+        已经发出去的卡是靠它认等级的。改名改的是「名称」，不影响任何已发的卡。<br>
+        用同一个标识再保存一次就是修改。<b>停用</b>只是不再出现在上面的发卡下拉框里，
+        已发出去的卡照常显示等级。
+      </p>
+      <p class="muted small">
+        <b>积分倍率</b>叠在「积分规则」里那个全局倍率之上：<br>
+        积分 = 金额 × 每欧元分数 × 全局倍率 × <b>本等级倍率</b>。1.00 就是与普通卡相同。<br>
+        改倍率<b>只影响以后的入账</b> —— 每一笔流水都记着当时实际用的倍率，
+        历史一行都不会变，客人来问「上次为什么给这么多分」时查得到。
+      </p>
+    </details>
   </div>
 
   <div id="tab-operators" class="panel">

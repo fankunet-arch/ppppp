@@ -351,6 +351,7 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator)
             'state'      => 'expired',
             'card_no'    => $app->cardNumber()->format((string)$card['card_no']),
             'serial'     => (int)$card['serial'],
+            'tier'       => $app->cardTiers()->describe($card['tier_code'] ?? null),
             'valid_to'   => $card['valid_to'],
             'grace_over' => (bool)($r['grace_over'] ?? false),
             'member'     => $m === null ? null : [
@@ -370,6 +371,8 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator)
         'state'     => $r['state'],
         'card_no'   => $app->cardNumber()->format((string)$card['card_no']),
         'serial'    => (int)$card['serial'],
+        // 等级：客人扫卡时系统就知道这张卡什么级别。不分级时为 null
+        'tier'      => $app->cardTiers()->describe($card['tier_code'] ?? null),
         'valid_to'  => $card['valid_to'],
         // 发卡前要提醒收银员「这张快到期了」，判断在前端做，天数由后端算
         'days_left' => \Vip\Repo\CardRepo::daysLeft($card),
@@ -514,6 +517,8 @@ $api->on('POST', '/card/status', static function () use ($app, $requireOperator)
         'expired'     => \Vip\Repo\CardRepo::isExpired($card),
         'grace_over'  => \Vip\Repo\CardRepo::graceOver($card, $app->cardService()->graceMonths()),
         'void_reason' => $card['void_reason'],
+        // 等级：不分级时为 null，前端据此不显示这一栏
+        'tier'        => $app->cardTiers()->describe($card['tier_code'] ?? null),
     ];
 
     $m = $r['member'] ?? null;

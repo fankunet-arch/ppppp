@@ -334,6 +334,11 @@
     'ask.frozen':         { zh: '积分照常累计，但客人尚未完成确认，暂不可兑换',
                             es: 'Acumula puntos, pero el cliente aún no ha confirmado y todavía no puede canjearlos' },
 
+    /* ── 卡片等级 ─────────────────────────────────────── */
+    'tier.label':         { zh: '{name}',        es: '{name}' },
+    'tier.multiplier':    { zh: '{x} 倍积分',    es: '{x}× puntos' },
+    'tier.none':          { zh: '不分级',        es: 'Sin nivel' },
+
     /* ── 现场确认码 ───────────────────────────────────── */
     'consent.notSent':    { zh: '确认码没发出去，积分会先冻结（可稍后在会员处重发）',
                             es: 'No se pudo enviar el código; los puntos quedan bloqueados (puede reenviarlo más tarde)' },

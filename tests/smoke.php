@@ -1425,6 +1425,91 @@ $g5 = $svc->replaceCard($hMid, $hb[0]['card_no'], '刚过期换卡', $clerk);
 ok($g5['ok'] && ($g5['forced'] ?? false) === false,
    '★ 还在宽限期内的卡，普通收银员照样能换，不用惊动经理');
 
+step('⑲ 卡片等级与积分倍率');
+
+/**
+ * 等级属于【卡】不属于会员 —— 它印在卡面上，换卡时跟着新卡走。
+ * 整套是可选的：不定义等级，一切照旧。
+ *
+ * 倍率叠在全局倍率之上，且【实际用了多少必须记进流水】——
+ * 倍率是活查的，不定格的话，改一次倍率历史就再也对不上账，
+ * 而「这单为什么给了 150 分」正是客人申诉时第一个要问的。
+ */
+$tiers = $app->cardTiers();
+
+ok($tiers->save('smokegold', '冒烟金卡', 'Oro de prueba', 2.0, 90, true), '建一个等级');
+$t = $tiers->find('smokegold');
+ok($t !== null, '查得到');
+eq('2.00', (string)$t['points_multiplier'], '倍率存下来了');
+
+ok(!$tiers->save('SmokeBad!', '名字', null, 1.0, 1, true), '★ 标识只允许小写字母数字下划线');
+ok(!$tiers->save('smokebad', '', null, 1.0, 1, true), '★ 名称不能为空');
+ok(!$tiers->save('smokebad', '名字', null, 0, 1, true), '★ 倍率不能是 0（消费了反而不给分）');
+ok(!$tiers->save('smokebad', '名字', null, -1, 1, true), '★ 倍率不能是负数');
+ok(!$tiers->save('smokebad', '名字', null, 99, 1, true), '★ 倍率有上限，防手滑多打个零');
+
+$d = $tiers->describe('smokegold');
+eq('冒烟金卡', $d['name'], '中文名');
+eq('Oro de prueba', $d['names']['es'], '西语名');
+eq(2.0, $d['multiplier'], '倍率也带出来');
+ok($tiers->describe(null) === null, '不分级返回 null —— 前端据此不显示等级那一栏');
+ok($tiers->describe('没这个等级') === null, '认不出的等级码也返回 null，不炸');
+
+// ── 发一批带等级的卡 ──
+$tb = $cards->generateBatch('SMOKETIER', 2, date('Y-m-d', strtotime('+2 years')), 'smokegold');
+eq('smokegold', $tb[0]['tier_code'], '★ 等级写进了卡（印刷清单也要有这一列）');
+$row = $cards->findByCardNo($tb[0]['card_no']);
+eq('smokegold', $row['tier_code'], '库里存下来了');
+
+// ── 倍率真的作用在积分上 ──
+$tr = $svc->bindNewMember($tb[0]['card_no'], null, null, null, $opStub);
+ok($tr['ok'], '这张金卡绑给一位会员');
+$goldMid = (int)$tr['member']['id'];
+
+$fm = $tiers->forMember($goldMid);
+eq('smokegold', $fm['code'], '★ 按会员查等级 —— 查的是他手里那张卡');
+eq(2.0, $fm['multiplier'], '倍率对');
+
+// 普通卡的会员作对照
+$pb = $cards->generateBatch('SMOKEPLAIN', 1, date('Y-m-d', strtotime('+2 years')));
+$pr = $svc->bindNewMember($pb[0]['card_no'], null, null, null, $opStub);
+$plainMid = (int)$pr['member']['id'];
+eq(null, $tiers->forMember($plainMid)['code'], '不分级的卡查出来是 null');
+eq(1.0, $tiers->forMember($plainMid)['multiplier'], '★ 不分级 = 1.00 倍，照常积分只是没有加成');
+
+// 同样金额，金卡应当拿到两倍
+$perEuro = $app->cfg()->float('points_per_euro', 1.0);
+$base    = \Vip\PointsEngine::pointsFor(5000, $perEuro, 1.0);
+$gold    = \Vip\PointsEngine::pointsFor(5000, $perEuro, 1.0 * 2.0);
+eq($base * 2, $gold, '★★ 同样 € 50，2 倍等级拿到两倍积分（' . $base . ' → ' . $gold . '）');
+
+// ── 换卡时等级跟着新卡走 ──
+$nb = $cards->generateBatch('SMOKETIER2', 1, date('Y-m-d', strtotime('+2 years')));
+$rp = $svc->replaceCard($goldMid, $nb[0]['card_no'], '换成不分级的卡', $opStub);
+ok($rp['ok'], '把金卡换成一张不分级的卡');
+eq(null, $tiers->forMember($goldMid)['code'],
+   '★★ 等级跟着新卡走 —— 换了不分级的卡，这位会员就不再是金卡');
+
+// ── 有卡在用的等级不给删 ──
+$tb2 = $cards->generateBatch('SMOKETIER3', 1, date('Y-m-d', strtotime('+2 years')), 'smokegold');
+$del = $tiers->delete('smokegold');
+ok(!$del['ok'] && $del['error'] === 'tier_in_use',
+   '★★ 已经有卡在用的等级不给删（删了那些卡就指向一个不存在的等级）');
+ok($del['in_use'] >= 1, '  └ 告诉调用方有几张在用：' . $del['in_use']);
+
+// 停用是允许的：只是不再出现在发卡下拉框里，老卡照常显示
+ok($tiers->save('smokegold', '冒烟金卡', 'Oro de prueba', 2.0, 90, false), '改成停用');
+ok(!$tiers->isUsable('smokegold'), '★ 停用后不能再用来发卡');
+ok($tiers->describe('smokegold') !== null, '★★ 但已发出去的卡照常显示等级名');
+ok(count($tiers->all(true)) < count($tiers->all(false)), '发卡下拉框里看不到停用的等级');
+
+// 清理
+$db->exec('DELETE FROM card WHERE store_code = ? AND batch_no LIKE ?', [SMOKE_STORE, 'SMOKETIER%']);
+$db->exec('DELETE FROM card WHERE store_code = ? AND batch_no = ?', [SMOKE_STORE, 'SMOKEPLAIN']);
+$db->exec('DELETE FROM point_ledger WHERE store_code = ? AND member_id IN (?,?)', [SMOKE_STORE, $goldMid, $plainMid]);
+$db->exec('DELETE FROM member WHERE store_code = ? AND id IN (?,?)', [SMOKE_STORE, $goldMid, $plainMid]);
+$db->exec('DELETE FROM card_tier WHERE store_code = ? AND code = ?', [SMOKE_STORE, 'smokegold']);
+
 step('⑱ 界面语言 —— 跟着账号走，不跟着平板走');
 
 /**

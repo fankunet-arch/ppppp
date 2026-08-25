@@ -128,6 +128,11 @@ final class App
         ));
     }
 
+    public function cardTiers(): Repo\CardTierRepo
+    {
+        return $this->once('cardTiers', fn() => new Repo\CardTierRepo($this->localDb(), $this->storeCode()));
+    }
+
     public function cards(): CardRepo
     {
         return $this->once('cards', fn() => new CardRepo(
@@ -247,6 +252,7 @@ final class App
             $this->audit(),
             $this->mealRules(),
             $this->businessDay(),
+            $this->cardTiers(),
         ));
     }
 }

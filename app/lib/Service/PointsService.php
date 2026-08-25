@@ -40,6 +40,7 @@ final class PointsService
         private AuditRepo  $audit,
         private MealRules  $rules,
         private BusinessDay $bizDay,
+        private \Vip\Repo\CardTierRepo $tiers,
     ) {
     }
 
@@ -419,7 +420,15 @@ final class PointsService
                     return ['ok' => false, 'error' => 'member_not_found', 'detail' => ['member_id' => $memberId]];
                 }
 
-                $points = PE::pointsFor($amt, $perEuro, $multiplier);
+                /**
+                 * 卡片等级的积分倍率，叠在全局倍率之上：
+                 *   积分 = 金额 × 每欧元分数 × 全局倍率 × 本等级倍率
+                 *
+                 * 逐人查而不是提到循环外：同一单里不同的人可能拿着不同等级的卡
+                 * （一桌四个人，两个金卡两个普卡是很常见的）。
+                 */
+                $tier   = $this->tiers->forMember($memberId);
+                $points = PE::pointsFor($amt, $perEuro, $multiplier * $tier['multiplier']);
                 // by_portion：按 counts_visit=1 菜品的份数计次
                 // by_ledger ：每笔流水最多 1 次
                 // ★ 免费餐 / 核销单不计次：那一餐是兑换来的，
@@ -439,6 +448,11 @@ final class PointsService
                     'excluded_cents'     => Money::toCents($order['excluded_amount']),
                     'alloc_mode'         => $allocMode,
                     'alloc_detail'       => $a['detail'] ?? null,
+                    // ★ 记下当时用的等级与倍率。倍率是活查的，改了立刻对以后生效 ——
+                    //   流水里不记的话，事后回答不了「这单为什么给了 150 分」，
+                    //   而这正是客人申诉、会计对账、撤销重算时第一个要问的。
+                    'tier_code'          => $tier['code'],
+                    'tier_multiplier'    => $tier['multiplier'],
                     'source'             => LedgerRepo::SRC_POS,
                     'operator_id'        => $operator['id']   ?? null,
                     'operator_name'      => $operator['name'] ?? null,
@@ -454,6 +468,8 @@ final class PointsService
                     'amount'    => Money::toStr($amt),
                     'points'    => $points,
                     'visits'    => $visits,
+                    'tier'      => $tier['code'],
+                    'tier_x'    => $tier['multiplier'],
                 ];
             }
 
@@ -582,10 +598,13 @@ final class PointsService
                 return ['ok' => false, 'error' => 'member_not_found'];
             }
 
+            // 手工录入也套等级倍率 —— 否则同一位客人「系统查不到订单」时
+            // 反而少拿分，这种不一致最难跟客人解释
+            $tier   = $this->tiers->forMember($memberId);
             $points = PE::pointsFor(
                 $amountCents,
                 $this->cfg->float('points_per_euro', 1.0),
-                $this->cfg->float('points_multiplier', 1.0)
+                $this->cfg->float('points_multiplier', 1.0) * $tier['multiplier']
             );
 
             $lid = $this->ledger->insert([
@@ -595,6 +614,8 @@ final class PointsService
                 'amount_cents'  => $amountCents,
                 'points'        => $points,
                 'counted_visit' => 0,      // 手工录入无明细，无法判断套餐份数 → 不计次
+                'tier_code'      => $tier['code'],
+                'tier_multiplier'=> $tier['multiplier'],
                 'source'        => LedgerRepo::SRC_MANUAL,
                 'manual_reason' => $reasonCode,
                 'review_status' => 1,      // 全部进待复核队列

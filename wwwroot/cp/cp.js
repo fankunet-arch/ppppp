@@ -554,13 +554,16 @@ async function loadCards() {
 
   const today = new Date().toISOString().slice(0, 10);
   $('#card-batches').innerHTML = d.batches.length ? `<table>
-    <tr><th>批次</th><th>有效期至</th><th>顺序号区间</th><th class="num">共</th><th class="num">库存</th>
+    <tr><th>批次</th><th>等级</th><th>有效期至</th><th>顺序号区间</th><th class="num">共</th><th class="num">库存</th>
         <th class="num">已激活</th><th class="num">已作废</th><th>生成时间</th></tr>${
     d.batches.map(b => {
       // 库存里还躺着的过期卡要显眼 —— 发出去客人拿回家就是一张废卡
       const dead = b.valid_to && b.valid_to < today;
       return `<tr>
       <td><b>${esc(b.batch_no)}</b></td>
+      <td>${b.tier
+            ? `${esc(b.tier.name)}${b.tier.multiplier !== 1 ? ` <span class="muted small">×${b.tier.multiplier}</span>` : ''}`
+            : '<span class="muted small">不分级</span>'}</td>
       <td class="${dead ? 'err' : 'muted small'}">${b.valid_to ? esc(b.valid_to) : '不设'}${
         dead && b.stock > 0 ? `　⚠ 库存 ${b.stock} 张已过期` : ''}</td>
       <td class="muted small">${b.serial_from} ~ ${b.serial_to}</td>
@@ -575,7 +578,107 @@ async function loadCards() {
   // 生成批次是管理员才有的动作 —— 它能一次拿到整批明文 PIN
   const box = $('#cd-gen-box');
   if (box) box.hidden = !window.IS_ADMIN;
+
+  await loadTiers();
 }
+
+/* ── 卡片等级 ─────────────────────────────────────
+ *
+ * 等级属于【卡】不属于会员 —— 它印在卡面上，换卡时跟着新卡走。
+ * 整套是可选的：不定义等级，发卡时选「不分级」，界面上就不出现这件事。
+ */
+async function loadTiers() {
+  const d = await api('/tiers', undefined, 'GET');
+
+  // 发卡下拉框：只列启用的（停用的不该再发出去）
+  const sel = $('#cd-tier');
+  if (sel) {
+    const keep = sel.value;
+    sel.innerHTML = '<option value="">不分级</option>' + d.tiers
+      .filter(t => t.enabled)
+      .map(t => `<option value="${esc(t.code)}">${esc(t.name)}${
+        t.multiplier !== 1 ? `（${t.multiplier} 倍积分）` : ''}</option>`).join('');
+    if (keep) sel.value = keep;
+  }
+
+  const list = $('#tier-list');
+  if (!list) return;
+  list.innerHTML = d.tiers.length ? `<table>
+    <tr><th>标识</th><th>名称（中文）</th><th>名称（西语）</th><th class="num">积分倍率</th>
+        <th class="num">排序</th><th>状态</th>${window.IS_ADMIN ? '<th></th>' : ''}</tr>${
+    d.tiers.map(t => `<tr>
+      <td><code>${esc(t.code)}</code></td>
+      <td><b>${esc(t.name)}</b></td>
+      <td>${t.name_es ? esc(t.name_es) : '<span class="muted small">未填 · 西语界面显示中文名</span>'}</td>
+      <td class="num">${t.multiplier === 1 ? '<span class="muted">1.00</span>' : `<b>${t.multiplier.toFixed(2)}</b>`}</td>
+      <td class="num muted small">${t.sort_order}</td>
+      <td>${t.enabled ? '<span class="tag on">启用</span>' : '<span class="tag off">停用</span>'}</td>
+      ${window.IS_ADMIN ? `<td>
+        <button class="tiny" data-te="${esc(t.code)}">编辑</button>
+        <button class="tiny" data-tt="${esc(t.code)}">${t.enabled ? '停用' : '启用'}</button>
+        <button class="tiny" data-td="${esc(t.code)}">删除</button>
+      </td>` : ''}</tr>`).join('')
+  }</table>` : '<div class="empty">还没有定义等级 —— 不用等级的话，发卡时选「不分级」即可</div>';
+
+  // 编辑：把这一行填回表单，改完用同一个标识保存即可
+  $$('[data-te]').forEach(b => b.onclick = () => {
+    const t = d.tiers.find(x => x.code === b.dataset.te);
+    if (!t) return;
+    // ★ 表单在一个折叠的 <details> 里，不展开的话点了「编辑」屏幕上
+    //   什么反应都没有 —— 值填进去了但看不见，只会被当成按钮坏了
+    const box = $('#tier-code').closest('details');
+    if (box) { box.open = true; }
+    $('#tier-code').value    = t.code;
+    $('#tier-name').value    = t.name;
+    $('#tier-name-es').value = t.name_es || '';
+    $('#tier-mult').value    = t.multiplier.toFixed(2);
+    $('#tier-sort').value    = t.sort_order;
+    $('#tier-code').focus();
+    toast(`已填入「${t.name}」，改完点保存`, 'ok');
+  });
+
+  $$('[data-tt]').forEach(b => b.onclick = async () => {
+    const t = d.tiers.find(x => x.code === b.dataset.tt);
+    if (!t) return;
+    try {
+      await api('/tiers/save', {
+        code: t.code, name: t.name, name_es: t.name_es,
+        points_multiplier: t.multiplier, sort_order: t.sort_order,
+        enabled: !t.enabled,
+      });
+      toast(t.enabled ? '已停用' : '已启用', 'ok');
+      loadTiers();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+
+  $$('[data-td]').forEach(b => b.onclick = async () => {
+    const code = b.dataset.td;
+    if (!await UI.confirm(`删除等级「${code}」？\n\n已经有卡在用的等级删不掉 —— 那种情况请改用「停用」。`,
+                          { okText: '删除', danger: true })) return;
+    try {
+      await api('/tiers/delete', { code });
+      toast('已删除', 'ok');
+      loadTiers();
+    } catch (e) { toast(e.message + (e.detail?.hint ? '\n' + e.detail.hint : ''), 'err'); }
+  });
+}
+
+$('#btn-tier-save').onclick = async () => {
+  try {
+    await api('/tiers/save', {
+      code:              $('#tier-code').value.trim(),
+      name:              $('#tier-name').value.trim(),
+      name_es:           $('#tier-name-es').value.trim(),
+      points_multiplier: parseFloat($('#tier-mult').value) || 1,
+      sort_order:        +$('#tier-sort').value || 0,
+      enabled:           true,
+    });
+    toast('已保存', 'ok');
+    $('#tier-code').value = ''; $('#tier-name').value = '';
+    $('#tier-name-es').value = ''; $('#tier-mult').value = '1.00';
+    loadTiers();
+  } catch (e) { toast(e.message + (e.detail?.hint ? '：' + e.detail.hint : ''), 'err'); }
+};
 
 $('#btn-card-look').onclick = async () => {
   const no = $('#cd-look').value.trim();
@@ -589,6 +692,9 @@ $('#btn-card-look').onclick = async () => {
       <tr><th>卡号</th><td><b>${esc(c.card_no)}</b></td></tr>
       <tr><th>状态</th><td>${esc(stateText)}</td></tr>
       <tr><th>批次</th><td>${esc(c.batch_no)}　顺序号 ${c.serial}</td></tr>
+      <tr><th>等级</th><td>${c.tier
+          ? `${esc(c.tier.name)}${c.tier.multiplier !== 1 ? `　<span class="muted small">${c.tier.multiplier} 倍积分</span>` : ''}`
+          : '<span class="muted small">不分级</span>'}</td></tr>
       <tr><th>有效期至</th><td class="${c.expired ? 'err' : ''}">${
         c.valid_to ? esc(c.valid_to) + (c.expired ? '　⚠ 已过期，可到店换发新卡（积分结转）' : '') : '不设'}</td></tr>
       ${c.activated_at ? `<tr><th>激活时间</th><td>${esc(c.activated_at)}</td></tr>` : ''}
@@ -647,11 +753,15 @@ $('#btn-card-gen').onclick = async () => {
     { okText: '生成并显示清单' })) return;
 
   try {
-    const d = await api('/cards/generate', { batch_no: batch, count, valid_to: valid });
+    const tier = $('#cd-tier') ? $('#cd-tier').value : '';
+    const d = await api('/cards/generate', { batch_no: batch, count, valid_to: valid, tier_code: tier });
     // 制表符分隔：直接粘进 Excel 就是四列，不用做 CSV 转义。
     // 有效期也放进去 —— 给印刷厂的稿子要按这一列排版
-    const lines = ['卡号\t二维码内容\tPIN\t有效期至']
-      .concat(d.rows.map(r => `${r.display}\t${r.card_no}\t${r.pin}\t${r.valid_to || ''}`));
+    // 制表符分隔：直接粘进 Excel 就是五列，不用做 CSV 转义。
+    // 等级也放进去 —— 卡面要按它排版（金卡银卡的版式本来就不同）
+    const tierName = d.tier ? d.tier.name : '';
+    const lines = ['卡号\t二维码内容\tPIN\t有效期至\t等级']
+      .concat(d.rows.map(r => `${r.display}\t${r.card_no}\t${r.pin}\t${r.valid_to || ''}\t${tierName}`));
     $('#card-gen-csv').value = lines.join('\n');
     $('#card-gen-warn').textContent = d.warning;
     $('#card-gen-result').hidden = false;
