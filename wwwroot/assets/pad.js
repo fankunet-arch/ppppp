@@ -98,6 +98,41 @@ function step(id) {
   if (window.UI && UI.back) UI.back.sync();
 }
 
+/**
+ * 会话令牌的本地备份。
+ *
+ * ★ 这一段是补一次现场事故的：**平板熄屏一会儿再打开就要求重新登录。**
+ *
+ *   查下来不是有效期问题（Cookie 与服务端会话都是 12 小时），
+ *   是 Android WebView 的老毛病：**Cookie 默认只存在内存里，
+ *   要 CookieManager.flush() 才落盘**。熄屏后系统把 WebView 进程回收，
+ *   没 flush 的 Cookie 就跟着没了。
+ *
+ *   正经的修法在容器侧（onPause() 里调 flush()），但那要每台平板都
+ *   装到新版容器才生效，而 apk/ 已经不在本仓库里。所以 Web 这边自己兜底：
+ *   登录时把令牌存进 localStorage，之后每个请求带一个头。
+ *   localStorage 的落盘时机和 Cookie 不同，进程被杀也还在。
+ *
+ * ★ Cookie 仍然是第一优先，这里只是后备（服务端 readToken 先看 Cookie）。
+ *
+ * ★ 每一处读写都包在 try/catch 里：容器可能禁掉 localStorage，
+ *   隐私模式下直接 throw。取不到就退回只靠 Cookie —— 那是原来的行为，
+ *   不会更糟，但绝不能因为存不了令牌就整个登录不了。
+ */
+const Session = {
+  KEY: 'vip_session_token',
+  token() {
+    try { return localStorage.getItem(this.KEY) || null; } catch { return null; }
+  },
+  save(t) {
+    if (!t) return;
+    try { localStorage.setItem(this.KEY, t); } catch {}
+  },
+  clear() {
+    try { localStorage.removeItem(this.KEY); } catch {}
+  },
+};
+
 async function api(path, body, method = 'POST') {
   const opt = {
     method,
@@ -107,6 +142,9 @@ async function api(path, body, method = 'POST') {
     headers: { 'Content-Type': 'application/json', 'X-Lang': I18N.lang },
     credentials: 'same-origin',
   };
+  // Cookie 丢了之后的后备通道 —— 说明见 Session 那一节
+  const tk = Session.token();
+  if (tk) { opt.headers['X-Session-Token'] = tk; }
   if (body !== undefined && method !== 'GET') opt.body = JSON.stringify(body);
   /**
    * ★ 必须把「连不上」和「连上了但没回 JSON」分开报。
@@ -136,6 +174,12 @@ async function api(path, body, method = 'POST') {
     };
   }
   if (!res.ok || json.ok === false) {
+    /**
+     * 令牌被服务端否掉了（过期、被踢、库重建过）——
+     * 本地那份就没有意义了，留着只会每次请求都白带一遍，
+     * 而且下一个人开机时会先被拒一次才回到登录页，看着像出错。
+     */
+    if (json.error === 'unauthorized') { Session.clear(); }
     throw { error: json.error || 'server_error', message: json.message || T('net.failed'), detail: json.detail };
   }
   return json.data;
@@ -149,6 +193,7 @@ $('#btn-login').onclick = async () => {
   if (!name || !pin) return showErr('#login-err', T('login.needBoth'));
   try {
     const d = await api('/auth/login', { login_name: name, pin, device: DEVICE });
+    Session.save(d.session_token);     // Cookie 丢了还能靠它回来
     enterMain(d.operator, d.settings);
   } catch (e) {
     showErr('#login-err', e.message);
@@ -164,6 +209,13 @@ $$('#btn-refresh, #btn-refresh-login').forEach(b => {
 
 $('#btn-logout').onclick = async () => {
   try { await api('/auth/logout', {}); } catch {}
+  /**
+   * ★ 本地那份也要删干净。
+   *   只让服务端作废、本地留着的话，下一个人开机会带着一个已作废的令牌
+   *   去请求，被拒之后才回到登录页 —— 中间那一下白等，而且看着像出错了。
+   *   而万一服务端那次作废没发出去（断网），本地还留着就等于没退出。
+   */
+  Session.clear();
   S.operator = null;
   /**
    * 退回登录页 = 回到「没有人登录」的状态，语言也该回到【这台平板】的设置，

@@ -154,7 +154,19 @@ $api->on('POST', '/auth/login', static function () use ($auth, $padSettings, $wi
     // 登录响应本身也按这个人的语言回话 —— 否则登录页是中文、
     // 进去之后第一条提示还是中文，要等下一次请求才切过来
     Api::setLang($op['lang']);
-    Api::ok(['operator' => $op, 'settings' => $padSettings()]);
+    /**
+     * ★ 令牌【也】交给前端存一份（localStorage）。
+     *
+     * 平板熄屏后系统会回收 WebView 进程，而 Android WebView 的 Cookie
+     * 默认只在内存里，没 flush 就丢 —— 于是「熄屏一会儿再打开就要重新登录」。
+     * 放在顶层而不是塞进 operator 里：那个数组会被 $withLang() 重塑，
+     * 多出来的键未必留得住。说明见 Api::readToken()。
+     */
+    Api::ok([
+        'operator' => $op,
+        'settings' => $padSettings(),
+        'session_token' => (string)$r['token'],
+    ]);
 });
 
 /**

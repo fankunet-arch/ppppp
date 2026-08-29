@@ -449,6 +449,10 @@ CREATE TABLE `operator_session` (
   `operator_id`  INT NOT NULL,
   `token_hash`   VARCHAR(64) NOT NULL COMMENT 'token 的 hash；明文只发给客户端，不落库',
   `ip`           VARCHAR(45) DEFAULT NULL,
+  -- ★ 滑动续期：剩不到 4 小时时，任何一次请求都会把它续满 12 小时。
+  --   原来是从登录起硬性 12 小时，晚市高峰正忙时突然掉线 ——
+  --   对一台整天开着的收银平板没道理。真正的下线由「退出」和
+  --   连续 12 小时没有任何请求来决定。
   `expires_at`   DATETIME NOT NULL,
   `revoked_at`   DATETIME DEFAULT NULL COMMENT '主动退出时打戳，不物理删除',
   `last_seen_at` DATETIME DEFAULT NULL,

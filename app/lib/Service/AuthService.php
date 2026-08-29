@@ -26,6 +26,18 @@ final class AuthService
     private const LOCK_MINUTES = 15;
     private const TTL_HOURS    = 12;   // 覆盖一个整班次
 
+    /**
+     * 滑动续期：剩不到这么多小时就自动续满。
+     *
+     * 原来是【从登录起硬性 12 小时】，到点就掉线，哪怕平板正在用。
+     * 对一台整天开着的收银平板来说这没道理 —— 中午登录，晚市高峰
+     * 正忙的时候突然要求重新登录，是现场最不需要的打断。
+     *
+     * 现在只要还在用就一直续。真正的下线由「退出」按钮和
+     * 长时间不用（超过 12 小时没有任何请求）来决定。
+     */
+    private const RENEW_WHEN_LEFT_HOURS = 4;
+
     public function __construct(
         private LocalDb $db,
         private string $storeCode,
@@ -111,10 +123,22 @@ final class AuthService
         if (strtotime((string)$s['expires_at']) <= time()) {
             return null;
         }
-        $this->db->exec(
-            'UPDATE operator_session SET last_seen_at = ? WHERE id = ?',
-            [$this->db->now(), $s['id']]
-        );
+        /**
+         * 滑动续期。只在剩余不足阈值时才写 expires_at ——
+         * 每个请求都写一次的话，一天几千次记账就是几千次多余的行更新。
+         */
+        $left = strtotime((string)$s['expires_at']) - time();
+        if ($left < self::RENEW_WHEN_LEFT_HOURS * 3600) {
+            $this->db->exec(
+                'UPDATE operator_session SET last_seen_at = ?, expires_at = ? WHERE id = ?',
+                [$this->db->now(), date('Y-m-d H:i:s', time() + self::TTL_HOURS * 3600), $s['id']]
+            );
+        } else {
+            $this->db->exec(
+                'UPDATE operator_session SET last_seen_at = ? WHERE id = ?',
+                [$this->db->now(), $s['id']]
+            );
+        }
         return [
             'id'         => (int)$s['operator_id'],
             'name'       => (string)$s['display_name'],

@@ -432,10 +432,44 @@ final class Api
 
     // ── 会话 Cookie ────────────────────────────────────────
 
+    /** 请求头里的会话令牌。Cookie 丢了之后的后备通道，见下方说明 */
+    public const TOKEN_HEADER = 'HTTP_X_SESSION_TOKEN';
+
+    /**
+     * 取会话令牌：先 Cookie，再请求头。
+     *
+     * ★ 为什么要有请求头这条后备路 —— 这是一次现场事故。
+     *
+     *   平板熄屏一会儿再打开就要求重新登录。查下来不是有效期问题
+     *   （Cookie 与服务端会话都是 12 小时），是 Android WebView 的老问题：
+     *   **Cookie 默认只在内存里，要 CookieManager.flush() 才落盘**。
+     *   熄屏后系统把 WebView 进程回收掉，没 flush 的 Cookie 就没了。
+     *
+     *   正确的修法在容器侧（onPause() 里调 flush()），但 apk/ 已经不在
+     *   本仓库里，而且指望每台平板都装到新版容器本身就不可靠。
+     *   所以 Web 这边自己兜底：登录时把令牌也交给前端存进 localStorage，
+     *   之后每个请求带上这个头。localStorage 的落盘时机与 Cookie 不同，
+     *   进程被杀也还在。
+     *
+     * ★ Cookie 仍然是【第一优先】。它能用的时候（普通浏览器、后台）
+     *   走的还是 httponly 那条更安全的路，请求头只是后备。
+     *
+     * ★ 安全上的取舍写在这里，不要静悄悄地改：
+     *   放进 localStorage 意味着令牌对 JS 可见，XSS 能把它偷走。
+     *   但同源 XSS 本来就能【直接带着 httponly 的 Cookie 发请求】——
+     *   httponly 挡的是「把令牌带离设备」，不是「冒用会话」。
+     *   在一台店内自持、只加载本站代码的收银平板上，这点增量风险
+     *   远小于「收银员一天被迫重登十几次」带来的后果
+     *   （PIN 写在柜台上、共用账号、挑最好记的 PIN）。
+     */
     public static function readToken(): ?string
     {
         $t = $_COOKIE[self::COOKIE] ?? null;
-        return is_string($t) && $t !== '' ? $t : null;
+        if (is_string($t) && $t !== '') {
+            return $t;
+        }
+        $h = $_SERVER[self::TOKEN_HEADER] ?? null;
+        return is_string($h) && trim($h) !== '' ? trim($h) : null;
     }
 
     public static function setToken(string $token, int $ttlSeconds): void
