@@ -102,9 +102,14 @@ $appVersion = vip_app_version([
     </div>
 
     <p id="locate-err" class="err" hidden></p>
+    <!-- 同一条原则：该先试的是「放宽再找」，它才该有颜色；
+         手工录入要进待复核队列，是降级路径，隔开放 -->
     <div id="locate-fallback" hidden>
-      <button id="btn-widen" class="ghost"></button>
-      <button id="btn-manual" class="ghost warn" data-i18n="lookup.useManual">改用手工录入</button>
+      <button id="btn-widen" class="primary"></button>
+      <div class="danger-zone">
+        <p class="danger-zone-note" data-i18n="lookup.manualNote"></p>
+        <button id="btn-manual" class="ghost warn" data-i18n="lookup.useManual">改用手工录入</button>
+      </div>
     </div>
 
     <!-- 客人当面问「我这卡还能用吗」。放在第一步：这种问题都发生在两单之间，
@@ -134,16 +139,24 @@ $appVersion = vip_app_version([
       一桌 4 个人：有 4 张卡就用「均摊 AA」记 4 张，各记 1 次；
       只有 2 张卡就只记那 2 张，剩下 2 份的次数没有了，不挪给在场的卡。
     -->
+    <!--
+      ★ .mode-main 给「均摊 AA」——它是每天点几百次的那个。
+        视觉优先级必须和使用频率一致，说明见 pad.css 里 .mode-main 的注释。
+    -->
     <div class="modes">
-      <button class="mode" data-mode="2"><b data-i18n="mode2.title"></b><span data-i18n="mode2.desc"></span></button>
+      <button class="mode mode-main" data-mode="2"><b data-i18n="mode2.title"></b><span data-i18n="mode2.desc"></span></button>
       <button class="mode" data-mode="3"><b data-i18n="mode3.title"></b><span data-i18n="mode3.desc"></span></button>
     </div>
     <p class="muted small" data-i18n-html="mode.noWholeNote"></p>
     <!-- 同行分桌把几桌的【积分】并给一位客人。次数不并（每张卡本餐期仍只 1 次）。
          普通服务员看不到这个入口 —— 要经理身份才出现。 -->
     <button id="btn-merge-start" class="ghost" data-i18n="merge.start" hidden>还有其他桌，一起记</button>
-    <button id="btn-free-meal" class="ghost warn" data-i18n="freeMeal.btn">标记为免费餐</button>
     <button class="ghost" data-back="step-order" data-i18n="common.back">返回</button>
+    <!-- 免费餐核销单独隔开：既少用又不可逆，不能和常用按钮挤在同一片点击区 -->
+    <div class="danger-zone">
+      <p class="danger-zone-note" data-i18n="freeMeal.zoneNote"></p>
+      <button id="btn-free-meal" class="ghost warn" data-i18n="freeMeal.btn">标记为免费餐</button>
+    </div>
   </div>
 
   <!-- 步骤 3bis：多桌合并（只有整单一种记法，见 docs/03 §12.2） -->

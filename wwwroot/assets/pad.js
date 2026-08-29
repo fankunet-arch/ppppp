@@ -557,7 +557,8 @@ function renderOrders(list) {
   box.innerHTML = '';
   list.forEach(o => {
     const b = document.createElement('button');
-    b.className = 'card' + (o.eligible ? '' : ' disabled');
+    // 能点的给主色，不能点的保持灰 —— 一屏里哪张该点，不用读字就看得出
+    b.className = 'card ' + (o.eligible ? 'pickable' : 'disabled');
     const time = o.order_end_time.slice(11, 16);
     const reason = {
       not_dine_in: T('order.notDineIn'),

@@ -1788,13 +1788,24 @@ $mkOrder('9909990002', 990002, 'R2', '47.80', date('Y-m-d H:i:s', $nowTs - 300))
 $mkOrder('9909990003', 990003, 'R3', '47.80', date('Y-m-d H:i:s', $nowTs - 420));
 // 第四张：同一天但隔了 5 小时 —— 「捡小票」的形状
 $mkOrder('9909990004', 990004, 'R9', '47.80', date('Y-m-d H:i:s', $nowTs - 5 * 3600));
+/**
+ * 第五张：和前三桌【同一顿】，专门留给 ⑤ 段测餐期上限。
+ *
+ * ★ 不能拿上面那张 5 小时前的单来测上限 —— 它和前三桌很可能不在同一个餐期
+ *   （比如现在 21:46 属「晚上」，5 小时前 16:46 属「白天」），
+ *   于是 countGrantsInSitting 一条都数不到，闸门根本不会触发。
+ *   这条测试因此会【随一天中的时刻时绿时红】：跑在 18:00–19:30 那个
+ *   餐期空档里就恰好是绿的，因为那时两张单都落在餐期之外、退回按天比。
+ *   加餐期种子之前它一直是绿的，正是这个原因。
+ */
+$mkOrder('9909990005', 990005, 'R5', '47.80', date('Y-m-d H:i:s', $nowTs - 60));
 $rk->setPosSource($rkPos);
 
-foreach (['9909990001' => 'R1', '9909990002' => 'R2', '9909990003' => 'R3', '9909990004' => 'R9'] as $sn => $tb) {
+foreach (['R1', 'R2', 'R3', 'R9', 'R5'] as $tb) {
     $rk->points()->locate($tb, 600);
 }
-eq(4, (int)$rkDb->value('SELECT COUNT(*) FROM pos_order WHERE store_code=? AND serial_id LIKE ?',
-                        [SMOKE_STORE, '99099900%']), '四张测试订单已落镜像');
+eq(5, (int)$rkDb->value('SELECT COUNT(*) FROM pos_order WHERE store_code=? AND serial_id LIKE ?',
+                        [SMOKE_STORE, '99099900%']), '五张测试订单已落镜像');
 
 $rkMid = (int)$rk->members()->create('TK-00099901-RSK', null, null, null)['id'];
 $rkOpS = ['id' => 1, 'name' => '收银员', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => false];
@@ -1879,7 +1890,8 @@ eq('经理', (string)$rkDb->value(
 // ── ⑤ 餐期上限 ──────────────────────────────────────────
 $rk->cfg()->set('late_grant_minutes', '0');     // 只测上限，把补记闸门让开
 $rk->cfg()->set('max_grants_per_period', '1');
-$capR = $rk->points()->grant('9909990004', [['member_id' => $rkMid, 'amount_cents' => 1, 'portions' => 0]],
+// ★ 用同一顿的那张（9909990005），不是 5 小时前那张 —— 理由见上面造单处
+$capR = $rk->points()->grant('9909990005', [['member_id' => $rkMid, 'amount_cents' => 1, 'portions' => 0]],
                              Vip\PointsEngine::MODE_WHOLE, $rkOpS);
 ok(!$capR['ok'] && $capR['error'] === 'manager_required', '★★ 同一餐期超过上限，普通收银员记不了');
 ok(($capR['detail']['gates'][0]['gate'] ?? '') === 'period_cap', "  └ 撞的是次数上限");

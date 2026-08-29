@@ -107,3 +107,72 @@ foreach ($jsFilled as $id) {
 T::true(str_contains($padJs, 'refreshDynamicText();')
     && preg_match('/function enterMain\(.*?refreshDynamicText\(\);.*?\n\}/s', $padJs) === 1,
     '★★ enterMain 里调了 refreshDynamicText —— 登录后这些文字才有内容');
+
+T::group('每一屏都要有一个「主色按钮」—— 视觉优先级不能反过来');
+
+/**
+ * ★★ 这条测试是补一次现场事故的。
+ *
+ *   「③ 记账方式」那一屏上，唯一有颜色的是「标记为免费餐（10送1核销）」——
+ *   一个既危险又极少用的按钮。而每天要点几百次的「均摊 AA」是白底黑字，
+ *   跟旁边的说明文字一样平。
+ *
+ *   现场反馈：收银员求快时，眼睛先落在那抹红色上，点错的正是它。
+ *
+ *   根因不是配色难看，是【视觉优先级和使用频率反过来了】。
+ *   其余每一屏都有 .primary 主按钮，只有这两屏没有 ——
+ *   因为它们的主按钮不是普通 button（一个是 .mode 卡片，
+ *   一个是动态填文字的 #btn-widen），当初就漏掉了。
+ *
+ * 判定：每个 .step 里至少要有一个「带主色」的元素
+ * （.primary 或 .mode-main）。
+ * 只有纯展示、没有下一步动作的步骤才可以没有。
+ */
+$padHtml = file_get_contents(__DIR__ . '/../../wwwroot/index.php');
+
+preg_match_all('/<div id="(step-[a-z-]+)" class="step[^"]*">(.*?)\n  <\/div>/s', $padHtml, $steps, PREG_SET_ORDER);
+T::true(count($steps) >= 5, '扫到了 ' . count($steps) . ' 个步骤屏');
+
+/**
+ * 有的屏主按钮是 JS 生成的（step-order 的订单卡片），HTML 里看不到 ——
+ * 所以两边都认。第一版只扫 HTML，把 step-order 报成了「没有主色按钮」，
+ * 而它其实只是把主色加在动态卡片上。
+ */
+$padJs = file_get_contents(__DIR__ . '/../../wwwroot/assets/pad.js');
+$dynamicPrimary = [
+    'step-order' => 'pickable',    // 可选的订单卡，renderOrders() 里加的
+];
+
+$noPrimary = [];
+foreach ($steps as [, $id, $body]) {
+    $hasPrimary = str_contains($body, 'class="primary')
+               || str_contains($body, 'primary big')
+               || str_contains($body, 'mode-main');
+    if (!$hasPrimary && isset($dynamicPrimary[$id])) {
+        $hasPrimary = str_contains($padJs, $dynamicPrimary[$id]);
+    }
+    if (!$hasPrimary) { $noPrimary[] = $id; }
+}
+T::true($noPrimary === [],
+    '★★ 每个步骤屏都有一个主色按钮，眼睛知道该先看哪儿'
+    . ($noPrimary
+        ? "\n      没有主色按钮的屏：" . implode('、', $noPrimary)
+          . "\n      —— 这一屏上最显眼的会变成别的东西（比如那个红色的危险按钮），"
+          . "\n         收银员求快时就会点错"
+        : ''));
+
+/**
+ * 危险动作要【隔开放】，光换颜色不够 —— 手指连点时会顺势滑过去。
+ */
+foreach (['btn-free-meal' => '标记为免费餐', 'btn-manual' => '改用手工录入'] as $id => $label) {
+    T::true((bool)preg_match(
+        '/<div class="danger-zone">.*?id="' . preg_quote($id, '/') . '"/s', $padHtml),
+        "★ 「{$label}」放在 .danger-zone 里（与常用按钮之间有分隔线和留白）");
+}
+
+// 主色按钮不能反过来给危险动作
+foreach (['btn-free-meal', 'btn-manual'] as $id) {
+    T::true(!(bool)preg_match('/id="' . preg_quote($id, '/') . '"[^>]*class="[^"]*primary/', $padHtml)
+         && !(bool)preg_match('/class="[^"]*primary[^"]*"[^>]*id="' . preg_quote($id, '/') . '"/', $padHtml),
+        "★★ #{$id} 不是主色按钮 —— 危险动作永远不该是最显眼的那个");
+}

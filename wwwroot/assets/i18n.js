@@ -261,6 +261,11 @@
     'member.scanNote':    { zh: '扫客人卡面的二维码；扫不出时照着卡面手输卡号也行。<b>不用纠结哪个是字母、哪个是数字</b>，看着像什么就输什么，系统会自动纠正。',
                             es: 'Escanee el QR de la tarjeta; si no lee, escriba el número tal como aparece. <b>No se preocupe por distinguir letras de números</b>: escriba lo que ve, el sistema lo corrige.' },
     'member.needInput':   { zh: '请输入查询内容', es: 'Escriba algo para buscar' },
+    // 隔离区的小字：说清这两个按钮为什么被单独放出来
+    'freeMeal.zoneNote':  { zh: '下面这个只在客人用券免单时点 —— 点了这一单就不积分、不计次。',
+                            es: 'Solo para canjes con vale: este ticket no sumará puntos ni visita.' },
+    'lookup.manualNote':  { zh: '上面都试过还是找不到，才用下面这个 —— 手工录入要经理复核。',
+                            es: 'Solo si nada de lo anterior encuentra el ticket. La entrada manual pasa a revisión.' },
     // 后台关掉「允许收集客人联系方式」时，手机号/邮箱两档置灰并显示这一句
     'member.piiOff':      { zh: '本店不登记手机号和邮箱，只按卡号查。',
                             es: 'Este local no registra teléfono ni email; solo se busca por tarjeta.' },
