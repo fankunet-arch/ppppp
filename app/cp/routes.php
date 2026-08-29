@@ -701,7 +701,14 @@ $api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin)
 
 $api->on('GET', '/tiers', static function () use ($app, $requireManager): void {
     $requireManager();
-    Api::ok(['tiers' => array_map(static fn(array $t): array => [
+    /**
+     * 带上当前的门槛口径：等级表单里「几次送 1 次」「满额送 1 次」两格，
+     * 和「配置 → 奖励规则」里那两项受同一个全局口径管。
+     * 口径没选的那一格在后台置灰 —— 两个页面必须一致，
+     * 否则同一件事在这边能改、在那边不能改，只会让人以为哪边坏了。
+     */
+    $mode = $app->cfg()->get('reward_mode', 'visits');
+    Api::ok(['reward_mode' => $mode, 'tiers' => array_map(static fn(array $t): array => [
         'code'       => $t['code'],
         'name'       => $t['name'],
         'name_es'    => $t['name_es'],

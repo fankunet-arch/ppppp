@@ -54,11 +54,13 @@ final class ConfigSchema
             'label' => '几次送一次',
             'desc'  => '「按次数」口径下生效。填 10 就是十送一，填 8 就是八送一。'
                      . '改完之后历史进度会自动重算，不会重复发也不会漏发',
+            'active_when' => ['key' => 'reward_mode', 'value' => 'visits'],
         ],
         'reward_threshold_amount' => [
             'group' => 'reward', 'type' => 'decimal', 'unit' => '€',
             'label' => '累计消费多少送一次',
             'desc'  => '「按金额」口径下生效',
+            'active_when' => ['key' => 'reward_mode', 'value' => 'amount'],
         ],
         'reward_auto_grant' => [
             'group' => 'reward', 'type' => 'bool',
@@ -252,6 +254,47 @@ final class ConfigSchema
     ];
 
     /** 后台要的完整结构：分组 → 项目（带当前值） */
+    /**
+     * 这一项当下用不用得上。
+     *
+     * ★ 「用不上」不等于「无效」：值照旧存在库里，只是现在的口径不看它。
+     *   所以判定只影响后台能不能编辑，不影响存储，也不影响任何历史数据 ——
+     *   口径切回去，原来填的值原样还在。
+     */
+    public static function isActive(array $meta, array $current): bool
+    {
+        $aw = $meta['active_when'] ?? null;
+        if ($aw === null) {
+            return true;
+        }
+        /**
+         * ★ 依赖项在库里【根本没有】时一律放行。
+         *
+         * 置灰是个便利，不是约束。老库缺 reward_mode 的话，按「不等于」判
+         * 会把两个门槛【同时】锁死 —— 管理员一格都改不了，而唯一的解法
+         * （改口径）本身也在这个页面上。宁可两格都能改，也不能锁死。
+         */
+        if (!array_key_exists($aw['key'], $current)) {
+            return true;
+        }
+        return (string)$current[$aw['key']] === (string)$aw['value'];
+    }
+
+    /** 置灰时给一句人话，说明要改它得先改哪一项 —— 否则看着像坏了 */
+    public static function inactiveHint(array $meta): ?string
+    {
+        $aw = $meta['active_when'] ?? null;
+        if ($aw === null) {
+            return null;
+        }
+        $dep = self::ITEMS[$aw['key']] ?? null;
+        if ($dep === null) {
+            return null;
+        }
+        $optLabel = $dep['options'][$aw['value']] ?? $aw['value'];
+        return "当前用不上 —— 把「{$dep['label']}」改成「{$optLabel}」之后才生效";
+    }
+
     public static function grouped(array $current): array
     {
         $out = [];
@@ -264,8 +307,11 @@ final class ConfigSchema
                 continue;
             }
             $out[$g]['items'][] = $meta + [
-                'key'   => $key,
-                'value' => (string)($current[$key] ?? ''),
+                'key'    => $key,
+                'value'  => (string)($current[$key] ?? ''),
+                // 依赖别项的（比如两个门槛只有一个当口径），当下用不上的置灰
+                'active' => self::isActive($meta, $current),
+                'inactive_hint' => self::inactiveHint($meta),
             ];
         }
         // 库里有、但这里没登记的项，兜底放到最后，免得改不了

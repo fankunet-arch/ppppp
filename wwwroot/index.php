@@ -202,6 +202,8 @@ $appVersion = vip_app_version([
       <button data-type="phone" data-i18n="member.byPhone">手机号</button>
       <button data-type="email" data-i18n="member.byEmail">邮箱</button>
     </div>
+    <!-- 后台关掉「允许收集客人联系方式」时，上面两档置灰，这一句说明为什么 -->
+    <p class="muted small" id="pii-off-note" hidden></p>
     <div class="row">
       <input id="member-input" type="text" autocomplete="off" data-i18n-ph="member.inputPh">
       <button id="btn-scan" class="primary" data-i18n="member.scan">扫卡</button>

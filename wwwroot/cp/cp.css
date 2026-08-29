@@ -152,6 +152,15 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .cfg-adv { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--line); }
 .cfg-adv summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .cfg-adv .cfg-items { margin-top: 12px; }
+
+/* 当下用不上的项：整行压暗，但【不隐藏】—— 藏起来会让人以为功能没有，
+   而实际上它只是要先改口径。旁边 .cfg-why 写着改哪一项。 */
+.cfg-off .cfg-label { color: #9aa1ab; }
+.cfg-off input { background: #f2f3f5; color: #9aa1ab; cursor: not-allowed; }
+.cfg-why { color: #b26a00; font-weight: 600; }
+/* 等级表单里的两个门槛格也用同一套置灰（.add-box 里是 label 包着 input） */
+.add-box label.cfg-off { color: #9aa1ab; }
+.add-box label.cfg-off input { background: #f2f3f5; color: #9aa1ab; cursor: not-allowed; }
 @media (max-width: 720px) { .cfg-item { grid-template-columns: 1fr; } }
 
 /* 常驻提醒横幅 —— 开了实名但确认短信没接入这类问题，

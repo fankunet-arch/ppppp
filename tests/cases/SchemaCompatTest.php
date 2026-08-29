@@ -355,6 +355,66 @@ T::eq(null, \Vip\ConfigSchema::validate('reward_mode', 'amount'), '合法选项�
 T::eq(null, \Vip\ConfigSchema::validate('business_day_cutoff', '02:00'), '时间格式通过');
 T::true(\Vip\ConfigSchema::validate('business_day_cutoff', '25:00') !== null, '非法时间被拒');
 
+T::group('配置 · 两个门槛由「门槛口径」决定哪个能改');
+
+/**
+ * 后台里「几次送一次」和「累计消费多少送一次」两格并排，而实际只有一格
+ * 在起作用 —— 起哪一格由「门槛口径」定。两格都能填的话，店家改了不起作用
+ * 的那一格，会以为规则变了而其实没变，等客人来问才发现。
+ *
+ * ★ 置灰【不影响存储】：值照旧在库里，口径切回去原样还在。
+ *   这里连带钉住这一点 —— 免得以后有人「顺手」在切口径时把另一格清空。
+ */
+$byVisits = ['reward_mode' => 'visits'];
+$byAmount = ['reward_mode' => 'amount'];
+$visitsItem = \Vip\ConfigSchema::ITEMS['reward_threshold_visits'];
+$amountItem = \Vip\ConfigSchema::ITEMS['reward_threshold_amount'];
+
+T::true(\Vip\ConfigSchema::isActive($visitsItem, $byVisits),  '★ 按次数时「几次送一次」可改');
+T::true(!\Vip\ConfigSchema::isActive($amountItem, $byVisits), '★★ 按次数时「累计消费多少送一次」置灰');
+T::true(\Vip\ConfigSchema::isActive($amountItem, $byAmount),  '★ 按金额时「累计消费多少送一次」可改');
+T::true(!\Vip\ConfigSchema::isActive($visitsItem, $byAmount), '★★ 按金额时「几次送一次」置灰');
+
+// 没声明依赖的项一律可改 —— 别让这套机制误伤其他配置
+T::true(\Vip\ConfigSchema::isActive(\Vip\ConfigSchema::ITEMS['reward_enabled'], $byVisits),
+    '没声明依赖的项不受影响');
+
+/**
+ * ★★ 老库里根本没有 reward_mode 这一项时，两格都要放行。
+ *   按「不等于就置灰」判的话两格【同时】锁死，管理员一格都改不了 ——
+ *   而唯一的解法（改口径）本身就在这个页面上，等于把自己关在门外。
+ */
+T::true(\Vip\ConfigSchema::isActive($visitsItem, []),
+    '★★ 库里没有 reward_mode 时「几次送一次」仍可改');
+T::true(\Vip\ConfigSchema::isActive($amountItem, []),
+    '★★ 「累计消费多少送一次」也可改 —— 两格同时锁死等于把管理员关在门外');
+T::true(!\Vip\ConfigSchema::isActive($amountItem, ['reward_mode' => '']),
+    '  └ 但有这一项、值是空串时照常判（那是数据脏，不是没有）');
+
+// 置灰要给理由，否则看着就是坏了
+$hint = \Vip\ConfigSchema::inactiveHint($amountItem);
+T::true(is_string($hint) && str_contains($hint, '门槛口径'),
+    "★★ 置灰时说清要先改哪一项：「{$hint}」");
+T::true(str_contains((string)$hint, '按金额'),
+    '  └ 并且点名要改成哪个选项（照抄下拉框里的原话，不另造词）');
+T::eq(null, \Vip\ConfigSchema::inactiveHint(\Vip\ConfigSchema::ITEMS['reward_enabled']),
+    '没依赖的项没有这句话');
+
+// grouped() 要把结论一并带给前端，否则后台还得自己算一遍
+$groups = \Vip\ConfigSchema::grouped(['reward_mode' => 'visits',
+                                       'reward_threshold_visits' => '10',
+                                       'reward_threshold_amount' => '300.00']);
+$found = null;
+foreach ($groups as $g) {
+    foreach ($g['items'] as $it) {
+        if ($it['key'] === 'reward_threshold_amount') { $found = $it; }
+    }
+}
+T::true($found !== null, 'grouped() 里找得到这一项');
+T::true(($found['active'] ?? null) === false, '★ grouped() 直接给出 active=false');
+T::eq('300.00', $found['value'] ?? null,
+    '★★ 置灰的项【值照样带出来】—— 置灰只是不让改，不是清空');
+
 // ⑤ 用户点名要的三项必须在
 foreach (['reward_mode' => '按次还是按金额',
           'reward_threshold_visits' => '几送一',

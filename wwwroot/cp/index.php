@@ -222,6 +222,7 @@ vip_no_store();
         <label>券有效期（天）<input id="tier-cvd" type="number" min="0" placeholder="跟随全局" style="width:7em"></label>
         <label>排序<input id="tier-sort" type="number" value="10" style="width:5em"></label>
       </div>
+      <p class="muted small" id="tier-th-why"></p>
       <button id="btn-tier-save" class="primary">保存</button>
       <p class="muted small">
         <b>标识</b>是给机器认的（小写字母、数字、下划线），定了就别改 ——

@@ -223,6 +223,9 @@
     'member.scanNote':    { zh: '扫客人卡面的二维码；扫不出时照着卡面手输卡号也行。<b>不用纠结哪个是字母、哪个是数字</b>，看着像什么就输什么，系统会自动纠正。',
                             es: 'Escanee el QR de la tarjeta; si no lee, escriba el número tal como aparece. <b>No se preocupe por distinguir letras de números</b>: escriba lo que ve, el sistema lo corrige.' },
     'member.needInput':   { zh: '请输入查询内容', es: 'Escriba algo para buscar' },
+    // 后台关掉「允许收集客人联系方式」时，手机号/邮箱两档置灰并显示这一句
+    'member.piiOff':      { zh: '本店不登记手机号和邮箱，只按卡号查。',
+                            es: 'Este local no registra teléfono ni email; solo se busca por tarjeta.' },
     'member.none':        { zh: '未找到该会员，可在下方新建。',
                             es: 'No se encuentra ese socio; puede darlo de alta abajo.' },
     'member.stats':       { zh: '{points} 分 · 已消费 {visits} 次 · 累计 € {spent}',

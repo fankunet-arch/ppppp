@@ -287,6 +287,8 @@ function refreshDynamicText() {
    * （见 data-amt / data-prt 的 oninput），从状态重画不会丢东西。
    */
   if (S.people && S.people.length) { renderPeople(true); }
+  // 这一句是 JS 填的，切语言时得跟着换（data-i18n 管不到它）
+  applyPiiTabs();
   checkHealth();
 }
 
@@ -302,10 +304,43 @@ function refreshDynamicText() {
  * 只藏前端的话，字段还在、接口照收，说不清楚。
  */
 function applySettings() {
+  applyPiiTabs();
   const box = $('#new-contact');
   if (!box) return;
   if (S.settings.collect_pii) return;      // 开启时保持原样
   box.remove();
+}
+
+/**
+ * 关闭时把「手机号 / 邮箱」两档【禁用】，只留「卡号」。
+ *
+ * 为什么这里是禁用而不是像上面那样整块删掉：
+ *   · 删掉的是【采集】入口 —— 它一存在就等于在邀请收银员向客人要信息，
+ *     所以必须让它在界面上根本不存在。
+ *   · 这里是【查找】入口。开关关掉之前建的会员，联系方式还在库里，
+ *     留着这两档灰着，至少能让人看懂「不是坏了，是本店不这么做」。
+ *     真要按手机号找，先去后台把开关打开。
+ *
+ * 禁用的按钮点不动，所以 doMemberSearch 拿不到这两档；那边还有一道
+ * 兜底（见 currentSearchType），防的是「开关切换时弹层正开着」这种缝。
+ */
+function applyPiiTabs() {
+  const on = !!S.settings.collect_pii;
+  $$('#search-type button').forEach(b => {
+    if (b.dataset.type === 'card') return;
+    b.disabled = !on;
+    // 关掉时如果正停在这一档上，拨回卡号 —— 否则会停在一个点不动的档位上
+    if (!on && b.classList.contains('on')) {
+      b.classList.remove('on');
+      const card = $('#search-type button[data-type=card]');
+      if (card) { card.classList.add('on'); card.click(); }
+    }
+  });
+  const note = $('#pii-off-note');
+  if (note) {
+    note.textContent = T('member.piiOff');
+    note.hidden = on;
+  }
 }
 
 async function checkHealth() {
@@ -950,9 +985,23 @@ function resetLookupState() {
   $('#member-new').open = false;
 }
 
+/**
+ * 当前选的是哪一档。
+ *
+ * 兜底：关掉「允许收集客人联系方式」之后，手机号/邮箱两档是禁用的，
+ * 正常点不到。但按钮的 disabled 与 .on 是两件事 —— 只要有一条路径
+ * 让「已选中」和「已禁用」同时成立（比如开关切换时弹层正开着），
+ * 这里就会按手机号去查。所以按开关判一次，不信 DOM 的 class。
+ */
+function currentSearchType() {
+  const t = ($('#search-type button.on') || {}).dataset?.type || 'card';
+  if ((t === 'phone' || t === 'email') && !S.settings.collect_pii) { return 'card'; }
+  return t;
+}
+
 async function doMemberSearch() {
   resetLookupState();
-  const type = $('#search-type button.on').dataset.type;
+  const type = currentSearchType();
   const value = $('#member-input').value.trim();
   if (!value) return showErr('#member-err', T('member.needInput'));
 
