@@ -264,6 +264,14 @@ T::group('容器兼容 · 桥接副本不能漂移');
  * 而我们部署的那份还是旧的，diagnose() 里两种包看起来一模一样。
  *
  * apk/ 目录不部署到门店服务器，所以那里跑测试时这一组自动跳过。
+ *
+ * ⚠️ 2026-08：apk/ 已从本仓库整个删除（容器源码另行保管）。
+ *   于是这一条【永远处于跳过状态】—— 它不会再报错，也不会再挡住任何漂移。
+ *   现在 wwwroot/assets/sushivip-bridge.js 是本仓库里唯一的一份，
+ *   等于默认它就是对的。容器方那边改了桥接，这里没有任何东西会提醒。
+ *
+ *   保留这段代码是因为它零成本：哪天 apk/doc/ 回到这个仓库（或建个软链），
+ *   比对会自动重新生效。真要恢复这道保障，就把原件放回 apk/doc/。
  */
 $apkBridge = __DIR__ . '/../../apk/doc/sushivip-bridge.js';
 $webBridge = $root . 'assets/sushivip-bridge.js';
@@ -271,7 +279,8 @@ $webBridge = $root . 'assets/sushivip-bridge.js';
 T::true(is_file($webBridge), '部署副本存在（缺了就取不到原生设备 ID）');
 
 if (!is_file($apkBridge)) {
-    echo "  \033[33m–\033[0m 跳过副本比对：apk/ 不在（门店服务器上属正常）\n";
+    echo "  \033[33m–\033[0m 跳过副本比对：apk/doc/ 不在。"
+         . "门店服务器上属正常；开发机上则意味着【桥接漂移无人看着】\n";
 } else {
     T::eq(md5_get($apkBridge), md5_get($webBridge),
         '★ wwwroot 里的桥接与 apk/doc/ 的原件逐字节一致');
