@@ -217,6 +217,8 @@ vip_no_store();
         <label>名称（中文）<input id="tier-name" type="text" placeholder="金卡"></label>
         <label>名称（西语）<input id="tier-name-es" type="text" placeholder="Oro"></label>
         <label>积分倍率<input id="tier-mult" type="number" step="0.05" min="0.05" max="10" value="1.00" style="width:6em"></label>
+        <label>几次送 1 次<input id="tier-thv" type="number" min="1" placeholder="跟随全局" style="width:7em"></label>
+        <label>满额送 1 次<input id="tier-tha" type="text" placeholder="跟随全局" style="width:7em"></label>
         <label>排序<input id="tier-sort" type="number" value="10" style="width:5em"></label>
       </div>
       <button id="btn-tier-save" class="primary">保存</button>
@@ -231,6 +233,13 @@ vip_no_store();
         积分 = 金额 × 每欧元分数 × 全局倍率 × <b>本等级倍率</b>。1.00 就是与普通卡相同。<br>
         改倍率<b>只影响以后的入账</b> —— 每一笔流水都记着当时实际用的倍率，
         历史一行都不会变，客人来问「上次为什么给这么多分」时查得到。
+      </p>
+      <p class="muted small">
+        <b>送 1 次的门槛</b>两格<b>留空即跟随「奖励规则」里的全局设置</b> ——
+        只想优待金卡的话，只填金卡那一格就行，其余等级不用动。<br>
+        按次还是按金额，取决于全局的「奖励模式」，这里两格各填各的。<br>
+        改门槛<b>会立刻重算</b>：调低（比如升级成金卡）当场补发差额；
+        调高<b>不会把已经发出去的券收回来</b> —— 收回已给出去的东西是绝不能做的。
       </p>
     </details>
   </div>

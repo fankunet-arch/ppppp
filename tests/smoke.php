@@ -1503,6 +1503,94 @@ ok(!$tiers->isUsable('smokegold'), '★ 停用后不能再用来发卡');
 ok($tiers->describe('smokegold') !== null, '★★ 但已发出去的卡照常显示等级名');
 ok(count($tiers->all(true)) < count($tiers->all(false)), '发卡下拉框里看不到停用的等级');
 
+// ── 按等级设不同的送 1 门槛 ──
+step('⑳ 按等级的奖励门槛（金卡 8 次送 1 次）');
+
+$rw = $app->rewards();
+$globalN = $app->cfg()->int('reward_threshold_visits', 10);
+ok($globalN > 0, "全局门槛是 {$globalN} 次");
+
+/**
+ * ⑲ 段最后把这位会员的金卡换成了不分级的卡（那一段验的就是「等级跟着卡走」）。
+ * 所以这里要先把他换回金卡，否则下面全在按不分级算 —— 一片红，
+ * 而原因跟产品毫无关系。
+ */
+$backR = $svc->replaceCard($goldMid, $tb2[0]['card_no'], '换回金卡', $opStub);
+ok($backR['ok'], '先把这位会员换回金卡（上一段把他换成不分级的了）');
+eq('smokegold', $tiers->forMember($goldMid)['code'], '  └ 确认他现在是金卡');
+
+// 门槛留空 = 跟随全局
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, null, null);
+$rNull = $rw->rule($tiers->forMember($goldMid));
+eq($globalN, $rNull['threshold_visits'], '★ 等级不设门槛时跟随全局 —— 只想优待金卡的店只填金卡那一格');
+
+// 给金卡设 8 次
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 8, null);
+$rGold = $rw->rule($tiers->forMember($goldMid));
+eq(8, $rGold['threshold_visits'], '★★ 金卡按 8 次算');
+eq($globalN, $rw->rule($tiers->forMember($plainMid))['threshold_visits'],
+   '★★ 不分级的会员仍按全局，互不影响');
+
+/**
+ * 达标判定一直是「floor(进度 / 阈值) − 已发张数」，不是「每次 +1」。
+ * 所以门槛一改数量会自动对上 —— 这正是改门槛安全的原因。
+ */
+$db->exec('UPDATE member SET visit_count = 8, rewards_issued = 0 WHERE store_code = ? AND id = ?',
+    [SMOKE_STORE, $goldMid]);
+$mg = $app->members()->findById($goldMid);
+$pg = $rw->progressOf($mg, $tiers->forMember($goldMid));
+eq(8, $pg['threshold'], '进度按金卡的 8 次算');
+eq(1, $pg['earned'],  '8 次 → 该发 1 张');
+eq(1, $pg['pending'], '还没发过，所以欠 1 张');
+eq('smokegold', $pg['tier_code'], '★ 进度里带着按的是哪个等级的门槛');
+
+// 同样 8 次，不分级的会员还差 2 次
+$db->exec('UPDATE member SET visit_count = 8, rewards_issued = 0 WHERE store_code = ? AND id = ?',
+    [SMOKE_STORE, $plainMid]);
+$pp = $rw->progressOf($app->members()->findById($plainMid), $tiers->forMember($plainMid));
+eq(0, $pp['earned'], '★★ 同样 8 次，不分级的还没达标（全局 ' . $globalN . ' 次）');
+
+// 真发一张，并确认券上定格了当时的等级与门槛
+$gr = $rw->checkAndGrant($goldMid, $opStub);
+eq(1, $gr['granted'], '★★ 金卡 8 次真的发出了 1 张券');
+$cp = $db->one('SELECT tier_code, threshold_used FROM coupon
+                 WHERE store_code = ? AND member_id = ? ORDER BY id DESC', [SMOKE_STORE, $goldMid]);
+eq('smokegold', $cp['tier_code'], '★★ 券上定格了发它时的等级');
+eq(8, (int)$cp['threshold_used'], '★★ 也定格了当时的门槛 —— 改门槛之后还答得出「凭什么发的」');
+
+/**
+ * 🔴 调高门槛【绝不能】把已经发出去的券收回来。
+ *    收回已给出去的东西是投诉的直接来源。
+ */
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 20, null);
+$pg2 = $rw->progressOf($app->members()->findById($goldMid), $tiers->forMember($goldMid));
+eq(0, $pg2['earned'],  '门槛调到 20 次后，按新门槛算 8 次还没达标');
+eq(0, $pg2['pending'], '★★ pending 取 max(0,…) —— 不会变成负数去追回已发的券');
+$still = (int)$db->value('SELECT COUNT(*) FROM coupon WHERE store_code = ? AND member_id = ? AND status = 1',
+    [SMOKE_STORE, $goldMid]);
+eq(1, $still, '★★ 已经发出去的那张券【原样还在】');
+
+// 调低则当场补发差额
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null);
+$gr2 = $rw->checkAndGrant($goldMid, $opStub);
+eq(1, $gr2['granted'], '★★ 门槛调到 4 次 → 8 次该发 2 张，当场补发差额 1 张');
+
+// 门槛的合法性
+ok(!$tiers->save('smokebad2', '名字', null, 1.0, 1, true, 0, null),
+   '★ 门槛不能是 0 次（每记一次账就发一张券，那不是优待，是把店送掉）');
+ok(!$tiers->save('smokebad2', '名字', null, 1.0, 1, true, -5, null), '★ 门槛不能是负数');
+ok(!$tiers->save('smokebad2', '名字', null, 1.0, 1, true, null, '-10'), '★ 满额门槛也不能是负数');
+ok($tiers->save('smokebad2', '名字', null, 1.0, 1, true, null, null), '两格都留空是合法的（跟随全局）');
+$db->exec('DELETE FROM card_tier WHERE store_code = ? AND code = ?', [SMOKE_STORE, 'smokebad2']);
+
+// 规则文案也要按等级说
+$txtGold  = $rw->ruleText($tiers->forMember($goldMid));
+$txtPlain = $rw->ruleText($tiers->forMember($plainMid));
+ok(str_contains($txtGold, '4'), "★★ 规则文案按等级说：「{$txtGold}」");
+ok($txtGold !== $txtPlain, "  └ 与不分级的不同：「{$txtPlain}」");
+
+$db->exec('DELETE FROM coupon WHERE store_code = ? AND member_id IN (?,?)', [SMOKE_STORE, $goldMid, $plainMid]);
+
 // 清理
 $db->exec('DELETE FROM card WHERE store_code = ? AND batch_no LIKE ?', [SMOKE_STORE, 'SMOKETIER%']);
 $db->exec('DELETE FROM card WHERE store_code = ? AND batch_no = ?', [SMOKE_STORE, 'SMOKEPLAIN']);

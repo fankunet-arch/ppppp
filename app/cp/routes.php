@@ -706,6 +706,9 @@ $api->on('GET', '/tiers', static function () use ($app, $requireManager): void {
         'name'       => $t['name'],
         'name_es'    => $t['name_es'],
         'multiplier' => (float)$t['points_multiplier'],
+        // null = 这一项跟随全局设置
+        'threshold_visits' => $t['threshold_visits'] !== null ? (int)$t['threshold_visits'] : null,
+        'threshold_amount' => $t['threshold_amount'],
         'sort_order' => (int)$t['sort_order'],
         'enabled'    => (int)$t['enabled'] === 1,
     ], $app->cardTiers()->all())]);
@@ -717,20 +720,27 @@ $api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin): vo
     $code = Api::str($b, 'code', '') ?: '';
     $name = Api::str($b, 'name', '') ?: '';
 
+    // 门槛留空 = 跟随全局设置（只想优待金卡的店家只填金卡那一格就行）
+    $thV = Api::str($b, 'threshold_visits', '');
+    $thA = Api::str($b, 'threshold_amount', '');
+
     if (!$app->cardTiers()->save(
             $code, $name, Api::str($b, 'name_es', ''),
             (float)($b['points_multiplier'] ?? 1.0),
             Api::int($b, 'sort_order', 0),
-            (bool)($b['enabled'] ?? true))) {
+            (bool)($b['enabled'] ?? true),
+            ($thV === null || trim($thV) === '') ? null : (int)$thV,
+            ($thA === null || trim($thA) === '') ? null : $thA)) {
         Api::fail('bad_request', 400, [
             'hint' => '标识只能用小写字母数字下划线（最多 20 位）；名称不能为空；'
-                    . '积分倍率需大于 0 且不超过 10',
+                    . '积分倍率需大于 0 且不超过 10；门槛留空表示跟随全局，填了就必须是正数',
         ]);
     }
     $app->audit()->log('card_tier_save', [
         'target_type' => 'card_tier', 'target_id' => strtolower(trim($code)),
         'operator_id' => $op['id'], 'operator_name' => $op['name'],
         'detail' => ['name' => $name, 'multiplier' => (float)($b['points_multiplier'] ?? 1.0),
+                     'threshold_visits' => $thV, 'threshold_amount' => $thA,
                      'enabled' => (bool)($b['enabled'] ?? true)],
     ]);
     Api::ok(['saved' => true]);

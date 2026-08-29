@@ -532,7 +532,9 @@ $api->on('POST', '/card/status', static function () use ($app, $requireOperator)
             'coupons'        => count($app->rewards()->availableFor($mid)),
             'progress'       => $app->rewards()->progress($mid),
         ];
-        $out['rule'] = $app->rewards()->ruleText();
+        // 规则文案也要按【这位客人的等级】说 —— 金卡 8 次送 1 次时，
+        // 屏幕上却写着「每满 10 次」，服务员照着念就是错的
+        $out['rule'] = $app->rewards()->ruleText($app->cardTiers()->forMember($mid));
     }
     Api::ok($out);
 });
@@ -688,7 +690,8 @@ $api->on('POST', '/member/rewards', static function () use ($app, $requireOperat
         Api::fail('bad_request');
     }
     Api::ok([
-        'rule'      => $app->rewards()->ruleText(),
+        // 按这位会员的等级说 —— 他是金卡就该看到金卡的门槛
+        'rule'      => $app->rewards()->ruleText($app->cardTiers()->forMember($mid)),
         'progress'  => $app->rewards()->progress($mid),
         'available' => $app->rewards()->availableFor($mid),
     ]);

@@ -35,7 +35,8 @@ final class CardTierRepo
      */
     public function all(bool $onlyEnabled = false): array
     {
-        $sql = 'SELECT code, name, name_es, points_multiplier, sort_order, enabled
+        $sql = 'SELECT code, name, name_es, points_multiplier,
+                       threshold_visits, threshold_amount, sort_order, enabled
                   FROM card_tier WHERE store_code = ?';
         if ($onlyEnabled) { $sql .= ' AND enabled = 1'; }
         $sql .= ' ORDER BY sort_order ASC, code ASC';
@@ -46,8 +47,9 @@ final class CardTierRepo
     {
         if ($code === null || trim($code) === '') { return null; }
         return $this->db->one(
-            'SELECT code, name, name_es, points_multiplier, sort_order, enabled FROM card_tier
-              WHERE store_code = ? AND code = ?',
+            'SELECT code, name, name_es, points_multiplier,
+                    threshold_visits, threshold_amount, sort_order, enabled
+               FROM card_tier WHERE store_code = ? AND code = ?',
             [$this->storeCode, trim($code)]
         );
     }
@@ -65,6 +67,10 @@ final class CardTierRepo
      * code 是机器标识，定了就别改 —— 已经发出去的卡是靠它认等级的。
      * 改名改的是 name / name_es，不影响任何已发的卡。
      */
+    /**
+     * @param int|null    $thVisits 本等级几次送 1 次；null = 跟随全局
+     * @param string|null $thAmount 本等级累计消费多少送 1 次；null = 跟随全局
+     */
     public function save(
         string $code,
         string $name,
@@ -72,6 +78,8 @@ final class CardTierRepo
         float $multiplier,
         int $sort,
         bool $enabled,
+        ?int $thVisits = null,
+        ?string $thAmount = null,
     ): bool {
         $code = strtolower(trim($code));
         $name = trim($name);
@@ -83,18 +91,31 @@ final class CardTierRepo
         if ($multiplier <= 0 || $multiplier > 10) {
             return false;
         }
+        // 门槛留空 = 跟随全局。填了就必须是正数 —— 0 次送 1 次意味着
+        // 每记一次账就发一张券，那不是优待，是把店送掉
+        if ($thVisits !== null && $thVisits < 1) {
+            return false;
+        }
+        $amt = ($thAmount === null || trim($thAmount) === '') ? null : trim($thAmount);
+        if ($amt !== null && (!is_numeric($amt) || (float)$amt <= 0)) {
+            return false;
+        }
         $es = trim((string)$nameEs);
         $this->db->exec(
             'INSERT INTO card_tier
-               (store_code, code, name, name_es, points_multiplier, sort_order, enabled, created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?)
+               (store_code, code, name, name_es, points_multiplier,
+                threshold_visits, threshold_amount, sort_order, enabled, created_at, updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)
              ON DUPLICATE KEY UPDATE
                name = VALUES(name), name_es = VALUES(name_es),
                points_multiplier = VALUES(points_multiplier),
+               threshold_visits = VALUES(threshold_visits),
+               threshold_amount = VALUES(threshold_amount),
                sort_order = VALUES(sort_order), enabled = VALUES(enabled),
                updated_at = VALUES(updated_at)',
             [$this->storeCode, $code, $name, $es !== '' ? $es : null,
              number_format($multiplier, 2, '.', ''),
+             $thVisits, $amt,
              $sort, $enabled ? 1 : 0, $this->db->now(), $this->db->now()]
         );
         return true;
@@ -111,16 +132,23 @@ final class CardTierRepo
     public function forMember(int $memberId): array
     {
         $row = $this->db->one(
-            'SELECT t.code, t.points_multiplier
+            'SELECT t.code, t.points_multiplier, t.threshold_visits, t.threshold_amount
                FROM card c
                JOIN card_tier t ON t.store_code = c.store_code AND t.code = c.tier_code
               WHERE c.store_code = ? AND c.member_id = ?',
             [$this->storeCode, $memberId]
         );
         if ($row === null) {
-            return ['code' => null, 'multiplier' => 1.0];
+            return ['code' => null, 'multiplier' => 1.0,
+                    'threshold_visits' => null, 'threshold_amount' => null];
         }
-        return ['code' => (string)$row['code'], 'multiplier' => (float)$row['points_multiplier']];
+        return [
+            'code'             => (string)$row['code'],
+            'multiplier'       => (float)$row['points_multiplier'],
+            // null = 这一项跟随全局设置
+            'threshold_visits' => $row['threshold_visits'] !== null ? (int)$row['threshold_visits'] : null,
+            'threshold_amount' => $row['threshold_amount'],
+        ];
     }
 
     /**
@@ -162,6 +190,9 @@ final class CardTierRepo
             'name'       => $names[\Vip\Http\Api::lang()] ?? $names[Lang::ZH],
             'names'      => $names,
             'multiplier' => (float)($t['points_multiplier'] ?? 1.0),
+            // null 表示这一项跟随全局设置
+            'threshold_visits' => $t['threshold_visits'] !== null ? (int)$t['threshold_visits'] : null,
+            'threshold_amount' => $t['threshold_amount'],
         ];
     }
 

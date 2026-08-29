@@ -120,6 +120,45 @@ ok(stillThere === 1, '★★ 已经有卡在用的等级删不掉');
 const t = (await page.locator('#toast').textContent()) || '';
 ok(/停用|不能删除|已有/.test(t), `  └ 并且说清为什么、该怎么办：「${t.replace(/\s+/g, ' ').trim().slice(0, 60)}」`);
 
+console.log('\n【③bis 按等级设送 1 门槛】');
+// 客人问的是「我还差几次」——金卡 8 次送 1 次时，屏幕上写着「每满 10 次」
+// 服务员照着念就是错的。所以规则文案也要按这位客人的等级说。
+await page.locator(`[data-te="${TIER}"]`).click();
+await page.waitForTimeout(300);
+ok(await page.locator('#tier-thv').inputValue() === '',
+   '★ 门槛留空 = 跟随全局（只想优待金卡的店只填金卡那一格）');
+await page.fill('#tier-thv', '3');
+await page.click('#btn-tier-save');
+await page.waitForTimeout(800);
+const row3 = await page.locator('#tier-list tr', { hasText: TIER }).textContent();
+ok(/3 次/.test(row3), `★★ 门槛能在后台设（列表里显示「3 次」）：「${row3.replace(/\s+/g, ' ').trim().slice(0, 70)}」`);
+
+// 停用/启用不能把门槛悄悄冲掉 —— 那个按钮只该改一个开关
+await page.locator(`[data-tt="${TIER}"]`).click();
+await page.waitForTimeout(800);
+await page.locator(`[data-tt="${TIER}"]`).click();
+await page.waitForTimeout(800);
+const row4 = await page.locator('#tier-list tr', { hasText: TIER }).textContent();
+ok(/3 次/.test(row4), '★★ 停用再启用之后门槛还在（那个按钮只该改开关，不该冲掉别的字段）');
+
+const ruleFor = JSON.parse(php(`
+  require "app/bootstrap.php";
+  $c = require "app/config/config.php";
+  $a = new Vip\\App($c);
+  $g = $a->cardTiers()->forMember(${F.gMid});
+  $p = $a->cardTiers()->forMember(${F.pMid});
+  echo json_encode([
+    'gold'   => $a->rewards()->rule($g)['threshold_visits'],
+    'plain'  => $a->rewards()->rule($p)['threshold_visits'],
+    'gText'  => $a->rewards()->ruleText($g),
+    'pText'  => $a->rewards()->ruleText($p),
+  ]);
+`));
+ok(ruleFor.gold === 3, `★★ 金卡按 3 次算（实得 ${ruleFor.gold}）`);
+ok(ruleFor.plain !== 3, `★★ 不分级的仍按全局 ${ruleFor.plain} 次 —— 互不影响`);
+ok(ruleFor.gText !== ruleFor.pText,
+   `★ 规则文案也按等级说：「${ruleFor.gText}」 vs 「${ruleFor.pText}」`);
+
 console.log('\n【④ Pad 扫卡就知道是什么级别】');
 const pad = await ctx.newPage();
 pad.on('pageerror', e => errs.push(String(e)));

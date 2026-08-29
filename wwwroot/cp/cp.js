@@ -605,12 +605,19 @@ async function loadTiers() {
   if (!list) return;
   list.innerHTML = d.tiers.length ? `<table>
     <tr><th>标识</th><th>名称（中文）</th><th>名称（西语）</th><th class="num">积分倍率</th>
-        <th class="num">排序</th><th>状态</th>${window.IS_ADMIN ? '<th></th>' : ''}</tr>${
+        <th class="num">送1门槛</th><th class="num">排序</th><th>状态</th>${window.IS_ADMIN ? '<th></th>' : ''}</tr>${
     d.tiers.map(t => `<tr>
       <td><code>${esc(t.code)}</code></td>
       <td><b>${esc(t.name)}</b></td>
       <td>${t.name_es ? esc(t.name_es) : '<span class="muted small">未填 · 西语界面显示中文名</span>'}</td>
       <td class="num">${t.multiplier === 1 ? '<span class="muted">1.00</span>' : `<b>${t.multiplier.toFixed(2)}</b>`}</td>
+      <td class="num">${
+        // 留空 = 跟随全局。显式写出来，免得看着像「没设置所以不发券」
+        t.threshold_visits === null && t.threshold_amount === null
+          ? '<span class="muted small">跟随全局</span>'
+          : [t.threshold_visits !== null ? `<b>${t.threshold_visits}</b> 次` : null,
+             t.threshold_amount !== null ? `€ <b>${esc(t.threshold_amount)}</b>` : null]
+            .filter(Boolean).join(' / ')}</td>
       <td class="num muted small">${t.sort_order}</td>
       <td>${t.enabled ? '<span class="tag on">启用</span>' : '<span class="tag off">停用</span>'}</td>
       ${window.IS_ADMIN ? `<td>
@@ -632,6 +639,8 @@ async function loadTiers() {
     $('#tier-name').value    = t.name;
     $('#tier-name-es').value = t.name_es || '';
     $('#tier-mult').value    = t.multiplier.toFixed(2);
+    $('#tier-thv').value     = t.threshold_visits ?? '';
+    $('#tier-tha').value     = t.threshold_amount ?? '';
     $('#tier-sort').value    = t.sort_order;
     $('#tier-code').focus();
     toast(`已填入「${t.name}」，改完点保存`, 'ok');
@@ -643,8 +652,11 @@ async function loadTiers() {
     try {
       await api('/tiers/save', {
         code: t.code, name: t.name, name_es: t.name_es,
-        points_multiplier: t.multiplier, sort_order: t.sort_order,
-        enabled: !t.enabled,
+        points_multiplier: t.multiplier,
+        // 停用/启用是原地改一个开关，其余字段必须原样带回去，
+        // 否则会把门槛悄悄清成「跟随全局」
+        threshold_visits: t.threshold_visits, threshold_amount: t.threshold_amount,
+        sort_order: t.sort_order, enabled: !t.enabled,
       });
       toast(t.enabled ? '已停用' : '已启用', 'ok');
       loadTiers();
@@ -670,12 +682,16 @@ $('#btn-tier-save').onclick = async () => {
       name:              $('#tier-name').value.trim(),
       name_es:           $('#tier-name-es').value.trim(),
       points_multiplier: parseFloat($('#tier-mult').value) || 1,
+      // 留空即跟随全局 —— 传空字符串，服务端据此存 NULL
+      threshold_visits:  $('#tier-thv').value.trim(),
+      threshold_amount:  $('#tier-tha').value.trim(),
       sort_order:        +$('#tier-sort').value || 0,
       enabled:           true,
     });
     toast('已保存', 'ok');
     $('#tier-code').value = ''; $('#tier-name').value = '';
     $('#tier-name-es').value = ''; $('#tier-mult').value = '1.00';
+    $('#tier-thv').value = ''; $('#tier-tha').value = '';
     loadTiers();
   } catch (e) { toast(e.message + (e.detail?.hint ? '：' + e.detail.hint : ''), 'err'); }
 };
