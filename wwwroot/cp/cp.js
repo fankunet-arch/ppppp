@@ -605,7 +605,8 @@ async function loadTiers() {
   if (!list) return;
   list.innerHTML = d.tiers.length ? `<table>
     <tr><th>标识</th><th>名称（中文）</th><th>名称（西语）</th><th class="num">积分倍率</th>
-        <th class="num">送1门槛</th><th class="num">排序</th><th>状态</th>${window.IS_ADMIN ? '<th></th>' : ''}</tr>${
+        <th class="num">送1门槛</th><th class="num">券有效期</th>
+        <th class="num">排序</th><th>状态</th>${window.IS_ADMIN ? '<th></th>' : ''}</tr>${
     d.tiers.map(t => `<tr>
       <td><code>${esc(t.code)}</code></td>
       <td><b>${esc(t.name)}</b></td>
@@ -618,6 +619,12 @@ async function loadTiers() {
           : [t.threshold_visits !== null ? `<b>${t.threshold_visits}</b> 次` : null,
              t.threshold_amount !== null ? `€ <b>${esc(t.threshold_amount)}</b>` : null]
             .filter(Boolean).join(' / ')}</td>
+      <td class="num">${
+        // 0 是有意义的取值（永久有效），所以判的是 null 而不是真值 ——
+        // 写成 `t.coupon_valid_days ? … : 跟随全局` 的话「永久」会显示成「跟随全局」
+        t.coupon_valid_days === null ? '<span class="muted small">跟随全局</span>'
+          : t.coupon_valid_days === 0 ? '<b>永久</b>'
+          : `<b>${t.coupon_valid_days}</b> 天`}</td>
       <td class="num muted small">${t.sort_order}</td>
       <td>${t.enabled ? '<span class="tag on">启用</span>' : '<span class="tag off">停用</span>'}</td>
       ${window.IS_ADMIN ? `<td>
@@ -641,6 +648,8 @@ async function loadTiers() {
     $('#tier-mult').value    = t.multiplier.toFixed(2);
     $('#tier-thv').value     = t.threshold_visits ?? '';
     $('#tier-tha').value     = t.threshold_amount ?? '';
+    // ?? 不是 || —— 0（永久有效）要如实填回去，不能被当成空
+    $('#tier-cvd').value     = t.coupon_valid_days ?? '';
     $('#tier-sort').value    = t.sort_order;
     $('#tier-code').focus();
     toast(`已填入「${t.name}」，改完点保存`, 'ok');
@@ -656,6 +665,7 @@ async function loadTiers() {
         // 停用/启用是原地改一个开关，其余字段必须原样带回去，
         // 否则会把门槛悄悄清成「跟随全局」
         threshold_visits: t.threshold_visits, threshold_amount: t.threshold_amount,
+        coupon_valid_days: t.coupon_valid_days,
         sort_order: t.sort_order, enabled: !t.enabled,
       });
       toast(t.enabled ? '已停用' : '已启用', 'ok');
@@ -685,6 +695,7 @@ $('#btn-tier-save').onclick = async () => {
       // 留空即跟随全局 —— 传空字符串，服务端据此存 NULL
       threshold_visits:  $('#tier-thv').value.trim(),
       threshold_amount:  $('#tier-tha').value.trim(),
+      coupon_valid_days: $('#tier-cvd').value.trim(),
       sort_order:        +$('#tier-sort').value || 0,
       enabled:           true,
     });
@@ -692,6 +703,7 @@ $('#btn-tier-save').onclick = async () => {
     $('#tier-code').value = ''; $('#tier-name').value = '';
     $('#tier-name-es').value = ''; $('#tier-mult').value = '1.00';
     $('#tier-thv').value = ''; $('#tier-tha').value = '';
+    $('#tier-cvd').value = '';
     loadTiers();
   } catch (e) { toast(e.message + (e.detail?.hint ? '：' + e.detail.hint : ''), 'err'); }
 };

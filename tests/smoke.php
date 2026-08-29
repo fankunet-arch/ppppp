@@ -1583,6 +1583,62 @@ ok(!$tiers->save('smokebad2', '名字', null, 1.0, 1, true, null, '-10'), '★ �
 ok($tiers->save('smokebad2', '名字', null, 1.0, 1, true, null, null), '两格都留空是合法的（跟随全局）');
 $db->exec('DELETE FROM card_tier WHERE store_code = ? AND code = ?', [SMOKE_STORE, 'smokebad2']);
 
+// ── 按等级设不同的券有效期 ──
+step('㉑ 按等级的券有效期（金卡的券多给一段时间）');
+
+/**
+ * 「金卡的券有效期长一点」是很自然的诉求，但它有一个容易踩的坑：
+ * 券的到期日是【发券当刻算好写死在券上】的，不是每次查询实时算的。
+ * 所以后台把这个设置一改，客人手上已经拿到的券【不会跟着变】——
+ * 券面上印的日子就是最终的日子。下面把这一点钉死。
+ */
+
+// 全局值从 rule() 自己拿 —— ConfigRepo 按实例缓存，直接读库或读另一个实例
+// 都可能和 $rw 眼里的值对不上，那样测的就不是同一件事了
+$globalDays = $rw->rule(null)['valid_days'];
+
+// ① 等级不设 = 跟随全局
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, null);
+eq($globalDays, $rw->rule($tiers->forMember($goldMid))['valid_days'],
+   '★ 等级不设券有效期时跟随全局（' . $globalDays . ' 天）');
+
+// ② 等级设了就按等级的
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, 7);
+eq(7, $rw->rule($tiers->forMember($goldMid))['valid_days'], '★★ 金卡的券按等级给 7 天');
+eq($globalDays, $rw->rule($tiers->forMember($plainMid))['valid_days'],
+   '  └ 不分级的卡不受影响，还是全局的 ' . $globalDays . ' 天');
+
+// ③ 真发一张，到期日按等级算
+$mc1 = $rw->grantManual($goldMid, '冒烟测试 · 按等级的券有效期', $opStub);
+ok($mc1['ok'], '发了一张手工券');
+eq(date('Y-m-d', strtotime('+7 days')), $mc1['coupon']['valid_to'],
+   '★★ 券上的到期日 = 发券当天 + 等级的 7 天');
+
+// ④ 改设置不动老券 —— 这是整段的重点
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, 30);
+$keep = $db->one('SELECT valid_to FROM coupon WHERE store_code = ? AND id = ?',
+                 [SMOKE_STORE, $mc1['coupon']['id']]);
+eq(date('Y-m-d', strtotime('+7 days')), (string)$keep['valid_to'],
+   '★★★ 把有效期改成 30 天后，【已经发出去的那张券还是 7 天】—— 券面上写的日子就是最终的日子');
+$mc2 = $rw->grantManual($goldMid, '冒烟测试 · 改完之后再发一张', $opStub);
+eq(date('Y-m-d', strtotime('+30 days')), $mc2['coupon']['valid_to'], '  └ 改完之后【新发的】才是 30 天');
+
+// ⑤ 0 = 永久有效（不是「没设置」，也不是「当天过期」）
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, 0);
+eq(0, $rw->rule($tiers->forMember($goldMid))['valid_days'], '★ 0 存得住，没被当成「留空」');
+$mc3 = $rw->grantManual($goldMid, '冒烟测试 · 永久有效', $opStub);
+eq(null, $mc3['coupon']['valid_to'], '★★ 0 天 = 永久有效（valid_to 存 NULL），不是当天就过期');
+
+// ⑥ 合法性
+ok(!$tiers->save('smokebad3', '名字', null, 1.0, 1, true, null, null, -1), '★ 券有效期不能是负数');
+ok($tiers->save('smokebad3', '名字', null, 1.0, 1, true, null, null, 0), '  └ 但 0 是合法的（永久）');
+ok($tiers->save('smokebad3', '名字', null, 1.0, 1, true, null, null, null), '  └ 留空也是合法的（跟随全局）');
+eq(null, $tiers->find('smokebad3')['coupon_valid_days'], '★ 留空存的是 NULL，不是 0 —— 两者含义完全不同');
+$db->exec('DELETE FROM card_tier WHERE store_code = ? AND code = ?', [SMOKE_STORE, 'smokebad3']);
+
+// 复位，免得影响后面
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, null);
+
 // 规则文案也要按等级说
 $txtGold  = $rw->ruleText($tiers->forMember($goldMid));
 $txtPlain = $rw->ruleText($tiers->forMember($plainMid));

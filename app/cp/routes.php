@@ -709,6 +709,8 @@ $api->on('GET', '/tiers', static function () use ($app, $requireManager): void {
         // null = 这一项跟随全局设置
         'threshold_visits' => $t['threshold_visits'] !== null ? (int)$t['threshold_visits'] : null,
         'threshold_amount' => $t['threshold_amount'],
+        // null = 跟随全局；0 = 永久有效（0 是有意义的取值，别当成「没设」）
+        'coupon_valid_days' => $t['coupon_valid_days'] !== null ? (int)$t['coupon_valid_days'] : null,
         'sort_order' => (int)$t['sort_order'],
         'enabled'    => (int)$t['enabled'] === 1,
     ], $app->cardTiers()->all())]);
@@ -723,6 +725,8 @@ $api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin): vo
     // 门槛留空 = 跟随全局设置（只想优待金卡的店家只填金卡那一格就行）
     $thV = Api::str($b, 'threshold_visits', '');
     $thA = Api::str($b, 'threshold_amount', '');
+    // 券有效期同理：留空跟随全局，填 0 表示永久有效
+    $cvd = Api::str($b, 'coupon_valid_days', '');
 
     if (!$app->cardTiers()->save(
             $code, $name, Api::str($b, 'name_es', ''),
@@ -730,10 +734,12 @@ $api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin): vo
             Api::int($b, 'sort_order', 0),
             (bool)($b['enabled'] ?? true),
             ($thV === null || trim($thV) === '') ? null : (int)$thV,
-            ($thA === null || trim($thA) === '') ? null : $thA)) {
+            ($thA === null || trim($thA) === '') ? null : $thA,
+            ($cvd === null || trim($cvd) === '') ? null : (int)$cvd)) {
         Api::fail('bad_request', 400, [
             'hint' => '标识只能用小写字母数字下划线（最多 20 位）；名称不能为空；'
-                    . '积分倍率需大于 0 且不超过 10；门槛留空表示跟随全局，填了就必须是正数',
+                    . '积分倍率需大于 0 且不超过 10；门槛留空表示跟随全局，填了就必须是正数；'
+                    . '券有效期留空表示跟随全局，填 0 表示永久有效，不能填负数',
         ]);
     }
     $app->audit()->log('card_tier_save', [
@@ -741,6 +747,7 @@ $api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin): vo
         'operator_id' => $op['id'], 'operator_name' => $op['name'],
         'detail' => ['name' => $name, 'multiplier' => (float)($b['points_multiplier'] ?? 1.0),
                      'threshold_visits' => $thV, 'threshold_amount' => $thA,
+                     'coupon_valid_days' => $cvd,
                      'enabled' => (bool)($b['enabled'] ?? true)],
     ]);
     Api::ok(['saved' => true]);

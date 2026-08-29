@@ -36,7 +36,8 @@ final class CardTierRepo
     public function all(bool $onlyEnabled = false): array
     {
         $sql = 'SELECT code, name, name_es, points_multiplier,
-                       threshold_visits, threshold_amount, sort_order, enabled
+                       threshold_visits, threshold_amount, coupon_valid_days,
+                       sort_order, enabled
                   FROM card_tier WHERE store_code = ?';
         if ($onlyEnabled) { $sql .= ' AND enabled = 1'; }
         $sql .= ' ORDER BY sort_order ASC, code ASC';
@@ -48,7 +49,8 @@ final class CardTierRepo
         if ($code === null || trim($code) === '') { return null; }
         return $this->db->one(
             'SELECT code, name, name_es, points_multiplier,
-                    threshold_visits, threshold_amount, sort_order, enabled
+                    threshold_visits, threshold_amount, coupon_valid_days,
+                    sort_order, enabled
                FROM card_tier WHERE store_code = ? AND code = ?',
             [$this->storeCode, trim($code)]
         );
@@ -80,6 +82,7 @@ final class CardTierRepo
         bool $enabled,
         ?int $thVisits = null,
         ?string $thAmount = null,
+        ?int $couponDays = null,
     ): bool {
         $code = strtolower(trim($code));
         $name = trim($name);
@@ -100,22 +103,28 @@ final class CardTierRepo
         if ($amt !== null && (!is_numeric($amt) || (float)$amt <= 0)) {
             return false;
         }
+        // 券有效期：留空 = 跟随全局；0 是有意义的（永久有效），所以只挡负数
+        if ($couponDays !== null && $couponDays < 0) {
+            return false;
+        }
         $es = trim((string)$nameEs);
         $this->db->exec(
             'INSERT INTO card_tier
                (store_code, code, name, name_es, points_multiplier,
-                threshold_visits, threshold_amount, sort_order, enabled, created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                threshold_visits, threshold_amount, coupon_valid_days,
+                sort_order, enabled, created_at, updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
              ON DUPLICATE KEY UPDATE
                name = VALUES(name), name_es = VALUES(name_es),
                points_multiplier = VALUES(points_multiplier),
                threshold_visits = VALUES(threshold_visits),
                threshold_amount = VALUES(threshold_amount),
+               coupon_valid_days = VALUES(coupon_valid_days),
                sort_order = VALUES(sort_order), enabled = VALUES(enabled),
                updated_at = VALUES(updated_at)',
             [$this->storeCode, $code, $name, $es !== '' ? $es : null,
              number_format($multiplier, 2, '.', ''),
-             $thVisits, $amt,
+             $thVisits, $amt, $couponDays,
              $sort, $enabled ? 1 : 0, $this->db->now(), $this->db->now()]
         );
         return true;
@@ -132,7 +141,8 @@ final class CardTierRepo
     public function forMember(int $memberId): array
     {
         $row = $this->db->one(
-            'SELECT t.code, t.points_multiplier, t.threshold_visits, t.threshold_amount
+            'SELECT t.code, t.points_multiplier, t.threshold_visits, t.threshold_amount,
+                    t.coupon_valid_days
                FROM card c
                JOIN card_tier t ON t.store_code = c.store_code AND t.code = c.tier_code
               WHERE c.store_code = ? AND c.member_id = ?',
@@ -140,7 +150,8 @@ final class CardTierRepo
         );
         if ($row === null) {
             return ['code' => null, 'multiplier' => 1.0,
-                    'threshold_visits' => null, 'threshold_amount' => null];
+                    'threshold_visits' => null, 'threshold_amount' => null,
+                    'coupon_valid_days' => null];
         }
         return [
             'code'             => (string)$row['code'],
@@ -148,6 +159,7 @@ final class CardTierRepo
             // null = 这一项跟随全局设置
             'threshold_visits' => $row['threshold_visits'] !== null ? (int)$row['threshold_visits'] : null,
             'threshold_amount' => $row['threshold_amount'],
+            'coupon_valid_days' => $row['coupon_valid_days'] !== null ? (int)$row['coupon_valid_days'] : null,
         ];
     }
 
@@ -193,6 +205,7 @@ final class CardTierRepo
             // null 表示这一项跟随全局设置
             'threshold_visits' => $t['threshold_visits'] !== null ? (int)$t['threshold_visits'] : null,
             'threshold_amount' => $t['threshold_amount'],
+            'coupon_valid_days' => $t['coupon_valid_days'] !== null ? (int)$t['coupon_valid_days'] : null,
         ];
     }
 

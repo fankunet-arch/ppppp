@@ -81,13 +81,24 @@ final class RewardService
             }
         }
 
+        /**
+         * 券有效期同理：等级没设就跟随全局。
+         *
+         * 0 是有意义的取值（永久有效），所以判的是 !== null 而不是真值 ——
+         * 写成 `?: ` 的话金卡设成「永久」会被当成没设置。
+         */
+        $days = max(0, $this->cfg->int('coupon_valid_days', 90));
+        if ($tier !== null && ($tier['coupon_valid_days'] ?? null) !== null) {
+            $days = max(0, (int)$tier['coupon_valid_days']);
+        }
+
         return [
             'enabled'          => $this->cfg->get('reward_enabled', '1') === '1',
             'mode'             => $mode,
             'threshold_visits' => $visits,
             'threshold_cents'  => $cents,
             'auto_grant'       => $this->cfg->get('reward_auto_grant', '1') === '1',
-            'valid_days'       => max(0, $this->cfg->int('coupon_valid_days', 90)),
+            'valid_days'       => $days,
             'tier_code'        => $tier['code'] ?? null,
         ];
     }
@@ -265,8 +276,8 @@ final class RewardService
             return ['ok' => false, 'error' => 'member_not_found'];
         }
         $c = $this->issue($memberId, self::SRC_MANUAL, 0,
-            $this->rule()['valid_days'], $note, $operator,
-            $this->tiers->forMember($memberId)['code'] ?? null, null);
+            $this->rule($tierForManual = $this->tiers->forMember($memberId))['valid_days'],
+            $note, $operator, $tierForManual['code'] ?? null, null);
         // 手工发的不计入 rewards_issued —— 否则会顶掉客人靠消费挣来的那张
         return ['ok' => true, 'coupon' => $c];
     }

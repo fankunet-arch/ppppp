@@ -219,6 +219,7 @@ vip_no_store();
         <label>积分倍率<input id="tier-mult" type="number" step="0.05" min="0.05" max="10" value="1.00" style="width:6em"></label>
         <label>几次送 1 次<input id="tier-thv" type="number" min="1" placeholder="跟随全局" style="width:7em"></label>
         <label>满额送 1 次<input id="tier-tha" type="text" placeholder="跟随全局" style="width:7em"></label>
+        <label>券有效期（天）<input id="tier-cvd" type="number" min="0" placeholder="跟随全局" style="width:7em"></label>
         <label>排序<input id="tier-sort" type="number" value="10" style="width:5em"></label>
       </div>
       <button id="btn-tier-save" class="primary">保存</button>
@@ -240,6 +241,12 @@ vip_no_store();
         按次还是按金额，取决于全局的「奖励模式」，这里两格各填各的。<br>
         改门槛<b>会立刻重算</b>：调低（比如升级成金卡）当场补发差额；
         调高<b>不会把已经发出去的券收回来</b> —— 收回已给出去的东西是绝不能做的。
+      </p>
+      <p class="muted small">
+        <b>券有效期</b>留空即跟随「奖励规则」里的全局天数；填 <b>0</b> 表示<b>永久有效</b>。<br>
+        券的到期日是<b>发券当天算好写死在券上</b>的，所以改这里
+        <b>只影响以后发的券</b>，客人手上已有的券不会跟着变长或变短 ——
+        券面上写的日子就是最终的日子。
       </p>
     </details>
   </div>

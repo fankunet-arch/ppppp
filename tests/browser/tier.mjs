@@ -141,6 +141,64 @@ await page.waitForTimeout(800);
 const row4 = await page.locator('#tier-list tr', { hasText: TIER }).textContent();
 ok(/3 次/.test(row4), '★★ 停用再启用之后门槛还在（那个按钮只该改开关，不该冲掉别的字段）');
 
+console.log('\n【③ter 按等级设券有效期】');
+/**
+ * 金卡的券多给一段时间。这一格有两个坐得住的地方：
+ *   · 留空 = 跟随全局，0 = 永久有效 —— 两者含义完全不同，
+ *     列表里用 `x ? … : 跟随全局` 写的话，「永久」会显示成「跟随全局」。
+ *   · 停用/启用那个按钮要把这一格原样带回去，否则会被悄悄冲成空。
+ */
+await page.locator(`[data-te="${TIER}"]`).click();
+await page.waitForTimeout(300);
+ok(await page.locator('#tier-cvd').inputValue() === '',
+   '★ 券有效期留空 = 跟随全局');
+await page.fill('#tier-cvd', '5');
+await page.click('#btn-tier-save');
+await page.waitForTimeout(800);
+const rowC = await page.locator('#tier-list tr', { hasText: TIER }).textContent();
+ok(/5 天/.test(rowC), `★★ 券有效期能在后台设（列表里显示【5 天】）`);
+
+await page.locator(`[data-tt="${TIER}"]`).click();
+await page.waitForTimeout(800);
+await page.locator(`[data-tt="${TIER}"]`).click();
+await page.waitForTimeout(800);
+const rowC2 = await page.locator('#tier-list tr', { hasText: TIER }).textContent();
+ok(/5 天/.test(rowC2) && /3 次/.test(rowC2),
+   '★★ 停用再启用之后【券有效期和门槛都还在】');
+
+// 0 = 永久有效，不是「没设置」也不是「当天过期」
+await page.locator(`[data-te="${TIER}"]`).click();
+await page.waitForTimeout(300);
+ok(await page.locator('#tier-cvd').inputValue() === '5', '  └ 编辑时能原值填回表单');
+await page.fill('#tier-cvd', '0');
+await page.click('#btn-tier-save');
+await page.waitForTimeout(800);
+const rowC3 = await page.locator('#tier-list tr', { hasText: TIER }).textContent();
+ok(/永久/.test(rowC3) && !/跟随全局/.test(rowC3),
+   `★★ 填 0 显示【永久】而不是【跟随全局】—— 0 是有意义的取值`);
+
+// 发一张看看真的永久，然后改回 5 天，确认老券不受影响
+const cpn = JSON.parse(php(`
+  require "app/bootstrap.php";
+  $c = require "app/config/config.php";
+  $a = new Vip\\App($c);
+  $op = ['id' => 1, 'name' => 'browser-test', 'device' => 'TEST'];
+  $r1 = $a->rewards()->grantManual(${F.gMid}, '浏览器测试 · 永久券', $op);
+  $a->cardTiers()->save('${TIER}', '测试金卡', 'Oro test', 1.5, 99, true, 3, null, 5);
+  $keep = $a->localDb()->one('SELECT valid_to FROM coupon WHERE id = ?', [$r1['coupon']['id']]);
+  $r2 = $a->rewards()->grantManual(${F.gMid}, '浏览器测试 · 改完之后', $op);
+  echo json_encode([
+    'permanent' => $r1['coupon']['valid_to'],
+    'keptAfterChange' => $keep['valid_to'],
+    'newOne' => $r2['coupon']['valid_to'],
+    'expect5' => date('Y-m-d', strtotime('+5 days')),
+  ]);
+`));
+ok(cpn.permanent === null, '★★ 0 天发出的券真的永久有效（valid_to 存 NULL）');
+ok(cpn.keptAfterChange === null,
+   '★★★ 把设置改成 5 天后，【已经发出去的那张还是永久】—— 券面上写的日子就是最终的日子');
+ok(cpn.newOne === cpn.expect5, `  └ 改完之后【新发的】才是 5 天（${cpn.newOne}）`);
+
 const ruleFor = JSON.parse(php(`
   require "app/bootstrap.php";
   $c = require "app/config/config.php";
@@ -263,6 +321,7 @@ php(`
   $a = new Vip\\App($c);
   foreach ([${F.gMid}, ${F.pMid}] as $id) {
     $a->localDb()->exec('DELETE FROM point_ledger WHERE member_id = ?', [$id]);
+    $a->localDb()->exec('DELETE FROM coupon WHERE member_id = ?', [$id]);
   }
   $a->localDb()->exec('DELETE FROM card WHERE batch_no LIKE ?', ['${TAG}%']);
   foreach ([${F.gMid}, ${F.pMid}] as $id) {
