@@ -654,9 +654,14 @@ $api->on('POST', '/points/grant', static function () use ($app, $requireOperator
         ];
     }
 
+    // 撞了防刷闸门时，经理可以带原因强制放行（docs/03 §12）
+    $reason   = trim((string)(Api::str($b, 'override_reason', '') ?? ''));
+    $override = $reason === '' ? null : ['reason' => $reason];
+
     $r = $app->points()->grant($serial, $clean, $mode, [
         'id' => $op['id'], 'name' => $op['name'], 'device' => $op['device'],
-    ]);
+        'role' => $op['role'] ?? 0, 'is_manager' => $op['is_manager'] ?? false,
+    ], $override);
 
     // 发分成功后检查奖励达标（N 送 1）。
     // 放在事务外：发券失败不该把已经记好的积分一起回滚，
@@ -679,6 +684,71 @@ $api->on('POST', '/points/grant', static function () use ($app, $requireOperator
         }
     }
     Api::fromResult($r, ['entries' => $r['entries'] ?? [], 'rewards' => $rewards]);
+});
+
+/**
+ * 多桌合并记账 —— 同行分桌，几桌的积分整单记进同一张卡。
+ *
+ * 场景见 docs/03 §12.2：一大帮人坐了三桌、一起结账，
+ * 自愿把三桌的分都记到其中一位的卡上。
+ *
+ * ★ 只有整单模式。合并之后再 AA 或点选菜品没有意义 ——
+ *   会走到这条路上本身就意味着「不用再分了，都算一个人的」。
+ */
+$api->on('POST', '/points/grant-merged', static function () use ($app, $requireOperator): void {
+    $op      = $requireOperator();
+    $b       = Api::body();
+    $serials = $b['serial_ids'] ?? [];
+    $mid     = Api::int($b, 'member_id', 0);
+
+    if (!is_array($serials) || !$serials || $mid <= 0) {
+        Api::fail('bad_request');
+    }
+    $reason   = trim((string)(Api::str($b, 'override_reason', '') ?? ''));
+    $override = $reason === '' ? null : ['reason' => $reason];
+
+    $r = $app->points()->grantMerged(
+        array_map(static fn($v): string => (string)$v, $serials),
+        $mid,
+        ['id' => $op['id'], 'name' => $op['name'], 'device' => $op['device'],
+         'role' => $op['role'] ?? 0, 'is_manager' => $op['is_manager'] ?? false],
+        $override
+    );
+
+    // 与单桌记账同理：发券放在事务外，失败不该把已记好的积分一起回滚
+    $rewards = [];
+    if (($r['ok'] ?? false) === true) {
+        $g = $app->rewards()->checkAndGrant($mid, ['id' => $op['id'], 'name' => $op['name']]);
+        if (($g['granted'] ?? 0) > 0 || ($g['pending'] ?? 0) > 0) {
+            $m = $app->members()->findById($mid);
+            $rewards[] = [
+                'member_id' => $mid, 'card_no' => $m['card_no'] ?? '',
+                'granted' => $g['granted'], 'pending' => $g['pending'], 'coupons' => $g['coupons'],
+            ];
+        }
+    }
+    Api::fromResult($r, [
+        'group'   => $r['group']   ?? null,
+        'entries' => $r['entries'] ?? [],
+        'forced'  => $r['forced']  ?? false,
+        'rewards' => $rewards,
+    ]);
+});
+
+/** 整组撤销 —— 合并是一次操作，撤销也该是一次操作 */
+$api->on('POST', '/points/reverse-group', static function () use ($app, $requireOperator): void {
+    $op     = $requireOperator();
+    $b      = Api::body();
+    $group  = Api::str($b, 'group', '') ?: '';
+    $reason = Api::str($b, 'reason', '') ?: '';
+    if ($group === '' || trim($reason) === '') {
+        Api::fail('bad_request');
+    }
+    $r = $app->points()->reverseGroup($group, $reason, [
+        'id' => $op['id'], 'name' => $op['name'], 'device' => $op['device'],
+        'role' => $op['role'] ?? 0, 'is_manager' => $op['is_manager'] ?? false,
+    ]);
+    Api::fromResult($r, ['count' => $r['count'] ?? 0]);
 });
 
 /** 某会员的奖励进度与可用券 —— Pad 选中会员后显示 */

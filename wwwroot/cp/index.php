@@ -295,7 +295,10 @@ vip_no_store();
       <select id="audit-action">
         <option value="">全部</option>
         <option value="point_grant">发放积分</option>
+        <option value="point_grant_merged">多桌合并记账</option>
+        <option value="point_grant_forced">★ 破例记账（经理放行）</option>
         <option value="point_reverse">撤销/冲正</option>
+        <option value="point_reverse_group">整组撤销</option>
         <option value="member_create">新建会员</option>
         <option value="data_erase">数据删除/假名化</option>
         <option value="coupon_redeem">卡券核销</option>

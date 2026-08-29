@@ -46,6 +46,7 @@ const S = {
   memberTarget: null,// 会员弹层回调
   pendingCard: null, // 扫到的库存卡，等着绑给新建的会员
   settings: {},      // 后台开关，随登录下发
+  merge: null,       // 多桌合并：{ orders: [...], member: {...} }
 };
 
 /* ── 工具 ────────────────────────────────────────── */
@@ -82,6 +83,8 @@ const STEP_BACK = {
   'step-order':  'step-table',
   'step-mode':   'step-order',
   'step-assign': 'step-mode',
+  // 合并页按返回回到记账方式：合并是从那一步进来的
+  'step-merge':  'step-mode',
   'step-done':   'step-table',
   'step-manual': 'step-table',
 };
@@ -404,7 +407,8 @@ function alreadyTried(version) {
 
 function applyUpdateIfIdle() {
   if (!pendingUpdate) return;
-  const busy = CURRENT_STEP !== 'step-table'
+  const busy = S.merge !== null
+            || CURRENT_STEP !== 'step-table'
             || (S.people && S.people.length > 0)
             || S.order !== null
             || !$('#member-modal').hidden
@@ -443,6 +447,7 @@ $('#btn-pin-submit').onclick = async () => {
 /* ── 步骤 1：桌号 ────────────────────────────────── */
 function resetFlow() {
   S.order = null; S.people = []; S.picks = {}; S.mode = 1;
+  S.merge = null;
   $('#table-input').value = '';
   $('#invoice-input').value = '';
   showErr('#locate-err', '');
@@ -566,6 +571,24 @@ function renderOrders(list) {
 }
 
 function selectOrder(o) {
+  /**
+   * 正在合并的话，选中的这一单是「再加一桌」，不是「开始新的一单」——
+   * 直接进队列，回到合并页，不要跳去记账方式（那一步在合并里不存在）。
+   */
+  if (S.merge) {
+    if (S.merge.orders.some(x => x.serial_id === o.serial_id)) {
+      /**
+       * 重复的那一桌不加，但【要回到合并页】。
+       * 只弹个提示就把人留在选订单页，收银员会以为点击没生效，
+       * 于是再点一次、再点一次 —— 而列表就在另一页上，他看不见。
+       */
+      toast(T('merge.dup'), 'err');
+      return step('step-merge');
+    }
+    S.merge.orders.push(o);
+    renderMerge();
+    return step('step-merge');
+  }
   S.order = o;
   S.people = []; S.picks = {};
   renderSummary(o);
@@ -912,21 +935,10 @@ $('#btn-submit').onclick = async () => {
   const btn = $('#btn-submit');
   btn.disabled = true;
   try {
-    const d = await api('/points/grant', { serial_id: S.order.serial_id, mode: S.mode, allocations });
-    $('#done-body').innerHTML = d.entries.map(e => `
-      <div class="card"><div class="amount">${T('done.points', { points: e.points })}</div>
-             <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, visits: e.visits })}</div></div>`).join('')
-      // 本次达标发了新券就大字提示 —— 服务员要当场告诉客人
-      + (d.rewards || []).map(r => r.granted > 0
-        ? `<div class="card reward-card">
-             <div class="amount">${T('done.granted', { n: r.granted })}</div>
-             <div class="meta">${T('done.grantedMeta', { card: escapeHtml(r.card_no) })}</div>
-             <div class="meta">${T('done.grantedCodes', { codes: r.coupons.map(c => escapeHtml(c.code)).join('、') })}</div>
-           </div>`
-        : `<div class="card reward-card">
-             <div class="amount">${T('done.pending', { n: r.pending })}</div>
-             <div class="meta">${T('done.pendingMeta', { card: escapeHtml(r.card_no) })}</div>
-           </div>`).join('');
+    const d = await submitWithGate('/points/grant',
+      { serial_id: S.order.serial_id, mode: S.mode, allocations });
+    if (d === null) return;                 // 经理放行那一步取消了
+    renderDone(d);
     step('step-done');
   } catch (e) {
     showErr('#assign-err', e.message + (e.detail && e.detail.total ? T('assign.overflow', { total: e.detail.total, allocated: e.detail.allocated }) : ''));
@@ -934,6 +946,156 @@ $('#btn-submit').onclick = async () => {
     btn.disabled = false;
   }
 };
+
+/**
+ * 记账结果。单桌与多桌合并共用 —— 两条路的返回结构本来就一样，
+ * 各写一份的话，改一处忘一处，现场表现是「合并记账不显示发券提示」。
+ */
+function renderDone(d) {
+  $('#done-body').innerHTML = (d.entries || []).map(e => `
+    <div class="card"><div class="amount">${T('done.points', { points: e.points })}</div>
+           <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, visits: e.visits })}</div></div>`).join('')
+    // 本次达标发了新券就大字提示 —— 服务员要当场告诉客人
+    + (d.rewards || []).map(r => r.granted > 0
+      ? `<div class="card reward-card">
+           <div class="amount">${T('done.granted', { n: r.granted })}</div>
+           <div class="meta">${T('done.grantedMeta', { card: escapeHtml(r.card_no) })}</div>
+           <div class="meta">${T('done.grantedCodes', { codes: r.coupons.map(c => escapeHtml(c.code)).join('、') })}</div>
+         </div>`
+      : `<div class="card reward-card">
+           <div class="amount">${T('done.pending', { n: r.pending })}</div>
+           <div class="meta">${T('done.pendingMeta', { card: escapeHtml(r.card_no) })}</div>
+         </div>`).join('');
+}
+
+/* ── 多桌合并（同行分桌）────────────────────────────
+ *
+ * 场景：一大帮人坐了三桌，分桌计费、最后一起结账，
+ * 然后自愿把三桌的积分都记到其中一位的卡上。docs/03 §12.2
+ *
+ * ★ 只有【整单】一种记法。合并之后再 AA 或点选菜品是没有意义的 ——
+ *   会走到这条路上，本身就意味着「不用再分了，都算一个人的」。
+ *   所以这一步没有记账方式可选，加桌、选卡、提交，三下完事。
+ *
+ * ★ 加桌走的是同一条找单流程（桌号 / 小票号），不另做一套 ——
+ *   收银员已经会用那个了，再学一个只会出错。
+ */
+function mergeStart() {
+  // 把当前这一单作为第一桌带进来 —— 收银员是在看着它的时候才想起「还有别桌」的
+  S.merge = { orders: S.order ? [S.order] : [], member: null };
+  renderMerge();
+  step('step-merge');
+}
+
+function mergeRow(o) {
+  return T('merge.row', {
+    table: escapeHtml(o.table_name || o.serial_id),
+    amount: money(o.remaining_cents),
+    portions: o.remaining_portions,
+  });
+}
+
+function renderMerge() {
+  const m = S.merge || { orders: [], member: null };
+  const box = $('#merge-list');
+  box.innerHTML = m.orders.map((o, i) =>
+    `<div class="lrow"><span>${mergeRow(o)}</span>
+       <button class="link" data-mrm="${i}">${T('merge.remove')}</button></div>`).join('')
+    || `<div class="empty">${T('merge.needTwo')}</div>`;
+  $$('[data-mrm]', box).forEach(b => b.onclick = () => {
+    S.merge.orders.splice(parseInt(b.dataset.mrm, 10), 1);
+    renderMerge();
+  });
+
+  const sum = m.orders.reduce((a, o) => a + o.remaining_cents, 0);
+  $('#merge-sum').textContent = money(sum);
+  $('#merge-count').textContent = T('merge.count', { n: m.orders.length });
+
+  $('#merge-member').innerHTML = m.member
+    ? `<div class="lrow"><span><b>${escapeHtml(m.member.card_no || '')}</b> · ${
+         T('member.statsShort', { points: m.member.points_balance, visits: m.member.visit_count })}</span></div>`
+    : '';
+  showErr('#merge-err', '');
+}
+
+$('#btn-merge-start').onclick = mergeStart;
+
+$('#btn-merge-add').onclick = () => {
+  /**
+   * 回到第一步再找一单。不清 S.merge —— 那是整个功能的状态；
+   * 但要清掉 S.order，否则回来时 selectOrder 会拿旧的那一单去比。
+   */
+  S.order = null;
+  $('#table-input').value = '';
+  $('#invoice-input').value = '';
+  showErr('#locate-err', '');
+  $('#locate-fallback').hidden = true;
+  setLookupMode('table');
+  step('step-table');
+};
+
+$('#btn-merge-pick').onclick = () => openMemberModal('merge');
+
+$('#btn-merge-cancel').onclick = () => {
+  S.merge = null;
+  step(S.order ? 'step-mode' : 'step-table');
+};
+
+$('#btn-merge-submit').onclick = async () => {
+  const m = S.merge || { orders: [], member: null };
+  if (m.orders.length < 2) return showErr('#merge-err', T('merge.needTwo'));
+  if (!m.member)           return showErr('#merge-err', T('merge.needMember'));
+
+  const sum = m.orders.reduce((a, o) => a + o.remaining_cents, 0);
+  if (!await UI.confirm(T('merge.confirm', {
+        n: m.orders.length, amount: money(sum), card: m.member.card_no }))) return;
+
+  const btn = $('#btn-merge-submit');
+  btn.disabled = true;
+  try {
+    const body = { serial_ids: m.orders.map(o => o.serial_id), member_id: m.member.id };
+    const d = await submitWithGate('/points/grant-merged', body);
+    if (d === null) return;                 // 用户在经理放行那一步取消了
+    renderDone(d);
+    S.merge = null;
+    step('step-done');
+  } catch (e) {
+    showErr('#merge-err', e.message + (e.detail && e.detail.hint ? '\n' + e.detail.hint : ''));
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+/**
+ * 提交；撞了防刷闸门就地问经理要原因，再带着原因重试一次。
+ *
+ * ★ 为什么在前台就地处理，而不是让收银员「去找经理重做一遍」：
+ *   客人就站在柜台前。让他等着、收银员跑去找经理、回来从头再走一遍
+ *   找单流程 —— 这中间任何一步分神，这一单就丢了。
+ *   经理走过来输一句原因，是现场唯一走得通的做法。
+ *
+ * ★ 只重试一次。第二次还被拦说明不是权限问题（比如经理账号本身没权限），
+ *   再问一遍只是让人反复输原因。
+ */
+async function submitWithGate(path, body) {
+  try {
+    return await api(path, body);
+  } catch (e) {
+    if (e.error !== 'manager_required') throw e;
+
+    const gates = (e.detail && e.detail.gates) || [];
+    const why = gates.map(g =>
+      g.gate === 'late_grant' ? T('gate.late', { min: g.minutes })
+      : g.gate === 'period_cap' ? T('gate.cap', { used: g.used, limit: g.limit })
+      : '').filter(Boolean).join('\n');
+
+    const reason = await UI.input(why + '\n\n' + T('gate.askReason'), {
+      placeholder: T('gate.reasonPh'), okText: T('gate.ok'), danger: true,
+    });
+    if (reason === null || !reason.trim()) return null;
+    return await api(path, Object.assign({}, body, { override_reason: reason.trim() }));
+  }
+}
 
 /* ── 会员弹层 ────────────────────────────────────── */
 function openMemberModal(personIndex) {
@@ -1557,7 +1719,10 @@ function askVerdict(d) {
 }
 
 function useMember(m) {
-  if (S.memberTarget === 'manual') {
+  if (S.memberTarget === 'merge') {
+    S.merge.member = m;
+    renderMerge();
+  } else if (S.memberTarget === 'manual') {
     S.manualMember = m;
     $('#manual-member').innerHTML = `<div class="found"><b>${escapeHtml(m.card_no)}</b>
       <div class="muted small">${m.points_balance} ${T('common.points')}</div></div>`;

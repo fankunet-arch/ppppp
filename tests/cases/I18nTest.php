@@ -46,6 +46,33 @@ T::true($extra === [], '西语里没有多出来的孤儿键'
 
 T::true(count($zh) > 50, '文案条数看着正常（' . count($zh) . ' 条）');
 
+/**
+ * ★★ 同一个数组里不能出现重复的键 —— 这条是补一次真实事故的。
+ *
+ * 加防刷闸门的文案时，我又写了一条 'reason_required'，
+ * 而这个键在下面「强制核销」那一段里已经有了。
+ * PHP 对数组字面量里的重复键【不报错也不警告】，后面那条直接覆盖前面那条 ——
+ * 于是新写的文案根本没生效，而收银员会在一个完全不相干的场景下
+ * 看到「强制核销必须填写原因」。
+ *
+ * 上面的中西对照断言也抓不到：Api::messageKeys() 拿到的已经是
+ * PHP 解析【去重之后】的结果，两边一样多、一样齐全，全绿。
+ * 只有回去数源文件里的字面量才看得见。
+ */
+$src = file_get_contents(__DIR__ . '/../../app/lib/Http/Api.php');
+foreach (['MESSAGES', 'MESSAGES_ES'] as $arr) {
+    T::true((bool)preg_match('/const ' . $arr . ' = \[(.*?)\n    \];/s', $src, $m),
+        "找得到 {$arr} 的字面量");
+    preg_match_all("/^\s*'([a-z_]+)'\s*=>/m", $m[1], $km);
+    $counts = array_count_values($km[1]);
+    $dups   = array_keys(array_filter($counts, static fn(int $n): bool => $n > 1));
+    T::true($dups === [],
+        "★★ {$arr} 里没有重复的键（共 " . count($km[1]) . " 条）"
+        . ($dups ? "\n      重复：" . implode(', ', $dups)
+                 . "\n      —— PHP 不报错，后一条会静默覆盖前一条，新文案等于没写"
+                 : ''));
+}
+
 // 按语言取词
 Api::setLang('zh');
 T::eq('zh', Api::lang(), '语言设成中文');

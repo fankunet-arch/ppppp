@@ -209,6 +209,36 @@
     'done.pendingMeta':   { zh: '{card} 达到门槛，但后台设为「人工发券」，请经理在后台发放',
                             es: '{card} llegó al objetivo, pero los vales se emiten a mano: que lo haga el encargado' },
 
+    /* ── 多桌合并（同行分桌）───────────────────────────── */
+    'merge.start':        { zh: '还有其他桌，一起记', es: 'Hay más mesas, juntarlas' },
+    'merge.title':        { zh: '③ 多桌一起记',      es: '③ Juntar varias mesas' },
+    'merge.note':         { zh: '几桌的积分【整单】记给同一张卡。适用于一起结账的同行客人 —— 加完所有桌，再选收分的那张卡。',
+                            es: 'Los puntos de varias mesas van enteros a una sola tarjeta. Para grupos que pagan juntos: añada todas las mesas y luego elija la tarjeta.' },
+    'merge.sum':          { zh: '合计',              es: 'Total' },
+    'merge.count':        { zh: '共 {n} 桌',         es: '{n} mesas' },
+    'merge.add':          { zh: '再加一桌',          es: 'Añadir otra mesa' },
+    'merge.pick':         { zh: '选择收分的会员',    es: 'Elegir quién recibe los puntos' },
+    'merge.submit':       { zh: '全部记给这张卡',    es: 'Dar todo a esta tarjeta' },
+    'merge.needMember':   { zh: '请先选择收分的会员', es: 'Elija primero quién recibe los puntos' },
+    'merge.needTwo':      { zh: '至少要两桌 —— 单桌请用普通记账',
+                            es: 'Hacen falta al menos dos mesas; para una sola use el apunte normal' },
+    'merge.dup':          { zh: '这一桌已经加进来了', es: 'Esa mesa ya está en la lista' },
+    'merge.remove':       { zh: '移除',              es: 'Quitar' },
+    'merge.row':          { zh: '{table} 桌 · € {amount} · {portions} 份', es: 'Mesa {table} · € {amount} · {portions} raciones' },
+    'merge.confirm':      { zh: '把这 {n} 桌共 € {amount} 的积分全部记给 {card}？',
+                            es: '¿Dar los puntos de estas {n} mesas (€ {amount}) a {card}?' },
+
+    /* ── 破例放行（防刷闸门）───────────────────────────── */
+    'gate.late':          { zh: '这一单已经结账 {min} 分钟了，超出当场记账的范围。',
+                            es: 'Esta cuenta se cerró hace {min} minutos, fuera del plazo normal.' },
+    'gate.cap':           { zh: '这张卡在本餐期已经记过 {used} 次了（上限 {limit} 次）。',
+                            es: 'Esta tarjeta ya tiene {used} apuntes en este servicio (máximo {limit}).' },
+    'gate.askReason':     { zh: '需要经理放行。请写明原因（会记入审计日志）：',
+                            es: 'Hace falta un encargado. Indique el motivo (queda registrado):' },
+    'gate.reasonPh':      { zh: '如：客人忘带卡，隔天拿小票来补',
+                            es: 'p. ej.: el cliente olvidó la tarjeta y vuelve con el ticket' },
+    'gate.ok':            { zh: '经理放行',          es: 'Autorizar' },
+
     /* ── 会员弹层 ─────────────────────────────────────── */
     'member.title':       { zh: '选择会员',    es: 'Elegir socio' },
     'member.byCard':      { zh: '卡号',        es: 'Tarjeta' },

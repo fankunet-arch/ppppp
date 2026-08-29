@@ -42,11 +42,11 @@ final class LedgerRepo
             'INSERT INTO point_ledger
                (store_code, member_id, serial_id, entry_type, amount, points, counted_visit,
                 portions_counted, portions_uncounted, excluded_amount,
-                alloc_mode, alloc_detail, status, reverses_id,
+                alloc_mode, alloc_detail, grant_group, status, reverses_id,
                 tier_code, tier_multiplier,
                 source, manual_reason, review_status, approved_by,
                 operator_id, operator_name, device, reason, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             [
                 $this->storeCode,
                 $e['member_id'],
@@ -60,6 +60,8 @@ final class LedgerRepo
                 Money::toStr($e['excluded_cents'] ?? 0),
                 $e['alloc_mode'] ?? null,
                 isset($e['alloc_detail']) ? json_encode($e['alloc_detail'], JSON_UNESCAPED_UNICODE) : null,
+                // 多桌合并时同一组的几笔共用一个值；单桌记账为 NULL
+                $e['grant_group'] ?? null,
                 $e['status'] ?? self::S_ACTIVE,
                 $e['reverses_id'] ?? null,
                 // 入账时那张卡的等级与实际套用的倍率。倍率是活查的，
@@ -115,6 +117,44 @@ final class LedgerRepo
               WHERE l.store_code = ? AND l.serial_id = ? AND l.status = ?
               ORDER BY l.id ASC',
             [$this->storeCode, $serialId, self::S_ACTIVE]
+        );
+    }
+
+    /**
+     * 这张卡在某个时间段内【有效的消费流水】，带上对应订单的结账时间。
+     *
+     * 给风控用（docs/03 §12）：判「这一顿记了几次」「几单跨了多久」都要
+     * 订单的 order_end_time，光看流水的 created_at 不行 ——
+     * 补记的那一笔 created_at 是今天，而它记的可能是三天前的一顿饭。
+     *
+     * 只取 entry_type=消费 且 status=有效：撤销过的不该再算进风控里。
+     * LIMIT 200 是防呆上限，一张卡一天不可能有这么多笔。
+     */
+    public function earnedInRange(int $memberId, string $from, string $to, int $limit = 200): array
+    {
+        return $this->db->all(
+            'SELECT l.id, l.serial_id, l.grant_group, o.order_end_time
+               FROM point_ledger l
+               JOIN pos_order o ON o.store_code = l.store_code AND o.serial_id = l.serial_id
+              WHERE l.store_code = ? AND l.member_id = ? AND l.entry_type = ? AND l.status = ?
+                AND o.order_end_time >= ? AND o.order_end_time < ?
+              ORDER BY o.order_end_time
+              LIMIT ' . max(1, min($limit, 500)),
+            [$this->storeCode, $memberId, self::T_EARN, self::S_ACTIVE, $from, $to]
+        );
+    }
+
+    /**
+     * 一次多桌合并产出的全部有效流水，用于整组撤销。
+     * 加锁：撤销要改会员余额与订单已分配额，必须和并发的记账排队。
+     */
+    public function lockActiveByGroup(string $group): array
+    {
+        return $this->db->all(
+            'SELECT * FROM point_ledger
+              WHERE store_code = ? AND grant_group = ? AND entry_type = ? AND status = ?
+              ORDER BY id FOR UPDATE',
+            [$this->storeCode, $group, self::T_EARN, self::S_ACTIVE]
         );
     }
 

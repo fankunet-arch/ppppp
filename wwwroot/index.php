@@ -129,8 +129,27 @@ $appVersion = vip_app_version([
       <button class="mode" data-mode="2"><b data-i18n="mode2.title"></b><span data-i18n="mode2.desc"></span></button>
       <button class="mode" data-mode="3"><b data-i18n="mode3.title"></b><span data-i18n="mode3.desc"></span></button>
     </div>
+    <!-- 同行分桌：一大帮人坐了几桌、一起结账，积分都记给其中一位 -->
+    <button id="btn-merge-start" class="ghost" data-i18n="merge.start">还有其他桌，一起记</button>
     <button id="btn-free-meal" class="ghost warn" data-i18n="freeMeal.btn">标记为免费餐</button>
     <button class="ghost" data-back="step-order" data-i18n="common.back">返回</button>
+  </div>
+
+  <!-- 步骤 3bis：多桌合并（只有整单一种记法，见 docs/03 §12.2） -->
+  <div id="step-merge" class="step">
+    <h2 data-i18n="merge.title">③ 多桌一起记</h2>
+    <p class="muted small" data-i18n="merge.note"></p>
+    <div id="merge-list" class="ledger-box"></div>
+    <div class="totals">
+      <span><span data-i18n="merge.sum">合计</span> <b id="merge-sum">0.00</b>
+            · <span id="merge-count" class="muted small"></span></span>
+    </div>
+    <button id="btn-merge-add" class="ghost" data-i18n="merge.add">再加一桌</button>
+    <div id="merge-member" class="ledger-box"></div>
+    <button id="btn-merge-pick" class="primary" data-i18n="merge.pick">选择收分的会员</button>
+    <p id="merge-err" class="err" hidden></p>
+    <button id="btn-merge-submit" class="primary big" data-i18n="merge.submit">全部记给这张卡</button>
+    <button id="btn-merge-cancel" class="ghost" data-i18n="common.cancel">取消</button>
   </div>
 
   <!-- 步骤 4：分配 -->

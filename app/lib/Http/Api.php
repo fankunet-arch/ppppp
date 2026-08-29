@@ -86,6 +86,17 @@ final class Api
         'invalid_amount'         => '金额不合法',
         'db_unavailable'         => '本地数据库暂时不可用，请联系管理员',
 
+        // ── 防刷闸门（docs/03 §12）──────────────────────────
+        // 每一条都要说清【为什么被拦】和【下一步找谁】，
+        // 只说「不行」的话收银员当场没法向客人交代
+        'manager_required'       => '这一单超出普通记账范围，需经理放行并写明原因',
+        'merge_needs_two'        => '多桌合并至少要选两桌，单桌请用普通记账',
+        'merge_too_many'         => '一次合并的桌数超过上限，请分两次做',
+        'merge_span_too_wide'    => '这几单的结账时间差得太远，不像同一顿饭 —— 需经理确认',
+        'merge_not_same_sitting' => '这几单不在同一餐期，不能合并记账',
+        'order_fully_allocated'  => '其中有一单的积分已经全部分配完了',
+        'group_not_found'        => '找不到这次合并记账，可能已经撤销过了',
+
         // ── 实体卡 ──────────────────────────────────────────
         // 每一条都要让收银员知道【下一步该做什么】，而不是只说「不行」
         'card_malformed'         => '卡号不完整，请重新扫描或核对卡面号码',
@@ -104,7 +115,8 @@ final class Api
         'pin_not_set'            => '此卡没有设置 PIN，请联系管理员',
         'pin_required'           => '请让客人刮开卡背并报出 PIN',
         'card_missing'           => '该会员当前没有绑定的卡，请先补发一张',
-        'reason_required'        => '强制核销必须填写原因',
+        // 强制核销、破例记账、超宽限期换卡都用这一条 —— 凡是破例都要写原因
+        'reason_required'        => '破例操作必须写明原因',
         'pii_disabled'           => '本店未开启收集联系方式，请勿向客人索要',
         'no_channel'             => '发不出确认码：短信/邮件未配置，或客人没留对应的联系方式',
         'channel_not_configured' => '发送渠道未配置，请联系管理员',
@@ -168,6 +180,13 @@ final class Api
         'card_not_available'     => 'Esta tarjeta no está en stock, no se puede entregar',
         'card_expired'           => 'Tarjeta caducada: entregue una nueva (los puntos se traspasan)',
         'grace_over'             => 'Esta tarjeta superó el plazo de renovación; los puntos han caducado — hace falta un encargado',
+        'manager_required'       => 'Este apunte sale de lo habitual: hace falta un encargado y un motivo',
+        'merge_needs_two'        => 'Para unir mesas hay que elegir al menos dos; para una sola use el apunte normal',
+        'merge_too_many'         => 'Demasiadas mesas en una sola unión; hágalo en dos veces',
+        'merge_span_too_wide'    => 'Estas cuentas se cerraron con demasiada diferencia de hora; no parecen la misma comida — hace falta un encargado',
+        'merge_not_same_sitting' => 'Estas cuentas no son del mismo servicio; no se pueden unir',
+        'order_fully_allocated'  => 'Una de las cuentas ya tiene todos sus puntos repartidos',
+        'group_not_found'        => 'No se encuentra esa unión de mesas; puede que ya se haya anulado',
         'card_expiring_soon'     => 'Esta tarjeta caduca pronto',
         'card_member_missing'    => 'No se encuentra el cliente asociado a la tarjeta, avise al administrador',
         'member_has_card'        => 'Este cliente ya tiene tarjeta; para cambiarla use la renovación',
@@ -177,7 +196,7 @@ final class Api
         'pin_not_set'            => 'Esta tarjeta no tiene PIN, avise al administrador',
         'pin_required'           => 'Pida al cliente que rasque el reverso y diga el PIN',
         'card_missing'           => 'Este cliente no tiene tarjeta activa, entregue una primero',
-        'reason_required'        => 'Para forzar la operación hay que indicar el motivo',
+        'reason_required'        => 'Toda excepción necesita un motivo por escrito',
         'pii_disabled'           => 'El restaurante no recoge datos de contacto, no se los pida al cliente',
         'no_channel'             => 'No se puede enviar el código: SMS/email sin configurar, o el cliente no dejó ese dato',
         'channel_not_configured' => 'El canal de envío no está configurado, avise al administrador',

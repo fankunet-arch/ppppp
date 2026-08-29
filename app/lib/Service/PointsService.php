@@ -41,6 +41,7 @@ final class PointsService
         private MealRules  $rules,
         private BusinessDay $bizDay,
         private \Vip\Repo\CardTierRepo $tiers,
+        private \Vip\MealPeriod $periods,
     ) {
     }
 
@@ -339,13 +340,129 @@ final class PointsService
      * @param array $allocations [['member_id'=>int,'amount_cents'=>int,'portions'=>int], ...]
      * @return array{ok:bool,error?:string,entries?:array}
      */
-    public function grant(string $serialId, array $allocations, int $allocMode, array $operator): array
+    public function grant(string $serialId, array $allocations, int $allocMode, array $operator,
+                          ?array $override = null): array
     {
         if (!$allocations) {
             return ['ok' => false, 'error' => 'empty_allocation'];
         }
 
-        return $this->db->transaction(function () use ($serialId, $allocations, $allocMode, $operator) {
+        return $this->db->transaction(function () use ($serialId, $allocations, $allocMode, $operator, $override) {
+            $memberIds = array_map(static fn(array $a): int => (int)($a['member_id'] ?? 0), $allocations);
+            $gate = $this->checkGates([$serialId], $memberIds, $operator, $override);
+            if (!$gate['ok']) {
+                return $gate;
+            }
+            $r = $this->grantOne($serialId, $allocations, $allocMode, $operator, null);
+            if (!($r['ok'] ?? false)) {
+                return $r;
+            }
+            $this->auditForced($gate, [$serialId], $operator, $override);
+            $this->riskWatch($memberIds, $operator);
+            return $r + ['forced' => $gate['forced'], 'gates' => $gate['hit']];
+        });
+    }
+
+    /**
+     * 多桌合并：几张订单的积分【整单】记进同一张卡。
+     *
+     * 场景是「同行分桌」—— 一大帮人坐了三桌，分桌计费、一起结账，
+     * 然后自愿把三桌的分都记到其中一位的卡上。docs/03 §12.2
+     *
+     * ★ 只支持整单模式。合并之后再 AA 或点选菜品是没有意义的：
+     *   会走到这条路上，本身就意味着「不用再分了，都算一个人的」。
+     *   支持它要把整个步骤机改成多单版，代价大得多，而现场没有这个需求。
+     *
+     * ★ 几张单必须是同一顿饭：同一营业日、同一餐期、结账时间跨度受限。
+     *   这三条就是把「同行分桌」和「捡了三张别人的小票」分开的全部依据 ——
+     *   前者永远挨在一起，后者来源必然分散。
+     *
+     * ★ 加锁顺序按 serial_id 排序。两台 Pad 同时合并有重叠的两组单时，
+     *   顺序不固定就会死锁 —— 这是合并相对单桌【新增】的唯一并发风险。
+     *
+     * @param string[] $serialIds
+     * @return array{ok:bool,error?:string,entries?:array,group?:string}
+     */
+    public function grantMerged(array $serialIds, int $memberId, array $operator,
+                                ?array $override = null): array
+    {
+        $serials = array_values(array_unique(array_filter(array_map(
+            static fn($v): string => trim((string)$v), $serialIds))));
+        if (count($serials) < 2) {
+            return ['ok' => false, 'error' => 'merge_needs_two'];
+        }
+        $maxOrders = max(1, $this->cfg->int('merge_max_orders', 8));
+        if (count($serials) > $maxOrders) {
+            return ['ok' => false, 'error' => 'merge_too_many',
+                    'detail' => ['max' => $maxOrders, 'given' => count($serials)]];
+        }
+        // ★ 固定加锁顺序，防止并发合并时死锁
+        sort($serials);
+
+        return $this->db->transaction(function () use ($serials, $memberId, $operator, $override) {
+            $span = $this->checkMergeSpan($serials);
+            if (!$span['ok']) {
+                return $span;
+            }
+            $gate = $this->checkGates($serials, [$memberId], $operator, $override);
+            if (!$gate['ok']) {
+                return $gate;
+            }
+
+            $group   = $this->newGroupId();
+            $entries = [];
+            foreach ($serials as $sid) {
+                $order = $this->orders->lockBySerial($sid);
+                if ($order === null) {
+                    return ['ok' => false, 'error' => 'order_not_found', 'detail' => ['serial_id' => $sid]];
+                }
+                // 整单 = 把这一单【剩下的】全给他。已经分掉一部分的单也能合进来，
+                // 剩多少给多少 —— 金额守恒照常在 grantOne 里逐单校验。
+                $remain     = Money::toCents($order['total_amount']) - Money::toCents($order['allocated_amount']);
+                $remainPort = (int)$order['portions_counted'] - (int)$order['allocated_portions'];
+                if ($remain <= 0) {
+                    return ['ok' => false, 'error' => 'order_fully_allocated', 'detail' => ['serial_id' => $sid]];
+                }
+                $r = $this->grantOne($sid, [[
+                    'member_id'    => $memberId,
+                    'amount_cents' => $remain,
+                    'portions'     => max(0, $remainPort),
+                ]], PE::MODE_WHOLE, $operator, $group);
+                if (!($r['ok'] ?? false)) {
+                    // 事务里直接返回 = 整组回滚。半成品比失败更难收拾：
+                    // 收银员看到「成功了 2 桌、第 3 桌失败」根本不知道该怎么办
+                    return $r + ['detail' => ($r['detail'] ?? []) + ['serial_id' => $sid]];
+                }
+                $entries = array_merge($entries, $r['entries']);
+            }
+
+            $this->audit->log('point_grant_merged', [
+                'target_type'   => 'grant_group', 'target_id' => $group,
+                'operator_id'   => $operator['id']   ?? null,
+                'operator_name' => $operator['name'] ?? null,
+                'device'        => $operator['device'] ?? null,
+                'detail'        => ['serials' => $serials, 'member_id' => $memberId,
+                                    'forced' => $gate['forced'], 'gates' => $gate['hit']],
+            ]);
+            $this->auditForced($gate, $serials, $operator, $override);
+            $this->riskWatch([$memberId], $operator);
+
+            return ['ok' => true, 'group' => $group, 'entries' => $entries,
+                    'member_ids' => [$memberId],
+                    'forced' => $gate['forced'], 'gates' => $gate['hit']];
+        });
+    }
+
+    /**
+     * 一张订单的分配 —— 事务由调用方开。
+     *
+     * 这一整段原本就是 grant() 事务闭包的全部内容，抽出来是为了让
+     * grantMerged() 能在【同一个事务】里把它跑 M 遍。逻辑一行没改：
+     * 金额守恒仍然是逐单校验的，本来就是 per-order 的，合并不动它。
+     */
+    private function grantOne(string $serialId, array $allocations, int $allocMode,
+                              array $operator, ?string $group): array
+    {
             $order = $this->orders->lockBySerial($serialId);
             if ($order === null) {
                 return ['ok' => false, 'error' => 'order_not_found'];
@@ -448,6 +565,7 @@ final class PointsService
                     'excluded_cents'     => Money::toCents($order['excluded_amount']),
                     'alloc_mode'         => $allocMode,
                     'alloc_detail'       => $a['detail'] ?? null,
+                    'grant_group'        => $group,
                     // ★ 记下当时用的等级与倍率。倍率是活查的，改了立刻对以后生效 ——
                     //   流水里不记的话，事后回答不了「这单为什么给了 150 分」，
                     //   而这正是客人申诉、会计对账、撤销重算时第一个要问的。
@@ -481,11 +599,241 @@ final class PointsService
                 'operator_id'   => $operator['id']   ?? null,
                 'operator_name' => $operator['name'] ?? null,
                 'device'        => $operator['device'] ?? null,
-                'detail'        => ['mode' => $allocMode, 'entries' => $entries],
+                'detail'        => ['mode' => $allocMode, 'entries' => $entries,
+                                    'grant_group' => $group],
             ]);
 
             return ['ok' => true, 'entries' => $entries, 'member_ids' => array_column($entries, 'member_id')];
-        });
+    }
+
+    // ════════════════════════════════════════════════════════
+    // 风控闸门（docs/03 §12）
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * 记账前的两道闸门：补记时限、同一餐期的次数上限。
+     *
+     * ★ 两道都【不是硬拒绝】，而是「普通收银员做不了，经理填原因可以做」。
+     *
+     *   一刀拒绝的代价是柜台当面回绝客人 —— 那正是投诉的来源，而且
+     *   两种被拦下的情形里都有大量正当的：客人忘带卡隔天来补、
+     *   一家人中午吃完晚上又来。给经理留一个带原因、带留痕的口子，
+     *   既守住了规则（普通收银员破不了例），事后又查得到是谁放的行。
+     *   与「超宽限期换卡」「经理强制核销」是同一套做法。
+     *
+     * @param string[] $serialIds
+     * @param int[]    $memberIds
+     * @return array{ok:bool,error?:string,detail?:array,forced:bool,hit:array}
+     */
+    private function checkGates(array $serialIds, array $memberIds, array $operator, ?array $override): array
+    {
+        $hit = [];
+
+        // ── ① 补记时限 ────────────────────────────────────
+        $lateMin = $this->cfg->int('late_grant_minutes', 60);
+        $oldest  = null;
+        if ($lateMin > 0) {
+            foreach ($serialIds as $sid) {
+                $o = $this->orders->findBySerial($sid);
+                if ($o === null) { continue; }
+                $age = (time() - strtotime((string)$o['order_end_time'])) / 60;
+                if ($oldest === null || $age > $oldest) { $oldest = $age; }
+            }
+            if ($oldest !== null && $oldest > $lateMin) {
+                $hit[] = ['gate' => 'late_grant', 'minutes' => (int)round($oldest), 'limit' => $lateMin];
+            }
+        }
+
+        // ── ② 同一餐期的记账次数 ──────────────────────────
+        $cap = $this->cfg->int('max_grants_per_period', 0);
+        if ($cap > 0 && $memberIds && $serialIds) {
+            $ref = $this->orders->findBySerial($serialIds[0]);
+            if ($ref !== null) {
+                foreach (array_unique(array_filter($memberIds)) as $mid) {
+                    $n = $this->countGrantsInSitting((int)$mid, (string)$ref['order_end_time'], $serialIds);
+                    if ($n >= $cap) {
+                        $hit[] = ['gate' => 'period_cap', 'member_id' => (int)$mid,
+                                  'used' => $n, 'limit' => $cap];
+                    }
+                }
+            }
+        }
+
+        if (!$hit) {
+            return ['ok' => true, 'forced' => false, 'hit' => []];
+        }
+
+        // 撞了闸门 —— 要经理 + 原因才放行
+        if ($override === null) {
+            return ['ok' => false, 'error' => 'manager_required', 'detail' => ['gates' => $hit],
+                    'forced' => false, 'hit' => $hit];
+        }
+        if ((int)($operator['role'] ?? 0) < 2) {
+            return ['ok' => false, 'error' => 'forbidden', 'detail' => ['gates' => $hit],
+                    'forced' => false, 'hit' => $hit];
+        }
+        if (trim((string)($override['reason'] ?? '')) === '') {
+            return ['ok' => false, 'error' => 'reason_required', 'detail' => ['gates' => $hit],
+                    'forced' => false, 'hit' => $hit];
+        }
+        return ['ok' => true, 'forced' => true, 'hit' => $hit];
+    }
+
+    /**
+     * 这张卡在【这一顿】里已经记过几次账。
+     *
+     * ★ 数的是「几次记账操作」，不是「几张订单」——
+     *   一次三桌合并算 1 次。所以大团不会被误伤，
+     *   而陆续拿三张小票来的会被数成 3 次。这正是要区分的东西。
+     *   实现上就是按 COALESCE(grant_group, serial_id) 去重。
+     *
+     * @param string[] $exclude 本次正在记的这几单不算进来
+     */
+    private function countGrantsInSitting(int $memberId, string $refEndTime, array $exclude): int
+    {
+        $bizDate = $this->bizDay->of($refEndTime);
+        [$from, $to] = $this->bizDay->range($bizDate);
+
+        $rows = $this->ledger->earnedInRange($memberId, $from, $to);
+
+        $seen = [];
+        foreach ($rows as $r) {
+            if (in_array((string)$r['serial_id'], $exclude, true)) { continue; }
+            // 同一顿 = 同一营业日 + 同一餐期
+            if (!$this->periods->sameSitting((string)$r['order_end_time'], $refEndTime, $this->bizDay)) {
+                continue;
+            }
+            $seen[(string)($r['grant_group'] ?? '') !== '' ? 'g:' . $r['grant_group'] : 's:' . $r['serial_id']] = true;
+        }
+        return count($seen);
+    }
+
+    /**
+     * 合并的几单必须是同一顿饭。
+     *
+     * 三条判据，全部来自「同行分桌一定挨在一起、捡小票一定分散」：
+     *   · 同一营业日
+     *   · 同一餐期（中午那桌和晚上那桌不是同一顿）
+     *   · 最早与最晚结账时间的跨度不超过配置值
+     */
+    private function checkMergeSpan(array $serials): array
+    {
+        $times = [];
+        foreach ($serials as $sid) {
+            $o = $this->orders->findBySerial($sid);
+            if ($o === null) {
+                return ['ok' => false, 'error' => 'order_not_found', 'detail' => ['serial_id' => $sid]];
+            }
+            $times[$sid] = (string)$o['order_end_time'];
+        }
+        $ref = reset($times);
+        foreach ($times as $sid => $t) {
+            if (!$this->periods->sameSitting($t, $ref, $this->bizDay)) {
+                return ['ok' => false, 'error' => 'merge_not_same_sitting',
+                        'detail' => ['serial_id' => $sid]];
+            }
+        }
+        $spanMin = max(1, $this->cfg->int('merge_span_minutes', 60));
+        $stamps  = array_map('strtotime', array_values($times));
+        $span    = (max($stamps) - min($stamps)) / 60;
+        if ($span > $spanMin) {
+            return ['ok' => false, 'error' => 'merge_span_too_wide',
+                    'detail' => ['span_minutes' => (int)round($span), 'limit' => $spanMin]];
+        }
+        return ['ok' => true];
+    }
+
+    /**
+     * 破例放行的记账，【单独记一条审计】。
+     *
+     * ★ 为什么不塞进 point_grant 的 detail 里就算了：
+     *   后台「审计」页是按 action 筛的。混在普通记账里的话，
+     *   想回答「这个月一共破了几次例、都是谁放的行」就得把当月
+     *   几千条 point_grant 全捞出来一条条看 detail —— 等于查不了。
+     *   单独一个 action 名，筛一下就是全部破例。
+     *   与 card_replace_forced 是同一套做法。
+     */
+    private function auditForced(array $gate, array $serials, array $operator, ?array $override): void
+    {
+        if (!($gate['forced'] ?? false)) {
+            return;
+        }
+        $this->audit->log('point_grant_forced', [
+            'target_type'   => 'order',
+            'target_id'     => implode(',', $serials),
+            'operator_id'   => $operator['id']   ?? null,
+            'operator_name' => $operator['name'] ?? null,
+            'device'        => $operator['device'] ?? null,
+            'detail'        => ['gates' => $gate['hit'], 'reason' => $override['reason'] ?? null],
+        ]);
+    }
+
+    /** 组号：短、可读、够用即可 —— 它只在本店本库里区分不同的合并操作 */
+    private function newGroupId(): string
+    {
+        return 'G' . date('ymdHis') . strtoupper(substr(bin2hex(random_bytes(2)), 0, 3));
+    }
+
+    /**
+     * 记账之后看一眼有没有值得留痕的形状 —— 【只告警，不拦】。
+     *
+     * ★ 这是唯一能管住内部人的东西。
+     *
+     *   上面那两道闸门都建立在「收银员是诚实的」之上，可员工本人就是
+     *   收银员，他要么有经理 PIN，要么干脆就是经理。对内部作案，
+     *   事前拦截在结构上就是无效的 —— 能做的只有让它留下痕迹，
+     *   并且让这个痕迹每周有人看一眼。
+     *
+     *   所以这里绝不返回错误、绝不影响记账结果，异常也吞掉：
+     *   风控的副作用不该把已经算好的积分弄回滚。
+     */
+    private function riskWatch(array $memberIds, array $operator): void
+    {
+        try {
+            $maxDay = $this->cfg->int('alert_grants_per_day', 0);
+            $maxSpan = $this->cfg->int('alert_span_hours', 0);
+            if ($maxDay <= 0 && $maxSpan <= 0) {
+                return;
+            }
+            [$from, $to] = $this->bizDay->range($this->bizDay->of(date('Y-m-d H:i:s')));
+
+            foreach (array_unique(array_filter($memberIds)) as $mid) {
+                $rows = $this->ledger->earnedInRange((int)$mid, $from, $to);
+                if (!$rows) { continue; }
+
+                $ops = [];
+                foreach ($rows as $r) {
+                    $ops[(string)($r['grant_group'] ?? '') !== '' ? 'g:' . $r['grant_group'] : 's:' . $r['serial_id']] = true;
+                }
+                $n = count($ops);
+                $card = $this->members->findById((int)$mid)['card_no'] ?? ('#' . $mid);
+
+                if ($maxDay > 0 && $n > $maxDay) {
+                    $this->alerts->raiseOnce('grant_many_per_day', 'member', (string)$mid,
+                        sprintf('卡 %s 今天已记账 %d 次（阈值 %d）——「同行分桌」算 1 次，'
+                              . '所以这是 %d 次分开的操作，值得核一下是不是同一位客人的消费',
+                                $card, $n, $maxDay, $n),
+                        ['severity' => 2, 'detail' => ['member_id' => (int)$mid, 'count' => $n,
+                            'operator' => $operator['name'] ?? null]]);
+                }
+
+                if ($maxSpan > 0 && count($rows) > 1) {
+                    $stamps = array_map(static fn(array $r): int => (int)strtotime((string)$r['order_end_time']), $rows);
+                    $spanH  = (max($stamps) - min($stamps)) / 3600;
+                    if ($spanH > $maxSpan) {
+                        $this->alerts->raiseOnce('grant_span_wide', 'member', (string)$mid,
+                            sprintf('卡 %s 今天记的几单，结账时间跨了 %.1f 小时（阈值 %d）——'
+                                  . '同一顿饭不会跨这么久，像是攒了一把小票一起来兑',
+                                    $card, $spanH, $maxSpan),
+                            ['severity' => 2, 'detail' => ['member_id' => (int)$mid,
+                                'span_hours' => round($spanH, 1), 'operator' => $operator['name'] ?? null]]);
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            // 风控只是观察者，坏了也不该影响记账
+            error_log('[riskWatch] ' . $e->getMessage());
+        }
     }
 
     // ════════════════════════════════════════════════════════
@@ -500,7 +848,17 @@ final class PointsService
      */
     public function reverse(int $ledgerId, string $reason, array $operator): array
     {
-        return $this->db->transaction(function () use ($ledgerId, $reason, $operator) {
+        return $this->db->transaction(fn(): array => $this->reverseInTx($ledgerId, $reason, $operator));
+    }
+
+    /**
+     * 撤销一条 —— 事务由调用方开。
+     *
+     * 抽出来是为了让 reverseGroup() 能在【同一个事务】里撤掉整组，
+     * 做到要么全撤要么全不撤。逻辑一行没改。
+     */
+    private function reverseInTx(int $ledgerId, string $reason, array $operator): array
+    {
             $orig = $this->ledger->lockById($ledgerId);
             if ($orig === null) {
                 return ['ok' => false, 'error' => 'ledger_not_found'];
@@ -562,6 +920,46 @@ final class PointsService
             ]);
 
             return ['ok' => true, 'reversal_id' => $revId];
+    }
+
+    /**
+     * 整组撤销 —— 一次多桌合并产出的几笔，一起撤掉。
+     *
+     * 为什么要单独有这个：合并是一次操作，撤销也该是一次操作。
+     * 让收银员逐条撤三笔，中间任何一步分神就留下一个撤了两桌、
+     * 剩一桌还挂着的会员 —— 而这种半成品账，事后没人看得懂。
+     *
+     * 逐条复用 reverse()：那里已经把「写反向流水、回退会员余额、
+     * 回退订单已分配额、标记原流水」四件事做全了，这里只是把它们
+     * 圈进同一个事务，要么全撤要么全不撤。
+     */
+    public function reverseGroup(string $group, string $reason, array $operator): array
+    {
+        $group = trim($group);
+        if ($group === '') {
+            return ['ok' => false, 'error' => 'bad_request'];
+        }
+        return $this->db->transaction(function () use ($group, $reason, $operator) {
+            $rows = $this->ledger->lockActiveByGroup($group);
+            if (!$rows) {
+                return ['ok' => false, 'error' => 'group_not_found'];
+            }
+            $ids = [];
+            foreach ($rows as $r) {
+                $one = $this->reverseInTx((int)$r['id'], $reason, $operator);
+                if (!($one['ok'] ?? false)) {
+                    return $one + ['detail' => ($one['detail'] ?? []) + ['ledger_id' => (int)$r['id']]];
+                }
+                $ids[] = $one['reversal_id'];
+            }
+            $this->audit->log('point_reverse_group', [
+                'target_type'   => 'grant_group', 'target_id' => $group,
+                'operator_id'   => $operator['id']   ?? null,
+                'operator_name' => $operator['name'] ?? null,
+                'device'        => $operator['device'] ?? null,
+                'detail'        => ['reason' => $reason, 'count' => count($ids), 'reversal_ids' => $ids],
+            ]);
+            return ['ok' => true, 'count' => count($ids), 'reversal_ids' => $ids];
         });
     }
 
