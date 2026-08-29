@@ -617,6 +617,7 @@ $api->on('GET', '/cards/batches', static function () use ($app, $requireManager)
             'serial_from' => (int)$b['serial_from'],
             'serial_to'   => (int)$b['serial_to'],
             'valid_to'    => $b['valid_to'],
+            'tier'        => $app->cardTiers()->describe($b['tier_code'] ?? null),
             'created_at'  => $b['created_at'],
         ], $app->cards()->batches()),
     ]);
@@ -660,8 +661,13 @@ $api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin)
         }
     }
 
+    $tier = Api::str($b, 'tier_code', '') ?: '';
+    if ($tier !== '' && !$app->cardTiers()->isUsable($tier)) {
+        Api::fail('bad_request', 400, ['hint' => '这个卡片等级不存在或已停用']);
+    }
+
     try {
-        $rows = $app->cards()->generateBatch($batch, $count, $validTo);
+        $rows = $app->cards()->generateBatch($batch, $count, $validTo, $tier !== '' ? $tier : null);
     } catch (\InvalidArgumentException $e) {
         Api::fail('bad_request', 400, ['hint' => $e->getMessage()]);
     }
@@ -670,6 +676,7 @@ $api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin)
         'target_type' => 'card_batch', 'target_id' => strtoupper(trim($batch)),
         'operator_id' => $op['id'], 'operator_name' => $op['name'],
         'detail' => ['count' => count($rows), 'valid_to' => $validTo,
+                     'tier_code' => $tier !== '' ? $tier : null,
                      'serial_from' => $rows[0]['serial'] ?? null,
                      'serial_to' => $rows[count($rows) - 1]['serial'] ?? null],
     ]);
@@ -678,11 +685,92 @@ $api->on('POST', '/cards/generate', static function () use ($app, $requireAdmin)
         'batch_no' => strtoupper(trim($batch)),
         'count'    => count($rows),
         'valid_to' => $validTo,
+        'tier'     => $app->cardTiers()->describe($tier !== '' ? $tier : null),
         'rows'     => $rows,
         'warning'  => '这份清单包含全部卡的明文 PIN，是一份总钥匙。'
                     . '库里只存不可还原的 hash，关掉窗口就再也取不回来。'
                     . '请立刻复制保存并交给印刷厂，印完销毁，不要留在邮箱或网盘里。',
     ]);
+});
+
+/* ── 卡片等级 ───────────────────────────────────────
+ *
+ * 等级属于【卡】不属于会员 —— 它印在卡面上，换卡时跟着新卡走。
+ * 整套是可选的：不定义等级，发卡时选「不分级」，界面上就不出现这件事。
+ */
+
+$api->on('GET', '/tiers', static function () use ($app, $requireManager): void {
+    $requireManager();
+    Api::ok(['tiers' => array_map(static fn(array $t): array => [
+        'code'       => $t['code'],
+        'name'       => $t['name'],
+        'name_es'    => $t['name_es'],
+        'multiplier' => (float)$t['points_multiplier'],
+        // null = 这一项跟随全局设置
+        'threshold_visits' => $t['threshold_visits'] !== null ? (int)$t['threshold_visits'] : null,
+        'threshold_amount' => $t['threshold_amount'],
+        // null = 跟随全局；0 = 永久有效（0 是有意义的取值，别当成「没设」）
+        'coupon_valid_days' => $t['coupon_valid_days'] !== null ? (int)$t['coupon_valid_days'] : null,
+        'sort_order' => (int)$t['sort_order'],
+        'enabled'    => (int)$t['enabled'] === 1,
+    ], $app->cardTiers()->all())]);
+});
+
+$api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin): void {
+    $op   = $requireAdmin();
+    $b    = Api::body();
+    $code = Api::str($b, 'code', '') ?: '';
+    $name = Api::str($b, 'name', '') ?: '';
+
+    // 门槛留空 = 跟随全局设置（只想优待金卡的店家只填金卡那一格就行）
+    $thV = Api::str($b, 'threshold_visits', '');
+    $thA = Api::str($b, 'threshold_amount', '');
+    // 券有效期同理：留空跟随全局，填 0 表示永久有效
+    $cvd = Api::str($b, 'coupon_valid_days', '');
+
+    if (!$app->cardTiers()->save(
+            $code, $name, Api::str($b, 'name_es', ''),
+            (float)($b['points_multiplier'] ?? 1.0),
+            Api::int($b, 'sort_order', 0),
+            (bool)($b['enabled'] ?? true),
+            ($thV === null || trim($thV) === '') ? null : (int)$thV,
+            ($thA === null || trim($thA) === '') ? null : $thA,
+            ($cvd === null || trim($cvd) === '') ? null : (int)$cvd)) {
+        Api::fail('bad_request', 400, [
+            'hint' => '标识只能用小写字母数字下划线（最多 20 位）；名称不能为空；'
+                    . '积分倍率需大于 0 且不超过 10；门槛留空表示跟随全局，填了就必须是正数；'
+                    . '券有效期留空表示跟随全局，填 0 表示永久有效，不能填负数',
+        ]);
+    }
+    $app->audit()->log('card_tier_save', [
+        'target_type' => 'card_tier', 'target_id' => strtolower(trim($code)),
+        'operator_id' => $op['id'], 'operator_name' => $op['name'],
+        'detail' => ['name' => $name, 'multiplier' => (float)($b['points_multiplier'] ?? 1.0),
+                     'threshold_visits' => $thV, 'threshold_amount' => $thA,
+                     'coupon_valid_days' => $cvd,
+                     'enabled' => (bool)($b['enabled'] ?? true)],
+    ]);
+    Api::ok(['saved' => true]);
+});
+
+$api->on('POST', '/tiers/delete', static function () use ($app, $requireAdmin): void {
+    $op   = $requireAdmin();
+    $code = Api::str(Api::body(), 'code', '') ?: '';
+    $r    = $app->cardTiers()->delete($code);
+    if (!$r['ok']) {
+        // 已经有卡在用的等级不给删 —— 删了那些卡就指向一个不存在的等级，
+        // 界面上显示不出等级名，而卡面上明明印着。要停用请用 enabled=0
+        Api::fail('bad_request', 400, [
+            'hint' => "已有 {$r['in_use']} 张卡在用这个等级，不能删除。"
+                    . '若不想再用，请把它「停用」—— 停用只是不再出现在发卡下拉框里，'
+                    . '已发出去的卡照常显示等级。',
+        ]);
+    }
+    $app->audit()->log('card_tier_delete', [
+        'target_type' => 'card_tier', 'target_id' => strtolower(trim($code)),
+        'operator_id' => $op['id'], 'operator_name' => $op['name'],
+    ]);
+    Api::ok(['deleted' => true]);
 });
 
 /** 查一张卡现在什么状态 —— 客人来问「我这卡还能用吗」时用 */
@@ -706,6 +794,7 @@ $api->on('POST', '/cards/lookup', static function () use ($app, $requireManager)
         'card_no'      => $app->cardNumber()->format((string)$card['card_no']),
         'serial'       => (int)$card['serial'],
         'batch_no'     => $card['batch_no'],
+        'tier'         => $app->cardTiers()->describe($card['tier_code'] ?? null),
         'valid_to'     => $card['valid_to'],
         'expired'      => \Vip\Repo\CardRepo::isExpired($card),
         'status'       => (int)$card['status'],

@@ -1425,6 +1425,235 @@ $g5 = $svc->replaceCard($hMid, $hb[0]['card_no'], '刚过期换卡', $clerk);
 ok($g5['ok'] && ($g5['forced'] ?? false) === false,
    '★ 还在宽限期内的卡，普通收银员照样能换，不用惊动经理');
 
+step('⑲ 卡片等级与积分倍率');
+
+/**
+ * 等级属于【卡】不属于会员 —— 它印在卡面上，换卡时跟着新卡走。
+ * 整套是可选的：不定义等级，一切照旧。
+ *
+ * 倍率叠在全局倍率之上，且【实际用了多少必须记进流水】——
+ * 倍率是活查的，不定格的话，改一次倍率历史就再也对不上账，
+ * 而「这单为什么给了 150 分」正是客人申诉时第一个要问的。
+ */
+$tiers = $app->cardTiers();
+
+ok($tiers->save('smokegold', '冒烟金卡', 'Oro de prueba', 2.0, 90, true), '建一个等级');
+$t = $tiers->find('smokegold');
+ok($t !== null, '查得到');
+eq('2.00', (string)$t['points_multiplier'], '倍率存下来了');
+
+ok(!$tiers->save('SmokeBad!', '名字', null, 1.0, 1, true), '★ 标识只允许小写字母数字下划线');
+ok(!$tiers->save('smokebad', '', null, 1.0, 1, true), '★ 名称不能为空');
+ok(!$tiers->save('smokebad', '名字', null, 0, 1, true), '★ 倍率不能是 0（消费了反而不给分）');
+ok(!$tiers->save('smokebad', '名字', null, -1, 1, true), '★ 倍率不能是负数');
+ok(!$tiers->save('smokebad', '名字', null, 99, 1, true), '★ 倍率有上限，防手滑多打个零');
+
+$d = $tiers->describe('smokegold');
+eq('冒烟金卡', $d['name'], '中文名');
+eq('Oro de prueba', $d['names']['es'], '西语名');
+eq(2.0, $d['multiplier'], '倍率也带出来');
+ok($tiers->describe(null) === null, '不分级返回 null —— 前端据此不显示等级那一栏');
+ok($tiers->describe('没这个等级') === null, '认不出的等级码也返回 null，不炸');
+
+// ── 发一批带等级的卡 ──
+$tb = $cards->generateBatch('SMOKETIER', 2, date('Y-m-d', strtotime('+2 years')), 'smokegold');
+eq('smokegold', $tb[0]['tier_code'], '★ 等级写进了卡（印刷清单也要有这一列）');
+$row = $cards->findByCardNo($tb[0]['card_no']);
+eq('smokegold', $row['tier_code'], '库里存下来了');
+
+// ── 倍率真的作用在积分上 ──
+$tr = $svc->bindNewMember($tb[0]['card_no'], null, null, null, $opStub);
+ok($tr['ok'], '这张金卡绑给一位会员');
+$goldMid = (int)$tr['member']['id'];
+
+$fm = $tiers->forMember($goldMid);
+eq('smokegold', $fm['code'], '★ 按会员查等级 —— 查的是他手里那张卡');
+eq(2.0, $fm['multiplier'], '倍率对');
+
+// 普通卡的会员作对照
+$pb = $cards->generateBatch('SMOKEPLAIN', 1, date('Y-m-d', strtotime('+2 years')));
+$pr = $svc->bindNewMember($pb[0]['card_no'], null, null, null, $opStub);
+$plainMid = (int)$pr['member']['id'];
+eq(null, $tiers->forMember($plainMid)['code'], '不分级的卡查出来是 null');
+eq(1.0, $tiers->forMember($plainMid)['multiplier'], '★ 不分级 = 1.00 倍，照常积分只是没有加成');
+
+// 同样金额，金卡应当拿到两倍
+$perEuro = $app->cfg()->float('points_per_euro', 1.0);
+$base    = \Vip\PointsEngine::pointsFor(5000, $perEuro, 1.0);
+$gold    = \Vip\PointsEngine::pointsFor(5000, $perEuro, 1.0 * 2.0);
+eq($base * 2, $gold, '★★ 同样 € 50，2 倍等级拿到两倍积分（' . $base . ' → ' . $gold . '）');
+
+// ── 换卡时等级跟着新卡走 ──
+$nb = $cards->generateBatch('SMOKETIER2', 1, date('Y-m-d', strtotime('+2 years')));
+$rp = $svc->replaceCard($goldMid, $nb[0]['card_no'], '换成不分级的卡', $opStub);
+ok($rp['ok'], '把金卡换成一张不分级的卡');
+eq(null, $tiers->forMember($goldMid)['code'],
+   '★★ 等级跟着新卡走 —— 换了不分级的卡，这位会员就不再是金卡');
+
+// ── 有卡在用的等级不给删 ──
+$tb2 = $cards->generateBatch('SMOKETIER3', 1, date('Y-m-d', strtotime('+2 years')), 'smokegold');
+$del = $tiers->delete('smokegold');
+ok(!$del['ok'] && $del['error'] === 'tier_in_use',
+   '★★ 已经有卡在用的等级不给删（删了那些卡就指向一个不存在的等级）');
+ok($del['in_use'] >= 1, '  └ 告诉调用方有几张在用：' . $del['in_use']);
+
+// 停用是允许的：只是不再出现在发卡下拉框里，老卡照常显示
+ok($tiers->save('smokegold', '冒烟金卡', 'Oro de prueba', 2.0, 90, false), '改成停用');
+ok(!$tiers->isUsable('smokegold'), '★ 停用后不能再用来发卡');
+ok($tiers->describe('smokegold') !== null, '★★ 但已发出去的卡照常显示等级名');
+ok(count($tiers->all(true)) < count($tiers->all(false)), '发卡下拉框里看不到停用的等级');
+
+// ── 按等级设不同的送 1 门槛 ──
+step('⑳ 按等级的奖励门槛（金卡 8 次送 1 次）');
+
+$rw = $app->rewards();
+$globalN = $app->cfg()->int('reward_threshold_visits', 10);
+ok($globalN > 0, "全局门槛是 {$globalN} 次");
+
+/**
+ * ⑲ 段最后把这位会员的金卡换成了不分级的卡（那一段验的就是「等级跟着卡走」）。
+ * 所以这里要先把他换回金卡，否则下面全在按不分级算 —— 一片红，
+ * 而原因跟产品毫无关系。
+ */
+$backR = $svc->replaceCard($goldMid, $tb2[0]['card_no'], '换回金卡', $opStub);
+ok($backR['ok'], '先把这位会员换回金卡（上一段把他换成不分级的了）');
+eq('smokegold', $tiers->forMember($goldMid)['code'], '  └ 确认他现在是金卡');
+
+// 门槛留空 = 跟随全局
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, null, null);
+$rNull = $rw->rule($tiers->forMember($goldMid));
+eq($globalN, $rNull['threshold_visits'], '★ 等级不设门槛时跟随全局 —— 只想优待金卡的店只填金卡那一格');
+
+// 给金卡设 8 次
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 8, null);
+$rGold = $rw->rule($tiers->forMember($goldMid));
+eq(8, $rGold['threshold_visits'], '★★ 金卡按 8 次算');
+eq($globalN, $rw->rule($tiers->forMember($plainMid))['threshold_visits'],
+   '★★ 不分级的会员仍按全局，互不影响');
+
+/**
+ * 达标判定一直是「floor(进度 / 阈值) − 已发张数」，不是「每次 +1」。
+ * 所以门槛一改数量会自动对上 —— 这正是改门槛安全的原因。
+ */
+$db->exec('UPDATE member SET visit_count = 8, rewards_issued = 0 WHERE store_code = ? AND id = ?',
+    [SMOKE_STORE, $goldMid]);
+$mg = $app->members()->findById($goldMid);
+$pg = $rw->progressOf($mg, $tiers->forMember($goldMid));
+eq(8, $pg['threshold'], '进度按金卡的 8 次算');
+eq(1, $pg['earned'],  '8 次 → 该发 1 张');
+eq(1, $pg['pending'], '还没发过，所以欠 1 张');
+eq('smokegold', $pg['tier_code'], '★ 进度里带着按的是哪个等级的门槛');
+
+// 同样 8 次，不分级的会员还差 2 次
+$db->exec('UPDATE member SET visit_count = 8, rewards_issued = 0 WHERE store_code = ? AND id = ?',
+    [SMOKE_STORE, $plainMid]);
+$pp = $rw->progressOf($app->members()->findById($plainMid), $tiers->forMember($plainMid));
+eq(0, $pp['earned'], '★★ 同样 8 次，不分级的还没达标（全局 ' . $globalN . ' 次）');
+
+// 真发一张，并确认券上定格了当时的等级与门槛
+$gr = $rw->checkAndGrant($goldMid, $opStub);
+eq(1, $gr['granted'], '★★ 金卡 8 次真的发出了 1 张券');
+$cp = $db->one('SELECT tier_code, threshold_used FROM coupon
+                 WHERE store_code = ? AND member_id = ? ORDER BY id DESC', [SMOKE_STORE, $goldMid]);
+eq('smokegold', $cp['tier_code'], '★★ 券上定格了发它时的等级');
+eq(8, (int)$cp['threshold_used'], '★★ 也定格了当时的门槛 —— 改门槛之后还答得出「凭什么发的」');
+
+/**
+ * 🔴 调高门槛【绝不能】把已经发出去的券收回来。
+ *    收回已给出去的东西是投诉的直接来源。
+ */
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 20, null);
+$pg2 = $rw->progressOf($app->members()->findById($goldMid), $tiers->forMember($goldMid));
+eq(0, $pg2['earned'],  '门槛调到 20 次后，按新门槛算 8 次还没达标');
+eq(0, $pg2['pending'], '★★ pending 取 max(0,…) —— 不会变成负数去追回已发的券');
+$still = (int)$db->value('SELECT COUNT(*) FROM coupon WHERE store_code = ? AND member_id = ? AND status = 1',
+    [SMOKE_STORE, $goldMid]);
+eq(1, $still, '★★ 已经发出去的那张券【原样还在】');
+
+// 调低则当场补发差额
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null);
+$gr2 = $rw->checkAndGrant($goldMid, $opStub);
+eq(1, $gr2['granted'], '★★ 门槛调到 4 次 → 8 次该发 2 张，当场补发差额 1 张');
+
+// 门槛的合法性
+ok(!$tiers->save('smokebad2', '名字', null, 1.0, 1, true, 0, null),
+   '★ 门槛不能是 0 次（每记一次账就发一张券，那不是优待，是把店送掉）');
+ok(!$tiers->save('smokebad2', '名字', null, 1.0, 1, true, -5, null), '★ 门槛不能是负数');
+ok(!$tiers->save('smokebad2', '名字', null, 1.0, 1, true, null, '-10'), '★ 满额门槛也不能是负数');
+ok($tiers->save('smokebad2', '名字', null, 1.0, 1, true, null, null), '两格都留空是合法的（跟随全局）');
+$db->exec('DELETE FROM card_tier WHERE store_code = ? AND code = ?', [SMOKE_STORE, 'smokebad2']);
+
+// ── 按等级设不同的券有效期 ──
+step('㉑ 按等级的券有效期（金卡的券多给一段时间）');
+
+/**
+ * 「金卡的券有效期长一点」是很自然的诉求，但它有一个容易踩的坑：
+ * 券的到期日是【发券当刻算好写死在券上】的，不是每次查询实时算的。
+ * 所以后台把这个设置一改，客人手上已经拿到的券【不会跟着变】——
+ * 券面上印的日子就是最终的日子。下面把这一点钉死。
+ */
+
+// 全局值从 rule() 自己拿 —— ConfigRepo 按实例缓存，直接读库或读另一个实例
+// 都可能和 $rw 眼里的值对不上，那样测的就不是同一件事了
+$globalDays = $rw->rule(null)['valid_days'];
+
+// ① 等级不设 = 跟随全局
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, null);
+eq($globalDays, $rw->rule($tiers->forMember($goldMid))['valid_days'],
+   '★ 等级不设券有效期时跟随全局（' . $globalDays . ' 天）');
+
+// ② 等级设了就按等级的
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, 7);
+eq(7, $rw->rule($tiers->forMember($goldMid))['valid_days'], '★★ 金卡的券按等级给 7 天');
+eq($globalDays, $rw->rule($tiers->forMember($plainMid))['valid_days'],
+   '  └ 不分级的卡不受影响，还是全局的 ' . $globalDays . ' 天');
+
+// ③ 真发一张，到期日按等级算
+$mc1 = $rw->grantManual($goldMid, '冒烟测试 · 按等级的券有效期', $opStub);
+ok($mc1['ok'], '发了一张手工券');
+eq(date('Y-m-d', strtotime('+7 days')), $mc1['coupon']['valid_to'],
+   '★★ 券上的到期日 = 发券当天 + 等级的 7 天');
+
+// ④ 改设置不动老券 —— 这是整段的重点
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, 30);
+$keep = $db->one('SELECT valid_to FROM coupon WHERE store_code = ? AND id = ?',
+                 [SMOKE_STORE, $mc1['coupon']['id']]);
+eq(date('Y-m-d', strtotime('+7 days')), (string)$keep['valid_to'],
+   '★★★ 把有效期改成 30 天后，【已经发出去的那张券还是 7 天】—— 券面上写的日子就是最终的日子');
+$mc2 = $rw->grantManual($goldMid, '冒烟测试 · 改完之后再发一张', $opStub);
+eq(date('Y-m-d', strtotime('+30 days')), $mc2['coupon']['valid_to'], '  └ 改完之后【新发的】才是 30 天');
+
+// ⑤ 0 = 永久有效（不是「没设置」，也不是「当天过期」）
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, 0);
+eq(0, $rw->rule($tiers->forMember($goldMid))['valid_days'], '★ 0 存得住，没被当成「留空」');
+$mc3 = $rw->grantManual($goldMid, '冒烟测试 · 永久有效', $opStub);
+eq(null, $mc3['coupon']['valid_to'], '★★ 0 天 = 永久有效（valid_to 存 NULL），不是当天就过期');
+
+// ⑥ 合法性
+ok(!$tiers->save('smokebad3', '名字', null, 1.0, 1, true, null, null, -1), '★ 券有效期不能是负数');
+ok($tiers->save('smokebad3', '名字', null, 1.0, 1, true, null, null, 0), '  └ 但 0 是合法的（永久）');
+ok($tiers->save('smokebad3', '名字', null, 1.0, 1, true, null, null, null), '  └ 留空也是合法的（跟随全局）');
+eq(null, $tiers->find('smokebad3')['coupon_valid_days'], '★ 留空存的是 NULL，不是 0 —— 两者含义完全不同');
+$db->exec('DELETE FROM card_tier WHERE store_code = ? AND code = ?', [SMOKE_STORE, 'smokebad3']);
+
+// 复位，免得影响后面
+$tiers->save('smokegold', '冒烟金卡', 'Oro', 2.0, 90, true, 4, null, null);
+
+// 规则文案也要按等级说
+$txtGold  = $rw->ruleText($tiers->forMember($goldMid));
+$txtPlain = $rw->ruleText($tiers->forMember($plainMid));
+ok(str_contains($txtGold, '4'), "★★ 规则文案按等级说：「{$txtGold}」");
+ok($txtGold !== $txtPlain, "  └ 与不分级的不同：「{$txtPlain}」");
+
+$db->exec('DELETE FROM coupon WHERE store_code = ? AND member_id IN (?,?)', [SMOKE_STORE, $goldMid, $plainMid]);
+
+// 清理
+$db->exec('DELETE FROM card WHERE store_code = ? AND batch_no LIKE ?', [SMOKE_STORE, 'SMOKETIER%']);
+$db->exec('DELETE FROM card WHERE store_code = ? AND batch_no = ?', [SMOKE_STORE, 'SMOKEPLAIN']);
+$db->exec('DELETE FROM point_ledger WHERE store_code = ? AND member_id IN (?,?)', [SMOKE_STORE, $goldMid, $plainMid]);
+$db->exec('DELETE FROM member WHERE store_code = ? AND id IN (?,?)', [SMOKE_STORE, $goldMid, $plainMid]);
+$db->exec('DELETE FROM card_tier WHERE store_code = ? AND code = ?', [SMOKE_STORE, 'smokegold']);
+
 step('⑱ 界面语言 —— 跟着账号走，不跟着平板走');
 
 /**

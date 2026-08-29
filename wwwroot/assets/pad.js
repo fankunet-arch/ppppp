@@ -1005,7 +1005,7 @@ async function doCardLookup(value) {
       const m = d.member;
       const soon = d.days_left !== null && d.days_left <= expiringSoonDays();
       $('#member-result').innerHTML = `
-        <div class="found"><b>${escapeHtml(m.card_no)}</b>
+        <div class="found"><b>${escapeHtml(m.card_no)}</b> ${tierBadge(d.tier)}
           <div class="muted small">${T('member.statsShort', { points: m.points_balance, visits: m.visit_count })}${
             d.valid_to ? ' · ' + T('card.validTo', { date: escapeHtml(d.valid_to) }) : ''}</div>
           ${soon ? `<div class="frozen">${T('card.soonInline', { days: d.days_left })}</div>` : ''}
@@ -1049,6 +1049,7 @@ async function doCardLookup(value) {
     S.pendingCard = d.card_no;
     $('#new-card-hint').innerHTML =
       T('card.notActive', { card: escapeHtml(d.card_no) })
+      + (d.tier ? '　' + tierBadge(d.tier) : '')
       + (d.valid_to ? `　<span class="muted">${T('card.validTo', { date: escapeHtml(d.valid_to) })}</span>` : '');
     $('#member-new').open = true;
     setTimeout(() => $('#btn-member-create').focus(), 50);
@@ -1389,6 +1390,25 @@ $('#btn-scan').onclick = () => launchScan('#member-err', (raw) => {
   return doCardLookup(raw);
 });
 
+/**
+ * 等级徽标。
+ *
+ * 倍率为 1 时【不显示倍率】—— 大多数卡都是 1 倍，全都标上只会变成噪音，
+ * 真正需要一眼看见的是「这张不一样」。
+ * 不分级（tier 为 null）时整个徽标不出现。
+ *
+ * 名字按当前语言取：服务端已经按 X-Lang 选好了 name，
+ * 但 names 两种都给了，切语言时不用重新请求。
+ */
+function tierBadge(tier) {
+  if (!tier) return '';
+  const name = (tier.names && tier.names[I18N.lang]) || tier.name || '';
+  if (!name) return '';
+  const x = Number(tier.multiplier);
+  const mult = (x && x !== 1) ? ` <span class="muted small">${escapeHtml(T('tier.multiplier', { x: x.toFixed(2).replace(/\.00$/, '') }))}</span>` : '';
+  return `<span class="tag">${escapeHtml(name)}</span>${mult}`;
+}
+
 /* ── 查一张卡：客人当面问「我这卡还能用吗」 ──────────
  *
  * 后台也有同样的功能，两个都留：客人问的是【服务员】，
@@ -1477,7 +1497,7 @@ function askVerdict(d) {
   lines.push(d.valid_to ? T('ask.validTo', { date: d.valid_to }) : T('ask.noExpiry'));
 
   return `
-    <div class="${cls}"><b>${escapeHtml(d.card_no)}</b>
+    <div class="${cls}"><b>${escapeHtml(d.card_no)}</b> ${tierBadge(d.tier)}
       <div style="margin:8px 0">${escapeHtml(headline)}</div>
       <div class="muted small">${lines.map(escapeHtml).join(' · ')}</div>
       ${m && m.progress ? `<div class="muted small">${escapeHtml(m.progress.text || '')}</div>` : ''}

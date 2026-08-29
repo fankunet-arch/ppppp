@@ -351,6 +351,7 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator)
             'state'      => 'expired',
             'card_no'    => $app->cardNumber()->format((string)$card['card_no']),
             'serial'     => (int)$card['serial'],
+            'tier'       => $app->cardTiers()->describe($card['tier_code'] ?? null),
             'valid_to'   => $card['valid_to'],
             'grace_over' => (bool)($r['grace_over'] ?? false),
             'member'     => $m === null ? null : [
@@ -370,6 +371,8 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator)
         'state'     => $r['state'],
         'card_no'   => $app->cardNumber()->format((string)$card['card_no']),
         'serial'    => (int)$card['serial'],
+        // 等级：客人扫卡时系统就知道这张卡什么级别。不分级时为 null
+        'tier'      => $app->cardTiers()->describe($card['tier_code'] ?? null),
         'valid_to'  => $card['valid_to'],
         // 发卡前要提醒收银员「这张快到期了」，判断在前端做，天数由后端算
         'days_left' => \Vip\Repo\CardRepo::daysLeft($card),
@@ -514,6 +517,8 @@ $api->on('POST', '/card/status', static function () use ($app, $requireOperator)
         'expired'     => \Vip\Repo\CardRepo::isExpired($card),
         'grace_over'  => \Vip\Repo\CardRepo::graceOver($card, $app->cardService()->graceMonths()),
         'void_reason' => $card['void_reason'],
+        // 等级：不分级时为 null，前端据此不显示这一栏
+        'tier'        => $app->cardTiers()->describe($card['tier_code'] ?? null),
     ];
 
     $m = $r['member'] ?? null;
@@ -527,7 +532,9 @@ $api->on('POST', '/card/status', static function () use ($app, $requireOperator)
             'coupons'        => count($app->rewards()->availableFor($mid)),
             'progress'       => $app->rewards()->progress($mid),
         ];
-        $out['rule'] = $app->rewards()->ruleText();
+        // 规则文案也要按【这位客人的等级】说 —— 金卡 8 次送 1 次时，
+        // 屏幕上却写着「每满 10 次」，服务员照着念就是错的
+        $out['rule'] = $app->rewards()->ruleText($app->cardTiers()->forMember($mid));
     }
     Api::ok($out);
 });
@@ -683,7 +690,8 @@ $api->on('POST', '/member/rewards', static function () use ($app, $requireOperat
         Api::fail('bad_request');
     }
     Api::ok([
-        'rule'      => $app->rewards()->ruleText(),
+        // 按这位会员的等级说 —— 他是金卡就该看到金卡的门槛
+        'rule'      => $app->rewards()->ruleText($app->cardTiers()->forMember($mid)),
         'progress'  => $app->rewards()->progress($mid),
         'available' => $app->rewards()->availableFor($mid),
     ]);

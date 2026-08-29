@@ -45,6 +45,7 @@ final class RewardService
         private MemberRepo $members,
         private AuditRepo  $audit,
         private CardRepo   $cards,
+        private \Vip\Repo\CardTierRepo $tiers,
     ) {
     }
 
@@ -53,20 +54,59 @@ final class RewardService
     // ════════════════════════════════════════════════════════
 
     /** 当前生效的奖励规则，同时供后台展示与 Pad 提示 */
-    public function rule(): array
+    /**
+     * 当前生效的奖励规则，同时供后台展示与 Pad 提示。
+     *
+     * @param array|null $tier 该会员的卡片等级（CardTierRepo::forMember 的结果）。
+     *                         给了就用它的门槛覆盖全局值；等级没设门槛（NULL）
+     *                         的那一项仍然跟随全局 —— 这样「只想优待金卡」的店家
+     *                         只填金卡那一格就行，其余等级不用动。
+     */
+    public function rule(?array $tier = null): array
     {
         $mode = $this->cfg->get('reward_mode', 'visits');
         if (!in_array($mode, ['visits', 'amount'], true)) {
             $mode = 'visits';
         }
+
+        $visits = max(1, $this->cfg->int('reward_threshold_visits', 10));
+        $cents  = max(1, Money::toCents($this->cfg->get('reward_threshold_amount', '300.00')));
+
+        if ($tier !== null) {
+            if (($tier['threshold_visits'] ?? null) !== null) {
+                $visits = max(1, (int)$tier['threshold_visits']);
+            }
+            if (($tier['threshold_amount'] ?? null) !== null) {
+                $cents = max(1, Money::toCents((string)$tier['threshold_amount']));
+            }
+        }
+
+        /**
+         * 券有效期同理：等级没设就跟随全局。
+         *
+         * 0 是有意义的取值（永久有效），所以判的是 !== null 而不是真值 ——
+         * 写成 `?: ` 的话金卡设成「永久」会被当成没设置。
+         */
+        $days = max(0, $this->cfg->int('coupon_valid_days', 90));
+        if ($tier !== null && ($tier['coupon_valid_days'] ?? null) !== null) {
+            $days = max(0, (int)$tier['coupon_valid_days']);
+        }
+
         return [
             'enabled'          => $this->cfg->get('reward_enabled', '1') === '1',
             'mode'             => $mode,
-            'threshold_visits' => max(1, $this->cfg->int('reward_threshold_visits', 10)),
-            'threshold_cents'  => max(1, Money::toCents($this->cfg->get('reward_threshold_amount', '300.00'))),
+            'threshold_visits' => $visits,
+            'threshold_cents'  => $cents,
             'auto_grant'       => $this->cfg->get('reward_auto_grant', '1') === '1',
-            'valid_days'       => max(0, $this->cfg->int('coupon_valid_days', 90)),
+            'valid_days'       => $days,
+            'tier_code'        => $tier['code'] ?? null,
         ];
+    }
+
+    /** 某会员当前该套用的规则 —— 按他手里那张卡的等级 */
+    public function ruleForMember(int $memberId): array
+    {
+        return $this->rule($this->tiers->forMember($memberId));
     }
 
     /**
@@ -78,9 +118,9 @@ final class RewardService
      *   前端再存一份必然漂移，而漂移的表现是西语界面里冒出一句中文。
      *   （真发生过：「查一张卡」上线时，进度那句就是中文漏进西语界面的。）
      */
-    public function ruleText(): string
+    public function ruleText(?array $tier = null): string
     {
-        $r  = $this->rule();
+        $r  = $this->rule($tier);
         $es = \Vip\Http\Api::lang() === \Vip\Lang::ES;
 
         if (!$r['enabled']) {
@@ -111,15 +151,20 @@ final class RewardService
         $m = $this->members->findById($memberId);
         if ($m === null) {
             return ['mode' => 'visits', 'progress' => 0, 'threshold' => 1, 'issued' => 0,
-                    'earned' => 0, 'pending' => 0, 'remain' => 0, 'text' => ''];
+                    'earned' => 0, 'pending' => 0, 'remain' => 0, 'text' => '', 'tier_code' => null];
         }
-        return $this->progressOf($m);
+        return $this->progressOf($m, $this->tiers->forMember($memberId));
     }
 
-    /** 同上，但直接吃一行 member，省一次查询 */
-    public function progressOf(array $m): array
+    /**
+     * 同上，但直接吃一行 member，省一次查询。
+     *
+     * @param array|null $tier 不给就退回全局规则 —— 调用方拿得到等级时应当传进来，
+     *                         否则金卡客人会按普卡的门槛算进度，界面上就骗人了
+     */
+    public function progressOf(array $m, ?array $tier = null): array
     {
-        $r      = $this->rule();
+        $r      = $this->rule($tier);
         $issued = (int)($m['rewards_issued'] ?? 0);
 
         if ($r['mode'] === 'amount') {
@@ -143,6 +188,8 @@ final class RewardService
             'earned'    => $earned,
             'pending'   => $pending,
             'remain'    => $remain,
+            // 记下按的是哪个等级的门槛 —— 界面上要说清楚「你是金卡，8 次就送」
+            'tier_code' => $r['tier_code'] ?? null,
             // 同 ruleText()：服务端生成的句子，按当前请求的语言出
             'text'      => self::progressText($r['mode'], $progress, $threshold, $remain),
         ];
@@ -174,7 +221,10 @@ final class RewardService
      */
     public function checkAndGrant(int $memberId, array $operator = []): array
     {
-        $r = $this->rule();
+        // 按【这位客人手里那张卡】的等级取规则：金卡 8 次送 1 次时，
+        // 用全局的 10 次去算就等于等级白设了
+        $tier = $this->tiers->forMember($memberId);
+        $r    = $this->rule($tier);
         if (!$r['enabled']) {
             return ['granted' => 0, 'pending' => 0, 'coupons' => []];
         }
@@ -183,7 +233,7 @@ final class RewardService
         if ($m === null) {
             return ['granted' => 0, 'pending' => 0, 'coupons' => []];
         }
-        $p = $this->progressOf($m);
+        $p = $this->progressOf($m, $tier);
         if ($p['pending'] <= 0) {
             return ['granted' => 0, 'pending' => 0, 'coupons' => []];
         }
@@ -200,7 +250,11 @@ final class RewardService
                 $p['progress'],
                 $r['valid_days'],
                 null,
-                $operator
+                $operator,
+                // 门槛是活查的 —— 券上不定格的话，改一次门槛就再也说不清
+                // 「这张券当初凭什么发的」。客人申诉、会计对账都要看它
+                $tier['code'] ?? null,
+                $p['threshold']
             );
         }
         $this->db->exec(
@@ -222,7 +276,8 @@ final class RewardService
             return ['ok' => false, 'error' => 'member_not_found'];
         }
         $c = $this->issue($memberId, self::SRC_MANUAL, 0,
-            $this->rule()['valid_days'], $note, $operator);
+            $this->rule($tierForManual = $this->tiers->forMember($memberId))['valid_days'],
+            $note, $operator, $tierForManual['code'] ?? null, null);
         // 手工发的不计入 rewards_issued —— 否则会顶掉客人靠消费挣来的那张
         return ['ok' => true, 'coupon' => $c];
     }
@@ -240,8 +295,16 @@ final class RewardService
      *   别把它「优化」成按当前配置实时计算 —— 那会让老客人的券凭空缩水或延长。
      *   tests/cases/SchemaCompatTest.php 有断言守着。
      */
+    /**
+     * @param string|null $tierCode  发券时这张卡的等级
+     * @param int|null    $threshold 发券时实际套用的门槛
+     *
+     * 后两个参数是【为了事后能解释】：门槛与倍率都是活查的，改一次之后
+     * 「这张券当初凭什么发的」就再也答不上来。客人申诉、会计对账都要看它。
+     */
     private function issue(int $memberId, int $source, int $progress,
-                           int $validDays, ?string $note, array $operator): array
+                           int $validDays, ?string $note, array $operator,
+                           ?string $tierCode = null, ?int $threshold = null): array
     {
         $now  = $this->db->now();
         $code = strtoupper(bin2hex(random_bytes(4)));   // 8 位，够短能口头核对
@@ -253,9 +316,11 @@ final class RewardService
         $this->db->exec(
             'INSERT INTO coupon
                (store_code, member_id, coupon_type, source, amount_cents, progress_at_grant,
+                tier_code, threshold_used,
                 note, code, status, valid_from, valid_to, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             [$this->storeCode, $memberId, 1, $source, 0, $progress,
+             $tierCode, $threshold,
              $note, $code, self::ST_ACTIVE, date('Y-m-d', strtotime($now)), $to, $now]
         );
         $id = $this->db->lastInsertId();
@@ -265,7 +330,8 @@ final class RewardService
             'operator_id'   => $operator['id']   ?? null,
             'operator_name' => $operator['name'] ?? null,
             'detail' => ['member_id' => $memberId, 'code' => $code,
-                         'source' => $source, 'valid_to' => $to, 'note' => $note],
+                         'source' => $source, 'valid_to' => $to, 'note' => $note,
+                         'tier_code' => $tierCode, 'threshold_used' => $threshold],
         ]);
 
         return ['id' => $id, 'code' => $code, 'valid_to' => $to, 'source' => $source];

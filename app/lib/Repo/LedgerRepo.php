@@ -43,9 +43,10 @@ final class LedgerRepo
                (store_code, member_id, serial_id, entry_type, amount, points, counted_visit,
                 portions_counted, portions_uncounted, excluded_amount,
                 alloc_mode, alloc_detail, status, reverses_id,
+                tier_code, tier_multiplier,
                 source, manual_reason, review_status, approved_by,
                 operator_id, operator_name, device, reason, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             [
                 $this->storeCode,
                 $e['member_id'],
@@ -61,6 +62,10 @@ final class LedgerRepo
                 isset($e['alloc_detail']) ? json_encode($e['alloc_detail'], JSON_UNESCAPED_UNICODE) : null,
                 $e['status'] ?? self::S_ACTIVE,
                 $e['reverses_id'] ?? null,
+                // 入账时那张卡的等级与实际套用的倍率。倍率是活查的，
+                // 不在流水里定格的话，改一次倍率历史就再也对不上账
+                $e['tier_code'] ?? null,
+                isset($e['tier_multiplier']) ? number_format((float)$e['tier_multiplier'], 2, '.', '') : null,
                 $e['source'] ?? self::SRC_POS,
                 $e['manual_reason'] ?? null,
                 $e['review_status'] ?? 0,

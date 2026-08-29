@@ -91,15 +91,18 @@ await page.waitForSelector('#card-gen-result:not([hidden])', { timeout: 5000 });
 const csv = await page.locator('#card-gen-csv').inputValue();
 const lines = csv.trim().split('\n');
 ok(lines.length === 6, `清单含表头 + 5 行（实得 ${lines.length}）`);
-ok(lines[0] === '卡号\t二维码内容\tPIN\t有效期至',
-   '表头是四列，制表符分隔（可直接粘进 Excel）');
+ok(lines[0] === '卡号\t二维码内容\tPIN\t有效期至\t等级',
+   '表头是五列，制表符分隔（可直接粘进 Excel）');
 
-const [display, qr, pin, validCol] = lines[1].split('\t');
+const [display, qr, pin, validCol, tierCol] = lines[1].split('\t');
 ok(/^TK-\d{8}-[0-9A-Z]{3}$/.test(display), `卡号是印刷分组形式（${display}）`);
 ok(qr === display.replace(/-/g, ''), '二维码内容是去掉连字符的纯卡号');
 ok(/^\d{6}$/.test(pin), `PIN 是 6 位数字（${pin}）`);
 ok(validCol === VALID_TO, '★ 清单里每一行都带着有效期 —— 印刷稿按这一列排版');
 ok(lines.slice(1).every(l => l.split('\t')[3] === VALID_TO), '整批 5 张的有效期一致');
+// 这一批没选等级 —— 等级列该是空的，而不是「不分级」三个字：
+// 印刷厂拿到的是排版依据，空就是空，别让他们照着印上去
+ok(tierCol === '', '★ 没选等级时那一列是空的（印刷厂按这一列排版，别印上多余的字）');
 
 const pins = lines.slice(1).map(l => l.split('\t')[2]);
 ok(new Set(pins).size === pins.length, '5 张卡的 PIN 互不相同');

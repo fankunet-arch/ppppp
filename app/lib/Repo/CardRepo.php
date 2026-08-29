@@ -101,8 +101,18 @@ final class CardRepo
      *                             必须与卡面印刷的日期一致 —— 卡面是唯一的
      *                             告知证据，两边不一致就等于没告知。
      */
-    public function generateBatch(string $batchNo, int $count, ?string $validTo = null): array
-    {
+    /**
+     * @param string|null $tierCode 卡片等级（普卡/银卡/金卡…）。
+     *                              NULL = 不分级。等级属于卡不属于会员 ——
+     *                              它印在卡面上，换卡时跟着新卡走。
+     *                              合法性由调用方校验（CardTierRepo::isUsable）。
+     */
+    public function generateBatch(
+        string $batchNo,
+        int $count,
+        ?string $validTo = null,
+        ?string $tierCode = null,
+    ): array {
         $batchNo = strtoupper(trim($batchNo));
         if (!preg_match('/^[A-Z0-9_-]{1,32}$/', $batchNo)) {
             throw new \InvalidArgumentException('批次号只能是字母数字与 - _，最多 32 位');
@@ -127,11 +137,13 @@ final class CardRepo
             $validTo = null;
         }
 
+        $tierCode = ($tierCode !== null && trim($tierCode) !== '') ? trim($tierCode) : null;
+
         $now   = $this->db->now();
         $start = $this->nextSerial();
         $out   = [];
 
-        $this->db->transaction(function () use ($batchNo, $count, $now, $start, $validTo, &$out): void {
+        $this->db->transaction(function () use ($batchNo, $count, $now, $start, $validTo, $tierCode, &$out): void {
             for ($i = 0; $i < $count; $i++) {
                 $serial = $start + $i;
                 // 后缀随机，理论上可能与同一顺序号的历史值重复，但顺序号本身
@@ -141,19 +153,20 @@ final class CardRepo
 
                 $this->db->exec(
                     'INSERT INTO card
-                       (store_code, card_no, serial, batch_no, valid_to, status,
+                       (store_code, card_no, serial, batch_no, tier_code, valid_to, status,
                         pin_hash, created_at, updated_at)
-                     VALUES (?,?,?,?,?,?,?,?,?)',
-                    [$this->storeCode, $no, $serial, $batchNo, $validTo, self::STATUS_STOCK,
+                     VALUES (?,?,?,?,?,?,?,?,?,?)',
+                    [$this->storeCode, $no, $serial, $batchNo, $tierCode, $validTo, self::STATUS_STOCK,
                      password_hash($pin, PASSWORD_BCRYPT), $now, $now]
                 );
 
                 $out[] = [
-                    'serial'   => $serial,
-                    'card_no'  => $no,
-                    'display'  => $this->cardNo->format($no),
-                    'pin'      => $pin,
-                    'valid_to' => $validTo,
+                    'serial'    => $serial,
+                    'card_no'   => $no,
+                    'display'   => $this->cardNo->format($no),
+                    'pin'       => $pin,
+                    'valid_to'  => $validTo,
+                    'tier_code' => $tierCode,
                 ];
             }
         });
@@ -191,7 +204,9 @@ final class CardRepo
                     MIN(serial)                                     AS serial_from,
                     MAX(serial)                                     AS serial_to,
                     MIN(created_at)                                 AS created_at,
-                    MAX(valid_to)                                   AS valid_to
+                    MAX(valid_to)                                   AS valid_to,
+                    -- 一个批次同一个等级（整批一起印的），MAX 只是为了能进 GROUP BY
+                    MAX(tier_code)                                  AS tier_code
                FROM card
               WHERE store_code = ?
            GROUP BY batch_no
