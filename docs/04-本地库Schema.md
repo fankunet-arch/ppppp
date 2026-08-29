@@ -35,14 +35,20 @@ CREATE TABLE `pos_order` (
   `business_date`     DATE         NOT NULL           COMMENT '营业日，按餐期规则计算，非 serial_id 前6位',
 
   -- 金额快照（发分时刻）
+  `original_amount`   DECIMAL(11,2) NOT NULL DEFAULT 0    COMMENT '折扣前金额；订单级折扣要按它做分母等比扣除（01 §3.3.1）',
   `should_amount`     DECIMAL(11,2) NOT NULL DEFAULT 0,
   `actual_amount`     DECIMAL(11,2) NOT NULL DEFAULT 0,
   `tax_amount`        DECIMAL(11,2) NOT NULL DEFAULT 0    COMMENT 'POS 税额快照；points_include_tax=0 时据此折算不含税价',
   `total_amount`      DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '可积分总额 = LEAST(should, actual)',
   `allocated_amount`  DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '已分配金额',
+  `allocated_portions` SMALLINT     NOT NULL DEFAULT 0 COMMENT '已分配份数，与金额一样受守恒约束',
 
   -- 状态
   `is_free_meal`      TINYINT      NOT NULL DEFAULT 0 COMMENT '1=10送1 免费餐，不计次',
+  -- 十送一核销（见 03 §6）。要区分「整单免」与「混合单」：
+  -- portions_counted 是净份数，为 0 才是整桌都兑换来的
+  `is_redeemed`       TINYINT      NOT NULL DEFAULT 0 COMMENT '1=这一单里打了核销折扣行',
+  `redeem_amount`     DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '核销折扣额，用它反推抵掉了几份',
   `alloc_status`      TINYINT      NOT NULL DEFAULT 0 COMMENT '0=未分配 1=部分分配 2=已全额分配',
   `verify_status`     TINYINT      NOT NULL DEFAULT 0 COMMENT '0=保护期内 1=已核对一致 2=已冲正 3=待人工复核',
   `last_verified_at`  DATETIME     DEFAULT NULL       COMMENT '最近一次值比对时间',
@@ -88,6 +94,14 @@ CREATE TABLE `member` (
   `level_id`       INT DEFAULT NULL,
   `level_since`    DATE DEFAULT NULL,
 
+  -- 现场确认码（见 09 §八）。不用「点链接确认」是因为那需要一个公网可达的
+  -- 端点接收点击，而门店网络是单向的 —— 只发一个 6 位码，客人当场报给收银员
+  `consent_code_hash`    VARCHAR(255) DEFAULT NULL COMMENT '确认码的 hash，明文不落库',
+  `consent_code_sent_at` DATETIME DEFAULT NULL,
+  `consent_code_expires` DATETIME DEFAULT NULL,
+  `consent_code_fail`    TINYINT NOT NULL DEFAULT 0 COMMENT '连续输错次数，超限需重发',
+  `consent_channel`      VARCHAR(10) DEFAULT NULL   COMMENT 'sms / mail，码是从哪条路发出去的',
+
   `created_at`     DATETIME NOT NULL,
   `updated_at`     DATETIME NOT NULL,
 
@@ -129,6 +143,13 @@ CREATE TABLE `point_ledger` (
   -- AA 记账方式
   `alloc_mode`      TINYINT DEFAULT NULL             COMMENT '1=整单 2=均摊AA 3=点选菜品',
   `alloc_detail`    TEXT DEFAULT NULL                COMMENT '模式3时记录认领的 menu_item 明细快照（JSON）',
+  -- 多桌合并（同行分桌，见 03 §12.2）。NULL = 单桌记账，老流水全是这个
+  `grant_group`     CHAR(16) DEFAULT NULL            COMMENT '同一次多桌合并产出的几笔共用一个值',
+
+  -- 入账时那张卡的等级与【实际套用的】倍率（见 09 §10.3）
+  -- 倍率是活查的，不在流水里定格的话，改一次倍率历史就再也对不上账
+  `tier_code`       VARCHAR(20) DEFAULT NULL         COMMENT '当时的卡片等级码',
+  `tier_multiplier` DECIMAL(4,2) DEFAULT NULL        COMMENT '当时实际套用的等级倍率',
 
   -- 撤销链
   `status`          TINYINT NOT NULL DEFAULT 1       COMMENT '1=有效 2=已被撤销',
@@ -152,9 +173,14 @@ CREATE TABLE `point_ledger` (
   KEY `idx_member`  (`store_code`,`member_id`,`created_at`),
   KEY `idx_order`   (`store_code`,`serial_id`),
   KEY `idx_reverse` (`reverses_id`),
-  KEY `idx_review`  (`store_code`,`review_status`,`created_at`)   -- 待复核队列
+  KEY `idx_review`  (`store_code`,`review_status`,`created_at`),  -- 待复核队列
+  KEY `idx_group`   (`store_code`,`grant_group`)                  -- 整组撤销 / 风控计数
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
+
+> 🔴 **`counted_visit` 怎么算，取决于 `visit_count_mode`。**
+> 现行默认是「一张卡一个餐期最多 1 次」，见 §4.2 与 `03` §13。
+> 这一列存的是**当时算出来的结果**，改口径不会重算历史。
 
 ### 4.0 手工录入流水（降级路径）
 
@@ -185,15 +211,22 @@ id=102  member=A  serial_id=2608130080  entry_type=2  amount=-53.70  points=-53 
 
 `member.visit_count = SUM(point_ledger.counted_visit WHERE status=1)`
 
-**默认口径 `by_portion`**：`counted_visit` = 该会员认领的、`meal_item_rule.counts_visit = 1` 的菜品的 **`SUM(quantity)`**（见 `03` §3.2）。
+**默认口径 `once_per_period`**：**一张卡，一个餐期，最多计 1 次**，
+不管这一单给他分了几份套餐（完整规则见 `03` §13）。
 
-| 场景 | `portions_counted` | `portions_uncounted` | `counted_visit` |
+`portions_counted` 仍然照实存该会员认领的、`meal_item_rule.counts_visit = 1`
+的菜品的 `SUM(quantity)` —— 它是快照，不因口径而变；变的只是
+`counted_visit` 怎么由它算出来。
+
+| 场景 | `portions_counted` | `counted_visit`（现行 `once_per_period`） | 旧口径 `by_portion` |
 |---|---|---|---|
-| 整单记一人，3 份 INFINITY | 3 | 0 | **3** |
-| AA 3 人，各 1 份 INFINITY | 1（每人） | 0 | **1**（每人） |
-| AA 3 人，2 份 INFINITY + 1 份 DEL DIA | 1/1/0 | 0/0/1 | **1 / 1 / 0** |
-| 儿童同行（后台关闭儿童计次） | 2 份成人 | 1 份儿童 | **2** |
-| 只点单品无套餐 | 0 | 0 | **0**（金额照常积分） |
+| 整单记一人，3 份 INFINITY | 3 | **1** | 3 |
+| 一桌 10 人 10 份，1 张卡 | 10 | **1** | 10 ⚠️ |
+| AA 3 人，各 1 份 INFINITY | 1（每人） | **1**（每人） | 1（每人） |
+| AA 3 人，2 份 INFINITY + 1 份 DEL DIA | 1/1/0 | **1 / 1 / 0** | 1 / 1 / 0 |
+| 同一餐期该卡第二次记账 | 2 | **0**（积分照给） | 2 |
+| 同一天换个餐期再来 | 2 | **1** | 2 |
+| 只点单品无套餐 | 0 | **0**（金额照常积分） | 0 |
 
 `portions_counted` / `portions_uncounted` 为快照字段，用于事后审计与口径切换时的重算。
 
@@ -206,7 +239,14 @@ id=102  member=A  serial_id=2608130080  entry_type=2  amount=-53.70  points=-53 
 举例：一桌 4 份、券抵 1 份 → 本字段存 **3**，明细里的 4 份不再出现在本表。
 需要原始份数时看 POS 明细，或看 locate 返回的 `portions_total`。
 
-> 📌 **已确认采用 `by_portion`**：整单记一人时 3 份套餐 = +3 次，3 人同行来 4 次即可换 1 份免费餐，此商业影响已知悉并接受。备用口径 `by_ledger`（每笔流水最多 1 次）保留在配置中，`portions_counted` 快照支持切换后重算历史数据。
+> 📌 **2026-08 换过口径。** 原为 `by_portion`（吃 10 份套餐送 1 份），
+> 现为 `once_per_period`（来 10 趟送 1 次）。起因是防刷：
+> 旧口径下一张 10 人的小票一次顶 10 次计次，捡到一张就直接换一顿饭。
+> 理由、影响与必须跟着改的店内告示见 **`03` §13**。
+>
+> 三种口径都保留在配置里（`once_per_period` / `by_portion` / `by_order`），
+> `portions_counted` 快照支持切换后重算历史数据。
+> **切换口径不重算已有流水** —— 每笔的 `counted_visit` 是当时定格的。
 
 ## 5. 卡券表 `coupon`
 
@@ -219,6 +259,10 @@ CREATE TABLE `coupon` (
   `source`        TINYINT NOT NULL DEFAULT 1    COMMENT '1=满次自动 2=满额自动 3=后台手工',
   `amount_cents`  INT NOT NULL DEFAULT 0        COMMENT '面额（分）；0=免一份套餐，按核销时实际套餐价抵扣',
   `progress_at_grant` INT NOT NULL DEFAULT 0    COMMENT '发放时的进度快照，便于对账与申诉',
+  -- 发券当刻定格的等级与门槛（见 09 §10.6）。门槛是活查的，
+  -- 不定格的话改一次之后「这张券当初凭什么发的」就再也答不上来
+  `tier_code`     VARCHAR(20) DEFAULT NULL      COMMENT '发券时该会员那张卡的等级',
+  `threshold_used` INT DEFAULT NULL             COMMENT '发券时实际套用的门槛（次数或分）',
   `note`          VARCHAR(200) DEFAULT NULL     COMMENT '手工发放的原因',
   `code`          VARCHAR(40) NOT NULL,
   `status`        TINYINT NOT NULL DEFAULT 1    COMMENT '1=未使用 2=已核销 3=已过期 4=已作废',
@@ -268,6 +312,164 @@ CREATE TABLE `coupon` (
 `expireStale()` 在每次查券时顺手把 `valid_to < 今天` 的置为已过期。
 不单开 Cron 任务 —— 券的过期不需要即时性，查的时候顺带处理即可。
 
+## 5bis. 实体卡 `card` 与卡片等级 `card_tier`
+
+> 概念、发卡流程、有效期与告知见 [`09-实体卡.md`](./09-实体卡.md) 与
+> [`11-卡片有效期与告知.md`](./11-卡片有效期与告知.md)。这里只列结构。
+
+```sql
+CREATE TABLE `card` (
+  `id`           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `store_code`   VARCHAR(20) NOT NULL,
+  `card_no`      VARCHAR(32) NOT NULL  COMMENT '完整卡号，二维码内容与卡面印刷一致',
+  `serial`       INT UNSIGNED NOT NULL COMMENT '顺序号，印刷与盘点用',
+  `batch_no`     VARCHAR(32) NOT NULL  COMMENT '印刷批次，如 B20260822',
+
+  `status`       TINYINT NOT NULL DEFAULT 0
+                 COMMENT '0=库存中未激活 1=已激活绑定会员 2=已作废/挂失',
+  `member_id`    BIGINT UNSIGNED DEFAULT NULL,
+
+  -- 卡背刮开层下的 PIN。明文只出现在给印刷厂的清单里（印完即销毁），
+  -- 库里只存 hash。二维码印在正面可被拍照，PIN 藏在刮层下 ——
+  -- 抄了码的人不知道 PIN，所以兑换免费餐时验它
+  `pin_hash`     VARCHAR(255) DEFAULT NULL COMMENT 'password_hash() 结果，绝不存明文',
+  `pin_fail`     INT NOT NULL DEFAULT 0,
+  `pin_locked_until` DATETIME DEFAULT NULL,
+
+  -- 有效期（migration 008）。🔴 必须与卡面印刷的日期完全一致 ——
+  -- 客人查不到任何线上信息，卡面那行日期就是唯一的告知证据
+  `valid_to`     DATE DEFAULT NULL     COMMENT '卡面印的有效期至',
+  `points_cleared_at` DATETIME DEFAULT NULL COMMENT '超宽限期后清分的时间（预留，尚无定时任务）',
+
+  -- 卡片等级（migration 011）。等级属于【卡】不属于会员 —— 它印在卡面上，
+  -- 换卡时跟着新卡走。挂在会员上会出现「卡面印银卡、系统说金卡」的错位
+  `tier_code`    VARCHAR(20) DEFAULT NULL COMMENT '关联 card_tier.code；NULL = 不分级',
+
+  `activated_at` DATETIME DEFAULT NULL,
+  `activated_by` INT DEFAULT NULL,
+  `voided_at`    DATETIME DEFAULT NULL,
+  `void_reason`  VARCHAR(190) DEFAULT NULL,
+  `created_at`   DATETIME NOT NULL,
+  `updated_at`   DATETIME NOT NULL,
+
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_card`   (`store_code`,`card_no`),
+  UNIQUE KEY `uk_serial` (`store_code`,`serial`),
+  UNIQUE KEY `uk_member` (`store_code`,`member_id`)   -- ★ 一人一卡，数据库层保证
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> ★ `uk_member` 是**一人一卡**的硬保证。挂失换卡时必须**先清空旧卡的
+> `member_id` 再绑新卡**，顺序反了会撞这条唯一键。历史留在 `audit_log` 里。
+
+```sql
+CREATE TABLE `card_tier` (
+  `store_code`  VARCHAR(20) NOT NULL,
+  `code`        VARCHAR(20) NOT NULL COMMENT '机器用的标识，如 std/silver/gold；定了就别改',
+  `name`        VARCHAR(40) NOT NULL COMMENT '中文名，如「银卡」',
+  `name_es`     VARCHAR(40) DEFAULT NULL COMMENT '西语名；为空则回落中文名',
+  `sort_order`  INT NOT NULL DEFAULT 0,
+  `points_multiplier` DECIMAL(4,2) NOT NULL DEFAULT 1.00
+                COMMENT '叠在全局倍率之上：积分 = 金额 × 每欧元分数 × 全局倍率 × 本等级倍率',
+
+  -- 按等级的奖励门槛（migration 012）。NULL = 跟随「奖励规则」里的全局设置，
+  -- 只想优待金卡的店只填金卡那一格就行
+  `threshold_visits` INT DEFAULT NULL           COMMENT '几次送 1 次；NULL=跟随全局',
+  `threshold_amount` DECIMAL(11,2) DEFAULT NULL COMMENT '满额送 1 次；NULL=跟随全局',
+  -- 按等级的券有效期（migration 013）。NULL=跟随全局，0=永久有效
+  `coupon_valid_days` INT DEFAULT NULL          COMMENT '★ NULL 与 0 含义完全不同',
+
+  `enabled`     TINYINT NOT NULL DEFAULT 1 COMMENT '停用只是不再出现在发卡下拉框里，老卡照常显示',
+  `created_at`  DATETIME NOT NULL,
+  `updated_at`  DATETIME NOT NULL,
+
+  PRIMARY KEY (`store_code`,`code`),
+  KEY `idx_sort` (`store_code`,`sort_order`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> 🔴 **`coupon_valid_days`：`NULL` ≠ `0`。** NULL 表示跟随全局，0 表示永久有效。
+> 代码里判的一律是 `!== null` 而不是真值 —— 写成 `?:` 的话「永久」会被
+> 当成「没设置」。详见 [`09`](./09-实体卡.md) §10.7。
+
+## 5ter. 操作员 `operator` 与告警 `alert`
+
+```sql
+CREATE TABLE `operator` (
+  `id`            INT NOT NULL AUTO_INCREMENT,
+  `store_code`    VARCHAR(20) NOT NULL,
+  `login_name`    VARCHAR(40) NOT NULL COMMENT '工号',
+  `display_name`  VARCHAR(40) NOT NULL COMMENT '中文显示名',
+  -- 西语显示名（migration 010）。为空则在西语界面回落中文名，
+  -- 否则顶栏会中西混排
+  `display_name_es` VARCHAR(40) DEFAULT NULL,
+  `pin_hash`      VARCHAR(255) NOT NULL COMMENT 'password_hash()，绝不存明文',
+  `role`          TINYINT NOT NULL DEFAULT 1 COMMENT '1=服务员 2=经理 3=管理员',
+  -- 界面语言（migration 009）。★ 记在【账号】上不是记在平板上：
+  -- 收银台的平板是共用的，中文和西语的员工换班轮着用同一台。
+  -- NULL = 这个账号还没选过，跟随后台的 default_lang
+  `lang`          VARCHAR(5) DEFAULT NULL,
+  `failed_count`  INT NOT NULL DEFAULT 0 COMMENT '连续登录失败次数',
+  `locked_until`  DATETIME DEFAULT NULL  COMMENT '锁定截止（防 4 位 PIN 被枚举）',
+  `last_login_at` DATETIME DEFAULT NULL,
+  `created_at`    DATETIME NOT NULL,
+  `updated_at`    DATETIME NOT NULL,
+
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_login` (`store_code`,`login_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE `alert` (
+  `id`         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `store_code` VARCHAR(20) NOT NULL,
+  `alert_type` VARCHAR(40) NOT NULL COMMENT 'free_meal_suspect / grant_many_per_day / grant_span_wide 等',
+  `severity`   TINYINT NOT NULL DEFAULT 1 COMMENT '1=提示 2=警告 3=严重',
+  `ref_type`   VARCHAR(20) DEFAULT NULL,
+  `ref_id`     VARCHAR(40) DEFAULT NULL,
+  `message`    VARCHAR(500) NOT NULL,
+  `detail`     TEXT DEFAULT NULL COMMENT 'JSON 文本',
+  `status`     TINYINT NOT NULL DEFAULT 0 COMMENT '0=未处理 1=已处理 2=已忽略',
+  `handled_by` INT DEFAULT NULL,
+  `handled_at` DATETIME DEFAULT NULL,
+  `created_at` DATETIME NOT NULL,
+
+  PRIMARY KEY (`id`),
+  KEY `idx_open` (`store_code`,`status`,`severity`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> `AlertRepo::raiseOnce()` 保证同一目标同一类型只要还未处理就不重复插入 ——
+> 防刷那几条告警每记一次账都会判一遍，不去重会刷屏。
+
+```sql
+-- 会话。Pad 与后台共用同一张表、同一个 vip_session cookie
+CREATE TABLE `operator_session` (
+  `id`           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `store_code`   VARCHAR(20) NOT NULL,
+  `operator_id`  INT NOT NULL,
+  `token_hash`   VARCHAR(64) NOT NULL COMMENT 'token 的 hash；明文只发给客户端，不落库',
+  `ip`           VARCHAR(45) DEFAULT NULL,
+  `expires_at`   DATETIME NOT NULL,
+  `revoked_at`   DATETIME DEFAULT NULL COMMENT '主动退出时打戳，不物理删除',
+  `last_seen_at` DATETIME DEFAULT NULL,
+  `created_at`   DATETIME NOT NULL,
+
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_token` (`token_hash`),
+  KEY `idx_op` (`store_code`,`operator_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 迁移登记。migrate 靠它判断哪些还没跑过
+CREATE TABLE `schema_migration` (
+  `filename`   VARCHAR(190) NOT NULL COMMENT '如 014_grant_group.sql',
+  `applied_at` DATETIME NOT NULL,
+  PRIMARY KEY (`filename`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> ⚠️ 从别处导入 schema 时**必须手工补登记 `schema_migration`**，
+> 否则下次 `migrate` 会把已经跑过的迁移再跑一遍并失败（见 `06` §3）。
+
 ## 6. 配置表
 
 ### 6.1 系统配置 `sys_config`
@@ -291,7 +493,7 @@ CREATE TABLE `sys_config` (
 | `points_multiplier` | `1.0` | 积分倍率（1.0 = 不启用） |
 | `points_include_tax` | `1` | 积分按含税价（已确认为 1） |
 | `free_meal_extra_earns` | `0` | 免费餐当次的额外消费（饮料甜品）是否计金额积分 |
-| `visit_count_mode` | `by_portion` | 计次口径：**`by_portion`=按套餐份数（已确认采用）**／`by_ledger`=每笔流水最多 1 次 |
+| `visit_count_mode` | `once_per_period` | 计次口径：**`once_per_period`=一张卡一个餐期 1 次（现行，见 `03` §13）**／`by_portion`=按套餐份数（旧默认）／`by_order`=每笔流水最多 1 次 |
 | `reversal_window_hours` | `24` | 自由撤销时间窗，超出需经理权限 |
 | `verify_protect_days` | `30` | 值比对保护期 |
 | `sync_window_hours` | `48` | 滚动校准窗口 |
@@ -414,6 +616,16 @@ INSERT INTO meal_item_rule
 > ✅ **`BOX` / `COMBO` 共 22 项已归类**：外卖产品线，三个开关全 `0`，见 §6.2.1。
 
 ### 6.3 餐期配置 `meal_period`
+
+> 🔴 **这张表从 001_init 就建好了，但直到 2026-08 才有代码读它**
+> （`app/lib/MealPeriod.php`）。此前营业日一直是按固定的 02:00 切点算的，
+> 餐期只是个摆设。
+>
+> 现在它决定「一张卡一个餐期最多 1 次」里的**餐期**边界（`03` §13）。
+> **一个餐期都不配的话，系统只能退回按整个营业日算** ——
+> 于是「中午来一次、晚上又来一次」被当成同一顿，客人少拿一半次数，
+> 而且没有任何地方会报错。所以后台顶栏会挂一条常驻红条
+> （`meal_period_missing`）提醒补配。
 
 ```sql
 CREATE TABLE `meal_period` (

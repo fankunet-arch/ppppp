@@ -951,3 +951,76 @@ foreach (['008_card_valid_to.sql', '009_operator_lang.sql', '010_operator_name_e
     T::true(is_file($f) && str_contains((string)file_get_contents($f), 'information_schema'),
         "{$n} 用 information_schema 做了存在性判定");
 }
+
+T::group('Schema 文档没有落后于迁移');
+
+/**
+ * ★★ 这条测试是补一次真实的文档腐烂。
+ *
+ *   写完防刷那一版之后回头看 docs/04-本地库Schema.md，发现它【落后了三个迁移】：
+ *     · point_ledger 缺 grant_group / tier_code / tier_multiplier
+ *     · coupon 缺 tier_code / threshold_used
+ *     · pos_order 缺 original_amount / allocated_portions / is_redeemed / redeem_amount
+ *     · card、card_tier、operator、alert、operator_session、schema_migration
+ *       这六张表【整张都没写进去】
+ *
+ *   没人会主动去发现这件事 —— 文档不会报错，测试也不跑它。
+ *   下一个人照着 docs/04 建表，建出来的东西跑不起来，
+ *   而他会先怀疑自己而不是怀疑文档。
+ *
+ * 判定方式：从 db/migrations/*.sql 里抠出所有 CREATE TABLE 与 ADD COLUMN 的列名，
+ * 逐个到文档里找。找不到就是文档没跟上。
+ *
+ * 只查【存在性】不查注释是否准确 —— 后者机器判不了，
+ * 但「整列漏写」这种最常见也最伤人的情况，这一条就能全挡掉。
+ */
+$docPath = __DIR__ . '/../../docs/04-本地库Schema.md';
+$doc     = (string)file_get_contents($docPath);
+T::true($doc !== '', 'docs/04 读得到');
+
+$migDir = __DIR__ . '/../../db/migrations';
+$files  = glob($migDir . '/*.sql') ?: [];
+T::true(count($files) >= 14, '找得到迁移文件（' . count($files) . ' 个）');
+
+/** 这些不是业务表，或纯属实现细节，文档不必逐列写 */
+$skipTables = [];
+
+$declared = [];        // table => [col, ...]
+foreach ($files as $f) {
+    $sql = (string)file_get_contents($f);
+
+    // CREATE TABLE 块里的列
+    if (preg_match_all('/CREATE TABLE(?:\s+IF NOT EXISTS)?\s+`([a-z_]+)`\s*\((.*?)\n\)/is', $sql, $ms, PREG_SET_ORDER)) {
+        foreach ($ms as $m) {
+            preg_match_all('/^\s*`([a-z_]+)`\s+[A-Za-z]/m', $m[2], $cm);
+            foreach ($cm[1] as $col) { $declared[$m[1]][] = $col; }
+        }
+    }
+    // 后续迁移里 ADD COLUMN 的列（含 information_schema + PREPARE 那种拼字符串的写法）
+    if (preg_match_all('/ALTER TABLE `?([a-z_]+)`? ADD COLUMN `([a-z_]+)`/i', $sql, $am, PREG_SET_ORDER)) {
+        foreach ($am as $m) { $declared[$m[1]][] = $m[2]; }
+    }
+}
+T::true(count($declared) >= 10, '从迁移里解析出 ' . count($declared) . ' 张表');
+
+$missing = [];
+foreach ($declared as $table => $cols) {
+    if (in_array($table, $skipTables, true)) { continue; }
+    if (!preg_match('/\b' . preg_quote($table, '/') . '\b/', $doc)) {
+        $missing[] = "整张表 `{$table}` 没写";
+        continue;
+    }
+    foreach (array_unique($cols) as $col) {
+        // 必须是「`列名` 类型」这种定义形态 —— 出现在 KEY(...) 里不算
+        if (!preg_match('/`' . preg_quote($col, '/') . '`\\s+[A-Z]/', $doc)) {
+            $missing[] = "{$table}.{$col}";
+        }
+    }
+}
+T::true($missing === [],
+    '★★ docs/04 覆盖了迁移里的每一张表、每一列'
+    . ($missing
+        ? "\n      文档里找不到：" . implode('、', array_slice($missing, 0, 12))
+          . (count($missing) > 12 ? ' …共 ' . count($missing) . ' 处' : '')
+          . "\n      —— 加了迁移就要同步更 docs/04，否则下一个人照着文档建表会建错"
+        : ''));

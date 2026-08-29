@@ -26,7 +26,8 @@ if ($task === '' || in_array($task, ['-h', '--help', 'help'], true)) {
 
       check                     检查 PHP 扩展、配置、两个数据库的连通性
       migrate                   建表（DROP TABLE，有安全闸门）
-      seed                      灌入配置、餐期、套餐规则（幂等，可重复执行）
+      seed                      灌入配置、餐期、套餐规则
+                                ⚠️ 会把配置覆盖回默认值 —— 已上线的库慎用，见 docs/06 §3.4
       admin <工号> <显示名>      创建管理员账号
       passwd <工号>              重置该账号 PIN 并解除锁定（忘记 PIN 时用）
       all                       check + seed（migrate 需显式单独执行）
