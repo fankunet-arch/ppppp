@@ -55,6 +55,12 @@ await page.click('#cd-gen-box summary');
 await page.fill('#cd-batch', BATCH);
 await page.fill('#cd-count', '5');
 
+/**
+ * ★ 有效期这一格现在【默认填好 2 年后的 12 月 31 日】，
+ *   所以要先清空才测得到「不填就不让生成」这条路。
+ *   默认值本身在 carddate.mjs 里验。
+ */
+await page.fill('#cd-valid', '');
 await clearToast();
 await page.click('#btn-card-gen');
 ok(/必须填写有效期/.test(await waitToast(/有效期/)), '★ 不填有效期不让生成');

@@ -44,6 +44,10 @@
       'background:#fff;color:var(--ink,#1c1f23)}',
       '.ui-ask-err{color:var(--err,#c0392b);margin:8px 0 0;font-size:14px}',
       '.ui-ask-err[hidden]{display:none}',
+      // 正文里需要一眼看见的那一句（比如「距今还有 380 天」）
+      '.ui-ask-hi{color:var(--err,#c0392b);font-weight:700;font-size:17px;',
+      'white-space:pre-wrap;line-height:1.5;margin:-8px 0 16px}',
+      '.ui-ask-hi[hidden]{display:none}',
       '.ui-ask-btns{display:flex;gap:10px;margin-top:18px}',
       '.ui-ask-btns button{flex:1;font-size:16px;padding:12px 14px;cursor:pointer;',
       'border-radius:var(--radius,10px);border:1px solid var(--line,#d9dce1);background:#fff;',
@@ -77,6 +81,7 @@
     host.innerHTML =
       '<div class="ui-ask-box" role="dialog" aria-modal="true">' +
         '<p class="ui-ask-msg"></p>' +
+        '<p class="ui-ask-hi" hidden></p>' +
         '<input class="ui-ask-input" hidden>' +
         '<p class="ui-ask-err" hidden></p>' +
         '<div class="ui-ask-btns">' +
@@ -140,6 +145,16 @@
       if (current) { done(current.kind === 'input' ? null : false); }
 
       host.querySelector('.ui-ask-msg').textContent = String(message == null ? '' : message);
+      /**
+       * opts.highlight —— 正文里要一眼看见的那一句，红色加粗单独一行。
+       *
+       * 用 textContent 而不是 innerHTML：调用方传进来的往往是拼出来的
+       * （日期、天数、金额），一旦允许标签，哪天有人把用户输入拼进去
+       * 就是一个 XSS。要变的只是颜色，样式交给 class 就够了。
+       */
+      var hi = host.querySelector('.ui-ask-hi');
+      hi.textContent = opts.highlight == null ? '' : String(opts.highlight);
+      hi.hidden = !hi.textContent;
       var input = host.querySelector('.ui-ask-input');
       input.hidden = kind !== 'input';
       if (kind === 'input') {

@@ -158,6 +158,8 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .cfg-off .cfg-label { color: #9aa1ab; }
 .cfg-off input { background: #f2f3f5; color: #9aa1ab; cursor: not-allowed; }
 .cfg-why { color: #b26a00; font-weight: 600; }
+/* 发卡表单：有效期旁边的「距今 N 天」。红字是为了让人真的看它一眼 */
+.date-far { color: var(--err, #c0392b); font-weight: 700; font-size: 13px; margin-left: 8px; white-space: nowrap; }
 /* 等级表单里的两个门槛格也用同一套置灰（.add-box 里是 label 包着 input） */
 .add-box label.cfg-off { color: #9aa1ab; }
 .add-box label.cfg-off input { background: #f2f3f5; color: #9aa1ab; cursor: not-allowed; }

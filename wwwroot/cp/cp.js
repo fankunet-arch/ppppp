@@ -574,8 +574,69 @@ $('#btn-add-op').onclick = async () => {
 
 /* ── 实体卡发放 ───────────────────────────────────── */
 
+/**
+ * 从今天到 ymd 还有多少【日历天】。
+ *
+ * 两边都取当地日期的 y/m/d 再拿 Date.UTC 做差 —— 不这么做的话，
+ * 西班牙一年两次夏令时切换那两天会差出 23/25 小时，
+ * 除以 86400000 之后就变成 379.96 天，四舍五入还能撞上边界。
+ * 取的是日历天，就该按日历算，不该掺进钟点。
+ */
+function daysUntil(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ''));
+  if (!m) return null;
+  const then = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  const n = new Date();
+  const today = Date.UTC(n.getFullYear(), n.getMonth(), n.getDate());
+  return Math.round((then - today) / 86400000);
+}
+
+/**
+ * 「距今 380 天（约 1 年 1 个月）」。
+ *
+ * 天数是主角 —— 但年月那一段才是真正能挡住【记错年份】的：
+ * 2028 打成 2038 时，天数从 745 跳到 4400 也许还要愣一下，
+ * 「约 12 年」是一眼就不对。这一整句就是为这个错误准备的。
+ */
+function validityHint(ymd) {
+  const n = daysUntil(ymd);
+  if (n === null) return '';
+  if (n < 0)  return `已经过期 ${-n} 天 —— 这个日期在今天之前`;
+  if (n === 0) return '就是今天 —— 印出来当天就作废';
+  let y = Math.floor(n / 365), mo = Math.round((n % 365) / 30.44);
+  // 余数四舍五入可能凑满 12 个月（如 725 天 → 1 年 12 个月），得进位
+  if (mo >= 12) { y += 1; mo = 0; }
+  const rough = y >= 1 ? `，约 ${y} 年${mo ? ` ${mo} 个月` : ''}` : '';
+  return `距今 ${n} 天${rough}`;
+}
+
+/* 有效期那一格改一下就更新旁边的红字，不用等到点「生成」才发现 */
+function refreshValidityHint() {
+  const el = $('#cd-valid-hint');
+  if (!el) return;
+  el.textContent = validityHint($('#cd-valid').value);
+}
+
+/**
+ * 默认填【2 年后的 12 月 31 日】。
+ *
+ * 只是预填，不锁定 —— 想填别的（包括更早的日期）照填不误。
+ * 取年底是因为卡面上印「2028-12-31」比印「2028-03-17」好记好核对，
+ * 整批卡的作废时间也集中，不会一年到头零零散散地过期。
+ *
+ * ★ 只在这一格【还是空的】时候填。已经填过就别动 ——
+ *   切个标签页回来把人家改好的日期冲掉，是最招人烦的那种「智能」。
+ */
+function defaultValidTo() {
+  const el = $('#cd-valid');
+  if (!el || el.value) return;
+  el.value = `${new Date().getFullYear() + 2}-12-31`;
+  refreshValidityHint();
+}
+
 async function loadCards() {
   const d = await api('/cards/batches', undefined, 'GET');
+  defaultValidTo();
 
   const tot = d.batches.reduce((a, b) => ({
     total: a.total + b.total, stock: a.stock + b.stock,
@@ -808,6 +869,9 @@ $('#btn-card-void').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
+$('#cd-valid').addEventListener('input',  refreshValidityHint);
+$('#cd-valid').addEventListener('change', refreshValidityHint);
+
 $('#btn-card-gen').onclick = async () => {
   const batch = $('#cd-batch').value.trim();
   const count = +$('#cd-count').value || 0;
@@ -825,12 +889,21 @@ $('#btn-card-gen').onclick = async () => {
    * 一旦印错，整批卡的合规基础就没了 —— 而且是印完才发现。
    * 多按一次确认，换的是这个。
    */
+  /**
+   * 距今多少天用红字单独摆一行。
+   *
+   * 日期本身是「对不对」看不出来的东西 —— 2028 还是 2029，盯着看也就那样。
+   * 换算成天数就不一样了：记错一年，数字差出三四百天，一眼就不对。
+   * 这一句是给「脑子一时反应错」准备的，不是给系统校验准备的。
+   */
+  // 红字排在正文【下面】，所以把日期挪到最后一行 —— 数字才紧挨着日期
   if (!await UI.confirm(
-    `请再核对一次有效期：\n\n` +
-    `        ${valid}\n\n` +
     `这个日期会印在卡面上，也是客人唯一能看到的告知。\n` +
-    `与印刷稿不一致的话，整批卡都得重印。`,
-    { okText: '日期没错', cancelText: '我再看看' })) return;
+    `与印刷稿不一致的话，整批卡都得重印。\n\n` +
+    `请再核对一次有效期：\n\n` +
+    `        ${valid}`,
+    { okText: '日期没错', cancelText: '我再看看',
+      highlight: validityHint(valid) })) return;
 
   if (!await UI.confirm(
     `生成 ${count} 张新卡（有效期至 ${valid}）？\n\n` +
