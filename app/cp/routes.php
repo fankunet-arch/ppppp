@@ -52,7 +52,9 @@ $requireAdmin = static function () use ($requireManager): array {
 $warnings = static function () use ($app): array {
     return \Vip\Features::warnings(
         $app->cfg()->bool('member_collect_pii', false),
-        $app->messaging()->readyChannels()
+        $app->messaging()->readyChannels(),
+        $app->cfg()->get('visit_count_mode', 'once_per_period') === 'once_per_period',
+        count($app->mealPeriods()->all())
     );
 };
 

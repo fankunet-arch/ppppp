@@ -102,9 +102,15 @@ final class ConfigSchema
         'visit_count_mode' => [
             'group' => 'points', 'type' => 'select',
             'label' => '计次口径',
-            'desc'  => '一桌点了 3 份套餐记给同一个人时，算 3 次还是 1 次',
-            'options' => ['by_portion' => '按套餐份数（3 份 = 3 次）',
-                          'by_order'   => '按订单（整单只算 1 次）'],
+            'desc'  => '决定「十送一」数的是什么。'
+                     . '★ 默认「一人一餐期一次」＝ 来 10 趟送 1 次，'
+                     . '一桌 4 人有 4 张卡就 4 张各记 1 次，只有 2 张卡就只记那 2 张，'
+                     . '剩下的次数不会挪给在场的卡。'
+                     . '另外两种是「买 N 份送 1 份」的老口径 —— '
+                     . '那种口径下一张 10 人的小票一次就顶 10 次，捡到一张直接换一顿饭',
+            'options' => ['once_per_period' => '一人一餐期一次（推荐 · 来 10 趟送 1 次）',
+                          'by_portion'      => '按套餐份数（3 份 = 3 次）',
+                          'by_order'        => '按订单（每笔账算 1 次）'],
         ],
         'reversal_window_hours' => [
             'group' => 'points', 'type' => 'int', 'unit' => '小时',

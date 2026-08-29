@@ -524,7 +524,7 @@ final class PointsService
 
             $perEuro    = $this->cfg->float('points_per_euro', 1.0);
             $multiplier = $this->cfg->float('points_multiplier', 1.0);
-            $byPortion  = $this->cfg->get('visit_count_mode', 'by_portion') === 'by_portion';
+            $countMode  = $this->cfg->get('visit_count_mode', 'once_per_period');
 
             $entries = [];
             foreach ($allocations as $a) {
@@ -551,7 +551,8 @@ final class PointsService
                 // ★ 免费餐 / 核销单不计次：那一餐是兑换来的，
                 //   再计一次就等于「拿奖励的同时又攒一次」。
                 //   金额可以照常积分（取决于 free_meal_extra_earns），但次数不给。
-                $visits = $freeish ? 0 : ($byPortion ? $prt : ($prt > 0 ? 1 : 0));
+                $visits = $freeish ? 0
+                        : $this->visitsFor($countMode, $memberId, $prt, (string)$order['order_end_time']);
 
                 $lid = $this->ledger->insert([
                     'member_id'          => $memberId,
@@ -604,6 +605,66 @@ final class PointsService
             ]);
 
             return ['ok' => true, 'entries' => $entries, 'member_ids' => array_column($entries, 'member_id')];
+    }
+
+    /**
+     * 这一笔该记几次。
+     *
+     * ── once_per_period（默认）───────────────────────────
+     *
+     * 🔴 **一张卡，一个餐期，最多 1 次。** 不管这一单给他分了几份套餐。
+     *
+     * 这是「十送一」口径的一次根本改变：从「买 10 份套餐」变成
+     * 「来 10 趟」。理由是前者没法防：
+     *
+     *   一桌 10 个人 10 份套餐，整单记给一个人 = 一次 10 次计次，
+     *   当场就够十送一。也就是说【一张小票 = 一顿免费的饭】——
+     *   捡到一张就直接换一顿，连攒都不用攒。
+     *
+     * 改成按人按餐期计次之后：
+     *   · 一桌 4 个人有 4 张卡 → 4 张各记 1 次
+     *   · 一桌 4 个人只有 2 张卡 → 只有那 2 张各记 1 次，
+     *     另外 2 份的次数【就是没有了】，不会挪给在场的卡
+     *   · 捡一张 10 人的小票 → 1 次，收益掉一个数量级
+     *
+     * ★ 判定要查库，不能只看本次分配。
+     *   同一个餐期里客人可能分两次结账（先点后加菜、分单），
+     *   也可能走多桌合并 —— 合并是在【同一个事务】里连着调本方法几遍，
+     *   第一遍插进去的流水必须被第二遍看见，否则三桌各记 1 次，
+     *   等于什么都没防住。查库（而不是缓存）正是为了这个。
+     *
+     * ── by_portion / by_order（保留）─────────────────────
+     * 老口径，店家要回去也回得去。by_portion 是「买 N 份送 1 份」，
+     * by_order 是「每笔账算 1 次」（同一餐期分两次结账会算 2 次）。
+     */
+    private function visitsFor(string $mode, int $memberId, int $portions, string $orderEndTime): int
+    {
+        if ($portions <= 0) {
+            return 0;
+        }
+        if ($mode === 'by_portion') {
+            return $portions;
+        }
+        if ($mode === 'by_order') {
+            return 1;
+        }
+        // once_per_period：这一顿已经记过就不再记
+        return $this->countedThisSitting($memberId, $orderEndTime) ? 0 : 1;
+    }
+
+    /** 这张卡在这一顿（同一营业日 + 同一餐期）里是不是已经记过次数了 */
+    private function countedThisSitting(int $memberId, string $refEndTime): bool
+    {
+        [$from, $to] = $this->bizDay->range($this->bizDay->of($refEndTime));
+        foreach ($this->ledger->earnedInRange($memberId, $from, $to) as $r) {
+            if ((int)$r['counted_visit'] <= 0) {
+                continue;
+            }
+            if ($this->periods->sameSitting((string)$r['order_end_time'], $refEndTime, $this->bizDay)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ════════════════════════════════════════════════════════

@@ -124,13 +124,24 @@ $appVersion = vip_app_version([
     <h2 data-i18n="step3.title">③ 记账方式</h2>
     <div id="order-summary" class="summary"></div>
     <div id="existing-ledger" class="ledger-box" hidden></div>
+    <!--
+      🔴 这里【没有「整单记一人」】。
+
+      十送一数的是「这个人来了几趟」，不是「买了几份套餐」。
+      把整桌记给一个人，等于把同桌其他人的次数并到他名下 ——
+      而那正是这条规则要禁止的事（docs/03 §13）。
+
+      一桌 4 个人：有 4 张卡就用「均摊 AA」记 4 张，各记 1 次；
+      只有 2 张卡就只记那 2 张，剩下 2 份的次数没有了，不挪给在场的卡。
+    -->
     <div class="modes">
-      <button class="mode" data-mode="1"><b data-i18n="mode1.title"></b><span data-i18n="mode1.desc"></span></button>
       <button class="mode" data-mode="2"><b data-i18n="mode2.title"></b><span data-i18n="mode2.desc"></span></button>
       <button class="mode" data-mode="3"><b data-i18n="mode3.title"></b><span data-i18n="mode3.desc"></span></button>
     </div>
-    <!-- 同行分桌：一大帮人坐了几桌、一起结账，积分都记给其中一位 -->
-    <button id="btn-merge-start" class="ghost" data-i18n="merge.start">还有其他桌，一起记</button>
+    <p class="muted small" data-i18n-html="mode.noWholeNote"></p>
+    <!-- 同行分桌把几桌的【积分】并给一位客人。次数不并（每张卡本餐期仍只 1 次）。
+         普通服务员看不到这个入口 —— 要经理身份才出现。 -->
+    <button id="btn-merge-start" class="ghost" data-i18n="merge.start" hidden>还有其他桌，一起记</button>
     <button id="btn-free-meal" class="ghost warn" data-i18n="freeMeal.btn">标记为免费餐</button>
     <button class="ghost" data-back="step-order" data-i18n="common.back">返回</button>
   </div>

@@ -308,6 +308,14 @@ function refreshDynamicText() {
  */
 function applySettings() {
   applyPiiTabs();
+  /**
+   * 多桌合并把几桌的【积分】并给一位客人 —— 次数不并（每张卡本餐期仍只 1 次）。
+   * 但它长得像「整单记一人」，而整单已经从界面上拿掉了。
+   * 两个入口一去一留会让人困惑：「为什么一桌不能并、三桌反而能并？」
+   * 所以只给经理看。普通服务员的路径就是 AA / 点选两种，干净。
+   */
+  const mb = $('#btn-merge-start');
+  if (mb) { mb.hidden = !(S.operator && S.operator.is_manager); }
   const box = $('#new-contact');
   if (!box) return;
   if (S.settings.collect_pii) return;      // 开启时保持原样
@@ -446,7 +454,9 @@ $('#btn-pin-submit').onclick = async () => {
 
 /* ── 步骤 1：桌号 ────────────────────────────────── */
 function resetFlow() {
-  S.order = null; S.people = []; S.picks = {}; S.mode = 1;
+  // ★ 默认模式是 2（均摊 AA）而不是 1（整单）—— 整单已从界面移除，
+  //   留成 1 的话，一进分配页就是个界面上根本没有的模式（docs/03 §13）
+  S.order = null; S.people = []; S.picks = {}; S.mode = 2;
   S.merge = null;
   $('#table-input').value = '';
   $('#invoice-input').value = '';
@@ -954,7 +964,8 @@ $('#btn-submit').onclick = async () => {
 function renderDone(d) {
   $('#done-body').innerHTML = (d.entries || []).map(e => `
     <div class="card"><div class="amount">${T('done.points', { points: e.points })}</div>
-           <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, visits: e.visits })}</div></div>`).join('')
+           <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, visits: e.visits })}</div>
+           ${e.visits === 0 ? `<div class="meta warn-line">${T('done.noVisit')}</div>` : ''}</div>`).join('')
     // 本次达标发了新券就大字提示 —— 服务员要当场告诉客人
     + (d.rewards || []).map(r => r.granted > 0
       ? `<div class="card reward-card">

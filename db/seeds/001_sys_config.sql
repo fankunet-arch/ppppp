@@ -26,7 +26,11 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 免费餐当次的额外消费（饮料甜品）是否计金额积分
 
 -- ── 计次 ──────────────────────────────────────────────────
-(@store,'visit_count_mode','by_portion',@now),
+(@store,'visit_count_mode','once_per_period',@now),
+  -- 🔴 一张卡一个餐期最多记 1 次 —— 十送一数的是「来了几趟」不是「买了几份」。
+  -- 按份数算的话，一桌 10 人 10 份套餐整单记给一个人 = 一次 10 次计次，
+  -- 也就是【一张小票 = 一顿免费的饭】，捡到一张就直接换，连攒都不用攒。
+  -- 老口径 by_portion / by_order 仍然可选，见 docs/03 §13。
   -- by_portion = 按 counts_visit=1 菜品的 SUM(quantity) 计次（已确认采用）
   -- by_ledger  = 每笔流水最多计 1 次（备用口径）
 

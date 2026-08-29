@@ -104,6 +104,10 @@
 
     /* ── 步骤 3：记账方式 ─────────────────────────────── */
     'step3.title':        { zh: '③ 记账方式',  es: '③ Cómo repartir' },
+    // ★ 整单模式【已从界面移除】（docs/03 §13）：它把同桌其他人的次数
+    //   并到一个人名下，正是新规则要禁止的事。
+    //   这两条文案留着不删 —— 历史流水里 alloc_mode=1 的记录还要显示得出名字，
+    //   而且经理走多桌合并时后端用的仍是这个模式号。
     'mode1.title':        { zh: '整单记一人',  es: 'Todo a un socio' },
     'mode1.desc':         { zh: '全部金额与份数记给一位会员',
                             es: 'Todo el importe y los menús a un solo socio' },
@@ -111,6 +115,10 @@
     'mode2.desc':         { zh: '按人数平均分摊，余数给第一位',
                             es: 'Se reparte entre los comensales; el resto al primero' },
     'mode3.title':        { zh: '点选菜品',    es: 'Por platos' },
+    'mode.noWholeNote':   { zh: '<b>一张卡一个餐期只记 1 次。</b>一桌 4 位客人有 4 张卡就记 4 张（各 1 次）；只有 2 张卡就只记那 2 张，其余的次数不会并到在场的卡上。',
+                            es: '<b>Una tarjeta suma 1 visita por servicio.</b> Si en una mesa de 4 hay 4 tarjetas, se apuntan las 4 (1 visita cada una); si solo hay 2, solo esas 2 — las visitas restantes no se pasan a las tarjetas presentes.' },
+    'done.noVisit':       { zh: '本餐期已记过 1 次，这一单只记积分不计次',
+                            es: 'Ya tenía su visita en este servicio: este apunte suma puntos pero no visita' },
     'mode3.desc':         { zh: '每位客人认领自己点的菜',
                             es: 'Cada cliente elige los platos que pidió' },
     'order.avail':        { zh: '可分配',      es: 'a repartir' },

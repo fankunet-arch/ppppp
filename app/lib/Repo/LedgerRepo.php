@@ -133,7 +133,7 @@ final class LedgerRepo
     public function earnedInRange(int $memberId, string $from, string $to, int $limit = 200): array
     {
         return $this->db->all(
-            'SELECT l.id, l.serial_id, l.grant_group, o.order_end_time
+            'SELECT l.id, l.serial_id, l.grant_group, l.counted_visit, o.order_end_time
                FROM point_ledger l
                JOIN pos_order o ON o.store_code = l.store_code AND o.serial_id = l.serial_id
               WHERE l.store_code = ? AND l.member_id = ? AND l.entry_type = ? AND l.status = ?

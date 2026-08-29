@@ -364,3 +364,7 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
   background: #fff4f4; border: 1px solid #f0c9c9;
   border-radius: 8px; padding: 7px 10px; color: #9a2c2c;
 }
+
+/* 结果卡里「这一单没计次」那一行 —— 必须让收银员看见，
+   不然客人回头问「怎么没给我盖章」时谁也说不清（docs/03 §13） */
+.warn-line { color: var(--warn, #b26a00); font-weight: 600; }

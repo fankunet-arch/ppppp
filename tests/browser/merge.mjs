@@ -15,6 +15,10 @@
  * ★ 只有整单一种记法。合并之后再 AA 或点选菜品没有意义 ——
  *   会走到这条路上，本身就意味着「不用再分了，都算一个人的」。
  *
+ * ★ 合并并的是【积分】，不是【次数】：那张卡本餐期照样只记 1 次
+ *   （docs/03 §13）。所以这个入口只给经理看，普通服务员的路径是
+ *   均摊 AA / 点选菜品两种。
+ *
  * 需要先注入模拟活单：
  *   sudo SIM_DSN=... php tests/sim/inject_live.php
  */
@@ -185,8 +189,15 @@ await page.click('#btn-new');
 await page.waitForSelector('#step-table.active', { timeout: 5000 });
 await findTable(T1.table);
 await page.waitForSelector('#step-mode.active', { timeout: 5000 });
-await page.click('.mode[data-mode="1"]');
+/**
+ * 整单模式已从界面移除，这里走均摊 AA 填 1 人 —— 效果等同于原来的整单。
+ * ★ AA 要先填人数再点「拆分」，人员行才会出来。
+ */
+await page.click('.mode[data-mode="2"]');
 await page.waitForSelector('#step-assign.active', { timeout: 5000 });
+await page.fill('#aa-people', '1');
+await page.click('#btn-aa');
+await page.waitForTimeout(800);
 await page.locator('#assign-people button').first().click();
 await page.waitForSelector('#member-modal:not([hidden])', { timeout: 5000 });
 await page.fill('#member-input', F.card);
