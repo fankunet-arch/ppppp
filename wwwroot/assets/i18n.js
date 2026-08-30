@@ -104,6 +104,10 @@
 
     /* ── 步骤 3：记账方式 ─────────────────────────────── */
     'step3.title':        { zh: '③ 记账方式',  es: '③ Cómo repartir' },
+    // ★ 整单模式【已从界面移除】（docs/03 §13）：它把同桌其他人的次数
+    //   并到一个人名下，正是新规则要禁止的事。
+    //   这两条文案留着不删 —— 历史流水里 alloc_mode=1 的记录还要显示得出名字，
+    //   而且经理走多桌合并时后端用的仍是这个模式号。
     'mode1.title':        { zh: '整单记一人',  es: 'Todo a un socio' },
     'mode1.desc':         { zh: '全部金额与份数记给一位会员',
                             es: 'Todo el importe y los menús a un solo socio' },
@@ -111,6 +115,10 @@
     'mode2.desc':         { zh: '按人数平均分摊，余数给第一位',
                             es: 'Se reparte entre los comensales; el resto al primero' },
     'mode3.title':        { zh: '点选菜品',    es: 'Por platos' },
+    'mode.noWholeNote':   { zh: '<b>一张卡一个餐期只记 1 次。</b>一桌 4 位客人有 4 张卡就记 4 张（各 1 次）；只有 2 张卡就只记那 2 张，其余的次数不会并到在场的卡上。',
+                            es: '<b>Una tarjeta suma 1 visita por servicio.</b> Si en una mesa de 4 hay 4 tarjetas, se apuntan las 4 (1 visita cada una); si solo hay 2, solo esas 2 — las visitas restantes no se pasan a las tarjetas presentes.' },
+    'done.noVisit':       { zh: '本餐期已记过 1 次，这一单只记积分不计次',
+                            es: 'Ya tenía su visita en este servicio: este apunte suma puntos pero no visita' },
     'mode3.desc':         { zh: '每位客人认领自己点的菜',
                             es: 'Cada cliente elige los platos que pidió' },
     'order.avail':        { zh: '可分配',      es: 'a repartir' },
@@ -209,6 +217,36 @@
     'done.pendingMeta':   { zh: '{card} 达到门槛，但后台设为「人工发券」，请经理在后台发放',
                             es: '{card} llegó al objetivo, pero los vales se emiten a mano: que lo haga el encargado' },
 
+    /* ── 多桌合并（同行分桌）───────────────────────────── */
+    'merge.start':        { zh: '还有其他桌，一起记', es: 'Hay más mesas, juntarlas' },
+    'merge.title':        { zh: '③ 多桌一起记',      es: '③ Juntar varias mesas' },
+    'merge.note':         { zh: '几桌的积分【整单】记给同一张卡。适用于一起结账的同行客人 —— 加完所有桌，再选收分的那张卡。',
+                            es: 'Los puntos de varias mesas van enteros a una sola tarjeta. Para grupos que pagan juntos: añada todas las mesas y luego elija la tarjeta.' },
+    'merge.sum':          { zh: '合计',              es: 'Total' },
+    'merge.count':        { zh: '共 {n} 桌',         es: '{n} mesas' },
+    'merge.add':          { zh: '再加一桌',          es: 'Añadir otra mesa' },
+    'merge.pick':         { zh: '选择收分的会员',    es: 'Elegir quién recibe los puntos' },
+    'merge.submit':       { zh: '全部记给这张卡',    es: 'Dar todo a esta tarjeta' },
+    'merge.needMember':   { zh: '请先选择收分的会员', es: 'Elija primero quién recibe los puntos' },
+    'merge.needTwo':      { zh: '至少要两桌 —— 单桌请用普通记账',
+                            es: 'Hacen falta al menos dos mesas; para una sola use el apunte normal' },
+    'merge.dup':          { zh: '这一桌已经加进来了', es: 'Esa mesa ya está en la lista' },
+    'merge.remove':       { zh: '移除',              es: 'Quitar' },
+    'merge.row':          { zh: '{table} 桌 · € {amount} · {portions} 份', es: 'Mesa {table} · € {amount} · {portions} raciones' },
+    'merge.confirm':      { zh: '把这 {n} 桌共 € {amount} 的积分全部记给 {card}？',
+                            es: '¿Dar los puntos de estas {n} mesas (€ {amount}) a {card}?' },
+
+    /* ── 破例放行（防刷闸门）───────────────────────────── */
+    'gate.late':          { zh: '这一单已经结账 {min} 分钟了，超出当场记账的范围。',
+                            es: 'Esta cuenta se cerró hace {min} minutos, fuera del plazo normal.' },
+    'gate.cap':           { zh: '这张卡在本餐期已经记过 {used} 次了（上限 {limit} 次）。',
+                            es: 'Esta tarjeta ya tiene {used} apuntes en este servicio (máximo {limit}).' },
+    'gate.askReason':     { zh: '需要经理放行。请写明原因（会记入审计日志）：',
+                            es: 'Hace falta un encargado. Indique el motivo (queda registrado):' },
+    'gate.reasonPh':      { zh: '如：客人忘带卡，隔天拿小票来补',
+                            es: 'p. ej.: el cliente olvidó la tarjeta y vuelve con el ticket' },
+    'gate.ok':            { zh: '经理放行',          es: 'Autorizar' },
+
     /* ── 会员弹层 ─────────────────────────────────────── */
     'member.title':       { zh: '选择会员',    es: 'Elegir socio' },
     'member.byCard':      { zh: '卡号',        es: 'Tarjeta' },
@@ -223,6 +261,14 @@
     'member.scanNote':    { zh: '扫客人卡面的二维码；扫不出时照着卡面手输卡号也行。<b>不用纠结哪个是字母、哪个是数字</b>，看着像什么就输什么，系统会自动纠正。',
                             es: 'Escanee el QR de la tarjeta; si no lee, escriba el número tal como aparece. <b>No se preocupe por distinguir letras de números</b>: escriba lo que ve, el sistema lo corrige.' },
     'member.needInput':   { zh: '请输入查询内容', es: 'Escriba algo para buscar' },
+    // 隔离区的小字：说清这两个按钮为什么被单独放出来
+    'freeMeal.zoneNote':  { zh: '下面这个只在客人用券免单时点 —— 点了这一单就不积分、不计次。',
+                            es: 'Solo para canjes con vale: este ticket no sumará puntos ni visita.' },
+    'lookup.manualNote':  { zh: '上面都试过还是找不到，才用下面这个 —— 手工录入要经理复核。',
+                            es: 'Solo si nada de lo anterior encuentra el ticket. La entrada manual pasa a revisión.' },
+    // 后台关掉「允许收集客人联系方式」时，手机号/邮箱两档置灰并显示这一句
+    'member.piiOff':      { zh: '本店不登记手机号和邮箱，只按卡号查。',
+                            es: 'Este local no registra teléfono ni email; solo se busca por tarjeta.' },
     'member.none':        { zh: '未找到该会员，可在下方新建。',
                             es: 'No se encuentra ese socio; puede darlo de alta abajo.' },
     'member.stats':       { zh: '{points} 分 · 已消费 {visits} 次 · 累计 € {spent}',

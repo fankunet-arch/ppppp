@@ -75,7 +75,14 @@ await page.waitForSelector('#step-mode.active', { timeout: 5000 });
 ok(true, '进到「记账方式」');
 const summary = await page.locator('#order-summary').textContent();
 ok(/€/.test(summary), `摘要有可分配金额：「${summary.trim().split('\n')[0]}」`);
-ok(await page.locator('.mode[data-mode="1"]').isVisible(), '三种记账方式都在');
+/**
+ * ★ 整单模式【已从界面移除】（docs/03 §13）：它把同桌其他人的次数
+ *   并到一个人名下，正是新规则要禁止的事。
+ */
+ok(await page.locator('.mode[data-mode="1"]').count() === 0,
+   '★★ 界面上没有「整单记一人」—— 那会把同桌其他人的次数并到一个人名下');
+ok(await page.locator('.mode[data-mode="2"]').isVisible()
+   && await page.locator('.mode[data-mode="3"]').isVisible(), '剩下均摊 AA 与点选菜品两种');
 
 console.log('\n【⑤ 查一个没单的桌号 → 降级入口要出现】');
 await page.click('[data-back="step-order"]');

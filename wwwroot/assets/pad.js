@@ -46,6 +46,7 @@ const S = {
   memberTarget: null,// 会员弹层回调
   pendingCard: null, // 扫到的库存卡，等着绑给新建的会员
   settings: {},      // 后台开关，随登录下发
+  merge: null,       // 多桌合并：{ orders: [...], member: {...} }
 };
 
 /* ── 工具 ────────────────────────────────────────── */
@@ -82,6 +83,8 @@ const STEP_BACK = {
   'step-order':  'step-table',
   'step-mode':   'step-order',
   'step-assign': 'step-mode',
+  // 合并页按返回回到记账方式：合并是从那一步进来的
+  'step-merge':  'step-mode',
   'step-done':   'step-table',
   'step-manual': 'step-table',
 };
@@ -95,6 +98,41 @@ function step(id) {
   if (window.UI && UI.back) UI.back.sync();
 }
 
+/**
+ * 会话令牌的本地备份。
+ *
+ * ★ 这一段是补一次现场事故的：**平板熄屏一会儿再打开就要求重新登录。**
+ *
+ *   查下来不是有效期问题（Cookie 与服务端会话都是 12 小时），
+ *   是 Android WebView 的老毛病：**Cookie 默认只存在内存里，
+ *   要 CookieManager.flush() 才落盘**。熄屏后系统把 WebView 进程回收，
+ *   没 flush 的 Cookie 就跟着没了。
+ *
+ *   正经的修法在容器侧（onPause() 里调 flush()），但那要每台平板都
+ *   装到新版容器才生效，而 apk/ 已经不在本仓库里。所以 Web 这边自己兜底：
+ *   登录时把令牌存进 localStorage，之后每个请求带一个头。
+ *   localStorage 的落盘时机和 Cookie 不同，进程被杀也还在。
+ *
+ * ★ Cookie 仍然是第一优先，这里只是后备（服务端 readToken 先看 Cookie）。
+ *
+ * ★ 每一处读写都包在 try/catch 里：容器可能禁掉 localStorage，
+ *   隐私模式下直接 throw。取不到就退回只靠 Cookie —— 那是原来的行为，
+ *   不会更糟，但绝不能因为存不了令牌就整个登录不了。
+ */
+const Session = {
+  KEY: 'vip_session_token',
+  token() {
+    try { return localStorage.getItem(this.KEY) || null; } catch { return null; }
+  },
+  save(t) {
+    if (!t) return;
+    try { localStorage.setItem(this.KEY, t); } catch {}
+  },
+  clear() {
+    try { localStorage.removeItem(this.KEY); } catch {}
+  },
+};
+
 async function api(path, body, method = 'POST') {
   const opt = {
     method,
@@ -104,6 +142,9 @@ async function api(path, body, method = 'POST') {
     headers: { 'Content-Type': 'application/json', 'X-Lang': I18N.lang },
     credentials: 'same-origin',
   };
+  // Cookie 丢了之后的后备通道 —— 说明见 Session 那一节
+  const tk = Session.token();
+  if (tk) { opt.headers['X-Session-Token'] = tk; }
   if (body !== undefined && method !== 'GET') opt.body = JSON.stringify(body);
   /**
    * ★ 必须把「连不上」和「连上了但没回 JSON」分开报。
@@ -133,6 +174,12 @@ async function api(path, body, method = 'POST') {
     };
   }
   if (!res.ok || json.ok === false) {
+    /**
+     * 令牌被服务端否掉了（过期、被踢、库重建过）——
+     * 本地那份就没有意义了，留着只会每次请求都白带一遍，
+     * 而且下一个人开机时会先被拒一次才回到登录页，看着像出错。
+     */
+    if (json.error === 'unauthorized') { Session.clear(); }
     throw { error: json.error || 'server_error', message: json.message || T('net.failed'), detail: json.detail };
   }
   return json.data;
@@ -146,6 +193,7 @@ $('#btn-login').onclick = async () => {
   if (!name || !pin) return showErr('#login-err', T('login.needBoth'));
   try {
     const d = await api('/auth/login', { login_name: name, pin, device: DEVICE });
+    Session.save(d.session_token);     // Cookie 丢了还能靠它回来
     enterMain(d.operator, d.settings);
   } catch (e) {
     showErr('#login-err', e.message);
@@ -161,6 +209,13 @@ $$('#btn-refresh, #btn-refresh-login').forEach(b => {
 
 $('#btn-logout').onclick = async () => {
   try { await api('/auth/logout', {}); } catch {}
+  /**
+   * ★ 本地那份也要删干净。
+   *   只让服务端作废、本地留着的话，下一个人开机会带着一个已作废的令牌
+   *   去请求，被拒之后才回到登录页 —— 中间那一下白等，而且看着像出错了。
+   *   而万一服务端那次作废没发出去（断网），本地还留着就等于没退出。
+   */
+  Session.clear();
   S.operator = null;
   /**
    * 退回登录页 = 回到「没有人登录」的状态，语言也该回到【这台平板】的设置，
@@ -287,6 +342,8 @@ function refreshDynamicText() {
    * （见 data-amt / data-prt 的 oninput），从状态重画不会丢东西。
    */
   if (S.people && S.people.length) { renderPeople(true); }
+  // 这一句是 JS 填的，切语言时得跟着换（data-i18n 管不到它）
+  applyPiiTabs();
   checkHealth();
 }
 
@@ -302,10 +359,51 @@ function refreshDynamicText() {
  * 只藏前端的话，字段还在、接口照收，说不清楚。
  */
 function applySettings() {
+  applyPiiTabs();
+  /**
+   * 多桌合并把几桌的【积分】并给一位客人 —— 次数不并（每张卡本餐期仍只 1 次）。
+   * 但它长得像「整单记一人」，而整单已经从界面上拿掉了。
+   * 两个入口一去一留会让人困惑：「为什么一桌不能并、三桌反而能并？」
+   * 所以只给经理看。普通服务员的路径就是 AA / 点选两种，干净。
+   */
+  const mb = $('#btn-merge-start');
+  if (mb) { mb.hidden = !(S.operator && S.operator.is_manager); }
   const box = $('#new-contact');
   if (!box) return;
   if (S.settings.collect_pii) return;      // 开启时保持原样
   box.remove();
+}
+
+/**
+ * 关闭时把「手机号 / 邮箱」两档【禁用】，只留「卡号」。
+ *
+ * 为什么这里是禁用而不是像上面那样整块删掉：
+ *   · 删掉的是【采集】入口 —— 它一存在就等于在邀请收银员向客人要信息，
+ *     所以必须让它在界面上根本不存在。
+ *   · 这里是【查找】入口。开关关掉之前建的会员，联系方式还在库里，
+ *     留着这两档灰着，至少能让人看懂「不是坏了，是本店不这么做」。
+ *     真要按手机号找，先去后台把开关打开。
+ *
+ * 禁用的按钮点不动，所以 doMemberSearch 拿不到这两档；那边还有一道
+ * 兜底（见 currentSearchType），防的是「开关切换时弹层正开着」这种缝。
+ */
+function applyPiiTabs() {
+  const on = !!S.settings.collect_pii;
+  $$('#search-type button').forEach(b => {
+    if (b.dataset.type === 'card') return;
+    b.disabled = !on;
+    // 关掉时如果正停在这一档上，拨回卡号 —— 否则会停在一个点不动的档位上
+    if (!on && b.classList.contains('on')) {
+      b.classList.remove('on');
+      const card = $('#search-type button[data-type=card]');
+      if (card) { card.classList.add('on'); card.click(); }
+    }
+  });
+  const note = $('#pii-off-note');
+  if (note) {
+    note.textContent = T('member.piiOff');
+    note.hidden = on;
+  }
 }
 
 async function checkHealth() {
@@ -369,7 +467,8 @@ function alreadyTried(version) {
 
 function applyUpdateIfIdle() {
   if (!pendingUpdate) return;
-  const busy = CURRENT_STEP !== 'step-table'
+  const busy = S.merge !== null
+            || CURRENT_STEP !== 'step-table'
             || (S.people && S.people.length > 0)
             || S.order !== null
             || !$('#member-modal').hidden
@@ -407,7 +506,10 @@ $('#btn-pin-submit').onclick = async () => {
 
 /* ── 步骤 1：桌号 ────────────────────────────────── */
 function resetFlow() {
-  S.order = null; S.people = []; S.picks = {}; S.mode = 1;
+  // ★ 默认模式是 2（均摊 AA）而不是 1（整单）—— 整单已从界面移除，
+  //   留成 1 的话，一进分配页就是个界面上根本没有的模式（docs/03 §13）
+  S.order = null; S.people = []; S.picks = {}; S.mode = 2;
+  S.merge = null;
   $('#table-input').value = '';
   $('#invoice-input').value = '';
   showErr('#locate-err', '');
@@ -507,7 +609,8 @@ function renderOrders(list) {
   box.innerHTML = '';
   list.forEach(o => {
     const b = document.createElement('button');
-    b.className = 'card' + (o.eligible ? '' : ' disabled');
+    // 能点的给主色，不能点的保持灰 —— 一屏里哪张该点，不用读字就看得出
+    b.className = 'card ' + (o.eligible ? 'pickable' : 'disabled');
     const time = o.order_end_time.slice(11, 16);
     const reason = {
       not_dine_in: T('order.notDineIn'),
@@ -531,6 +634,24 @@ function renderOrders(list) {
 }
 
 function selectOrder(o) {
+  /**
+   * 正在合并的话，选中的这一单是「再加一桌」，不是「开始新的一单」——
+   * 直接进队列，回到合并页，不要跳去记账方式（那一步在合并里不存在）。
+   */
+  if (S.merge) {
+    if (S.merge.orders.some(x => x.serial_id === o.serial_id)) {
+      /**
+       * 重复的那一桌不加，但【要回到合并页】。
+       * 只弹个提示就把人留在选订单页，收银员会以为点击没生效，
+       * 于是再点一次、再点一次 —— 而列表就在另一页上，他看不见。
+       */
+      toast(T('merge.dup'), 'err');
+      return step('step-merge');
+    }
+    S.merge.orders.push(o);
+    renderMerge();
+    return step('step-merge');
+  }
   S.order = o;
   S.people = []; S.picks = {};
   renderSummary(o);
@@ -877,21 +998,10 @@ $('#btn-submit').onclick = async () => {
   const btn = $('#btn-submit');
   btn.disabled = true;
   try {
-    const d = await api('/points/grant', { serial_id: S.order.serial_id, mode: S.mode, allocations });
-    $('#done-body').innerHTML = d.entries.map(e => `
-      <div class="card"><div class="amount">${T('done.points', { points: e.points })}</div>
-             <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, visits: e.visits })}</div></div>`).join('')
-      // 本次达标发了新券就大字提示 —— 服务员要当场告诉客人
-      + (d.rewards || []).map(r => r.granted > 0
-        ? `<div class="card reward-card">
-             <div class="amount">${T('done.granted', { n: r.granted })}</div>
-             <div class="meta">${T('done.grantedMeta', { card: escapeHtml(r.card_no) })}</div>
-             <div class="meta">${T('done.grantedCodes', { codes: r.coupons.map(c => escapeHtml(c.code)).join('、') })}</div>
-           </div>`
-        : `<div class="card reward-card">
-             <div class="amount">${T('done.pending', { n: r.pending })}</div>
-             <div class="meta">${T('done.pendingMeta', { card: escapeHtml(r.card_no) })}</div>
-           </div>`).join('');
+    const d = await submitWithGate('/points/grant',
+      { serial_id: S.order.serial_id, mode: S.mode, allocations });
+    if (d === null) return;                 // 经理放行那一步取消了
+    renderDone(d);
     step('step-done');
   } catch (e) {
     showErr('#assign-err', e.message + (e.detail && e.detail.total ? T('assign.overflow', { total: e.detail.total, allocated: e.detail.allocated }) : ''));
@@ -899,6 +1009,157 @@ $('#btn-submit').onclick = async () => {
     btn.disabled = false;
   }
 };
+
+/**
+ * 记账结果。单桌与多桌合并共用 —— 两条路的返回结构本来就一样，
+ * 各写一份的话，改一处忘一处，现场表现是「合并记账不显示发券提示」。
+ */
+function renderDone(d) {
+  $('#done-body').innerHTML = (d.entries || []).map(e => `
+    <div class="card"><div class="amount">${T('done.points', { points: e.points })}</div>
+           <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, visits: e.visits })}</div>
+           ${e.visits === 0 ? `<div class="meta warn-line">${T('done.noVisit')}</div>` : ''}</div>`).join('')
+    // 本次达标发了新券就大字提示 —— 服务员要当场告诉客人
+    + (d.rewards || []).map(r => r.granted > 0
+      ? `<div class="card reward-card">
+           <div class="amount">${T('done.granted', { n: r.granted })}</div>
+           <div class="meta">${T('done.grantedMeta', { card: escapeHtml(r.card_no) })}</div>
+           <div class="meta">${T('done.grantedCodes', { codes: r.coupons.map(c => escapeHtml(c.code)).join('、') })}</div>
+         </div>`
+      : `<div class="card reward-card">
+           <div class="amount">${T('done.pending', { n: r.pending })}</div>
+           <div class="meta">${T('done.pendingMeta', { card: escapeHtml(r.card_no) })}</div>
+         </div>`).join('');
+}
+
+/* ── 多桌合并（同行分桌）────────────────────────────
+ *
+ * 场景：一大帮人坐了三桌，分桌计费、最后一起结账，
+ * 然后自愿把三桌的积分都记到其中一位的卡上。docs/03 §12.2
+ *
+ * ★ 只有【整单】一种记法。合并之后再 AA 或点选菜品是没有意义的 ——
+ *   会走到这条路上，本身就意味着「不用再分了，都算一个人的」。
+ *   所以这一步没有记账方式可选，加桌、选卡、提交，三下完事。
+ *
+ * ★ 加桌走的是同一条找单流程（桌号 / 小票号），不另做一套 ——
+ *   收银员已经会用那个了，再学一个只会出错。
+ */
+function mergeStart() {
+  // 把当前这一单作为第一桌带进来 —— 收银员是在看着它的时候才想起「还有别桌」的
+  S.merge = { orders: S.order ? [S.order] : [], member: null };
+  renderMerge();
+  step('step-merge');
+}
+
+function mergeRow(o) {
+  return T('merge.row', {
+    table: escapeHtml(o.table_name || o.serial_id),
+    amount: money(o.remaining_cents),
+    portions: o.remaining_portions,
+  });
+}
+
+function renderMerge() {
+  const m = S.merge || { orders: [], member: null };
+  const box = $('#merge-list');
+  box.innerHTML = m.orders.map((o, i) =>
+    `<div class="lrow"><span>${mergeRow(o)}</span>
+       <button class="link" data-mrm="${i}">${T('merge.remove')}</button></div>`).join('')
+    || `<div class="empty">${T('merge.needTwo')}</div>`;
+  $$('[data-mrm]', box).forEach(b => b.onclick = () => {
+    S.merge.orders.splice(parseInt(b.dataset.mrm, 10), 1);
+    renderMerge();
+  });
+
+  const sum = m.orders.reduce((a, o) => a + o.remaining_cents, 0);
+  $('#merge-sum').textContent = money(sum);
+  $('#merge-count').textContent = T('merge.count', { n: m.orders.length });
+
+  $('#merge-member').innerHTML = m.member
+    ? `<div class="lrow"><span><b>${escapeHtml(m.member.card_no || '')}</b> · ${
+         T('member.statsShort', { points: m.member.points_balance, visits: m.member.visit_count })}</span></div>`
+    : '';
+  showErr('#merge-err', '');
+}
+
+$('#btn-merge-start').onclick = mergeStart;
+
+$('#btn-merge-add').onclick = () => {
+  /**
+   * 回到第一步再找一单。不清 S.merge —— 那是整个功能的状态；
+   * 但要清掉 S.order，否则回来时 selectOrder 会拿旧的那一单去比。
+   */
+  S.order = null;
+  $('#table-input').value = '';
+  $('#invoice-input').value = '';
+  showErr('#locate-err', '');
+  $('#locate-fallback').hidden = true;
+  setLookupMode('table');
+  step('step-table');
+};
+
+$('#btn-merge-pick').onclick = () => openMemberModal('merge');
+
+$('#btn-merge-cancel').onclick = () => {
+  S.merge = null;
+  step(S.order ? 'step-mode' : 'step-table');
+};
+
+$('#btn-merge-submit').onclick = async () => {
+  const m = S.merge || { orders: [], member: null };
+  if (m.orders.length < 2) return showErr('#merge-err', T('merge.needTwo'));
+  if (!m.member)           return showErr('#merge-err', T('merge.needMember'));
+
+  const sum = m.orders.reduce((a, o) => a + o.remaining_cents, 0);
+  if (!await UI.confirm(T('merge.confirm', {
+        n: m.orders.length, amount: money(sum), card: m.member.card_no }))) return;
+
+  const btn = $('#btn-merge-submit');
+  btn.disabled = true;
+  try {
+    const body = { serial_ids: m.orders.map(o => o.serial_id), member_id: m.member.id };
+    const d = await submitWithGate('/points/grant-merged', body);
+    if (d === null) return;                 // 用户在经理放行那一步取消了
+    renderDone(d);
+    S.merge = null;
+    step('step-done');
+  } catch (e) {
+    showErr('#merge-err', e.message + (e.detail && e.detail.hint ? '\n' + e.detail.hint : ''));
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+/**
+ * 提交；撞了防刷闸门就地问经理要原因，再带着原因重试一次。
+ *
+ * ★ 为什么在前台就地处理，而不是让收银员「去找经理重做一遍」：
+ *   客人就站在柜台前。让他等着、收银员跑去找经理、回来从头再走一遍
+ *   找单流程 —— 这中间任何一步分神，这一单就丢了。
+ *   经理走过来输一句原因，是现场唯一走得通的做法。
+ *
+ * ★ 只重试一次。第二次还被拦说明不是权限问题（比如经理账号本身没权限），
+ *   再问一遍只是让人反复输原因。
+ */
+async function submitWithGate(path, body) {
+  try {
+    return await api(path, body);
+  } catch (e) {
+    if (e.error !== 'manager_required') throw e;
+
+    const gates = (e.detail && e.detail.gates) || [];
+    const why = gates.map(g =>
+      g.gate === 'late_grant' ? T('gate.late', { min: g.minutes })
+      : g.gate === 'period_cap' ? T('gate.cap', { used: g.used, limit: g.limit })
+      : '').filter(Boolean).join('\n');
+
+    const reason = await UI.input(why + '\n\n' + T('gate.askReason'), {
+      placeholder: T('gate.reasonPh'), okText: T('gate.ok'), danger: true,
+    });
+    if (reason === null || !reason.trim()) return null;
+    return await api(path, Object.assign({}, body, { override_reason: reason.trim() }));
+  }
+}
 
 /* ── 会员弹层 ────────────────────────────────────── */
 function openMemberModal(personIndex) {
@@ -950,9 +1211,23 @@ function resetLookupState() {
   $('#member-new').open = false;
 }
 
+/**
+ * 当前选的是哪一档。
+ *
+ * 兜底：关掉「允许收集客人联系方式」之后，手机号/邮箱两档是禁用的，
+ * 正常点不到。但按钮的 disabled 与 .on 是两件事 —— 只要有一条路径
+ * 让「已选中」和「已禁用」同时成立（比如开关切换时弹层正开着），
+ * 这里就会按手机号去查。所以按开关判一次，不信 DOM 的 class。
+ */
+function currentSearchType() {
+  const t = ($('#search-type button.on') || {}).dataset?.type || 'card';
+  if ((t === 'phone' || t === 'email') && !S.settings.collect_pii) { return 'card'; }
+  return t;
+}
+
 async function doMemberSearch() {
   resetLookupState();
-  const type = $('#search-type button.on').dataset.type;
+  const type = currentSearchType();
   const value = $('#member-input').value.trim();
   if (!value) return showErr('#member-err', T('member.needInput'));
 
@@ -1508,7 +1783,10 @@ function askVerdict(d) {
 }
 
 function useMember(m) {
-  if (S.memberTarget === 'manual') {
+  if (S.memberTarget === 'merge') {
+    S.merge.member = m;
+    renderMerge();
+  } else if (S.memberTarget === 'manual') {
     S.manualMember = m;
     $('#manual-member').innerHTML = `<div class="found"><b>${escapeHtml(m.card_no)}</b>
       <div class="muted small">${m.points_balance} ${T('common.points')}</div></div>`;

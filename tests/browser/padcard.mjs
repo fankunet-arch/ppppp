@@ -4,6 +4,17 @@ import { execSync } from 'node:child_process';
 let pass = 0, fail = 0;
 const ok = (c, m) => { c ? (pass++, console.log('  \x1b[32m✓\x1b[0m ' + m)) : (fail++, console.log('  \x1b[31m✗\x1b[0m ' + m)); };
 
+/**
+ * ★ 本用例假设「允许收集客人联系方式」是【关闭】的（下面要断言联系方式那一栏
+ *   整块不在 DOM 里）。以前没写，靠的是库里恰好是关的 —— 换个跑法就崩。
+ *   开关这种全局状态，用例必须自己摆好，不能指望上一个用例留下什么。
+ */
+const setPii = (v) => execSync(
+  `php -r 'require "app/bootstrap.php"; $c=require "app/config/config.php";` +
+  ` (new Vip\\App($c))->cfg()->set("member_collect_pii","${v}");'`,
+  { cwd: '/home/user/ppppp' });
+setPii(0);
+
 // 备两张库存卡（直接走 PHP，绕开界面，专心测 Pad 侧）
 const BATCH = 'PAD' + Math.floor(Math.random() * 9000 + 1000);
 const out = execSync(
@@ -34,9 +45,14 @@ ok(true, '会员弹层已打开');
 
 // 默认就是「卡号」档，扫卡按钮该显示
 ok(await page.locator('#btn-scan').isVisible(), '「卡号」档显示扫卡按钮');
-await page.click('#search-type button[data-type="phone"]');
-ok(await page.locator('#btn-scan').isHidden(), '★ 切到「手机号」档时扫卡按钮隐藏');
-await page.click('#search-type button[data-type="card"]');
+/**
+ * 关闭收集时「手机号 / 邮箱」两档是禁用的，切不过去 ——
+ * 所以这里不再验「切过去之后扫卡按钮会隐藏」（那一条在 piiswitch.mjs
+ * 的开启段里验），只验它确实点不动、且界面仍停在卡号档上。
+ */
+ok(await page.locator('#search-type button[data-type="phone"]').isDisabled(),
+   '★ 关闭收集时「手机号」档点不动');
+ok(await page.locator('#btn-scan').isVisible(), '  └ 界面仍停在「卡号」档，扫卡按钮还在');
 
 /**
  * 等一条【新的】toast。
@@ -90,6 +106,17 @@ ok(await page.evaluate(() => S.pendingCard) === null,
 // 这条比上面那条危险：pendingCard 残留时点「启用」会把上一张卡绑给这个人
 await lookup(CARD_A);
 ok(await page.evaluate(() => S.pendingCard) !== null, '扫卡后 pendingCard 已设置');
+/**
+ * 这一段验的是「换查找方式要清掉 pendingCard」，前提是手机号那一档能点。
+ * 而本用例整体跑在「关闭收集」下，那一档是禁用的。
+ *
+ * 重新登录能把开关真打开，但那会连 pendingCard 一起清掉 ——
+ * 正好把要验的东西冲没了。所以这里就地把会话里的开关翻上去：
+ * 相当于「这位收银员的会话是开着收集的」，而被测的那段逻辑
+ * （resetLookupState）跟开关本来也没关系。
+ * 开关本身怎么控制这两档，由 piiswitch.mjs 从真实路径验。
+ */
+await page.evaluate(() => { S.settings.collect_pii = true; applyPiiTabs(); });
 await page.click('#search-type button[data-type="phone"]');
 await page.fill('#member-input', '600000000000');
 await page.click('#btn-member-search');
@@ -98,6 +125,8 @@ ok(await page.evaluate(() => S.pendingCard) === null,
    '★ 改用手机号查找后，上一张卡的 pendingCard 被清空');
 ok((await page.locator('#new-card-hint').textContent()).trim() === '', '卡号提示也清了');
 await page.click('#search-type button[data-type="card"]');
+// 还原成本用例的前提（关闭收集），后面还要验联系方式那一栏不在 DOM 里
+await page.evaluate(() => { S.settings.collect_pii = false; applyPiiTabs(); });
 
 // ── 库存卡 → 引导建会员 ──
 await lookup(CARD_A);

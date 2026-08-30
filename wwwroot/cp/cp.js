@@ -328,9 +328,18 @@ async function loadConfig() {
   $$('.cfg-items select').forEach(sel => sel.onchange = () => saveCfg(sel.dataset.ck));
 }
 
-/** 渲染一项配置。类型决定用什么控件 —— 开关就是开关，别让人填 0/1 */
+/**
+ * 渲染一项配置。类型决定用什么控件 —— 开关就是开关，别让人填 0/1。
+ *
+ * it.active === false 表示【当下这一项用不上】（比如口径选了「按次数」，
+ * 那「累计消费多少送一次」就轮不到它）。这时置灰，并把原因写在旁边 ——
+ * 光置灰不说话，看着就是坏了。
+ *
+ * ★ 置灰只是不让编辑，值照旧存在库里。口径切回去，原来填的值原样还在。
+ */
 function cfgRow(it, ro) {
-  const dis = ro ? ' disabled' : '';
+  const off = it.active === false;
+  const dis = (ro || off) ? ' disabled' : '';
   let ctrl;
   if (it.type === 'bool') {
     ctrl = `<label class="switch-wrap">
@@ -346,12 +355,13 @@ function cfgRow(it, ro) {
     ctrl = `<span class="cfg-input">
       <input data-ck="${esc(it.key)}" value="${esc(it.value)}"${mode}${dis}>
       ${it.unit ? `<em>${esc(it.unit)}</em>` : ''}
-      ${ro ? '' : `<button class="tiny primary" data-cs="${esc(it.key)}">保存</button>`}</span>`;
+      ${(ro || off) ? '' : `<button class="tiny primary" data-cs="${esc(it.key)}">保存</button>`}</span>`;
   }
-  return `<div class="cfg-item">
+  return `<div class="cfg-item${off ? ' cfg-off' : ''}">
     <div class="cfg-label">${esc(it.label)}<code>${esc(it.key)}</code></div>
     <div class="cfg-ctrl">${ctrl}</div>
-    <div class="cfg-desc muted small">${esc(it.desc)}</div>
+    <div class="cfg-desc muted small">${esc(it.desc)}${
+      off && it.inactive_hint ? `<br><b class="cfg-why">${esc(it.inactive_hint)}</b>` : ''}</div>
   </div>`;
 }
 
@@ -365,6 +375,34 @@ async function saveCfg(key) {
    * 这种状态不会自己暴露：客人留了手机号却收不到确认链接，积分默默冻结着，
    * 等有人来投诉才发现。所以开启时明确告知，开启之后后台再挂一条常驻红条。
    */
+  /**
+   * 切换门槛口径 —— 先把「切过去之后门槛是多少」摆出来再确认。
+   *
+   * 两个门槛各存各的，切口径就是换一个生效。而当下用不上的那个是置灰的、
+   * 改不了，所以【没法先调好再切】—— 只能切过去再调。中间这一小段时间
+   * 用的是上一次留下的值，万一那是个测试时随手填的 1.00，
+   * 一切过去就会给一大批人发券，而发出去的券是收不回来的。
+   *
+   * 所以这里不拦，只是把那个数字明明白白摆出来让人看一眼。
+   */
+  if (key === 'reward_mode') {
+    const other = val === 'visits' ? 'reward_threshold_visits' : 'reward_threshold_amount';
+    const el2   = $(`[data-ck="${other}"]`);
+    const shown = val === 'visits' ? `每满 ${el2 ? el2.value : '?'} 次送 1 次`
+                                   : `每累计消费 € ${el2 ? el2.value : '?'} 送 1 次`;
+    const go = await UI.confirm(
+      `切换门槛口径后，规则会立刻变成：
+
+    ${shown}
+
+` +
+      '这个数字是上一次留下的值。如果不对，切换后请马上改 —— ' +
+      '门槛偏低会立刻给一批人补发券，而【发出去的券收不回来】。',
+      { okText: '确认切换' }
+    );
+    if (!go) { loadConfig(); return; }
+  }
+
   if (key === 'member_collect_pii' && val === '1' && window.SMS_READY === false) {
     const go = await UI.confirm(
       '确认短信/邮件目前尚未接入。\n\n' +
@@ -536,8 +574,69 @@ $('#btn-add-op').onclick = async () => {
 
 /* ── 实体卡发放 ───────────────────────────────────── */
 
+/**
+ * 从今天到 ymd 还有多少【日历天】。
+ *
+ * 两边都取当地日期的 y/m/d 再拿 Date.UTC 做差 —— 不这么做的话，
+ * 西班牙一年两次夏令时切换那两天会差出 23/25 小时，
+ * 除以 86400000 之后就变成 379.96 天，四舍五入还能撞上边界。
+ * 取的是日历天，就该按日历算，不该掺进钟点。
+ */
+function daysUntil(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ''));
+  if (!m) return null;
+  const then = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  const n = new Date();
+  const today = Date.UTC(n.getFullYear(), n.getMonth(), n.getDate());
+  return Math.round((then - today) / 86400000);
+}
+
+/**
+ * 「距今 380 天（约 1 年 1 个月）」。
+ *
+ * 天数是主角 —— 但年月那一段才是真正能挡住【记错年份】的：
+ * 2028 打成 2038 时，天数从 745 跳到 4400 也许还要愣一下，
+ * 「约 12 年」是一眼就不对。这一整句就是为这个错误准备的。
+ */
+function validityHint(ymd) {
+  const n = daysUntil(ymd);
+  if (n === null) return '';
+  if (n < 0)  return `已经过期 ${-n} 天 —— 这个日期在今天之前`;
+  if (n === 0) return '就是今天 —— 印出来当天就作废';
+  let y = Math.floor(n / 365), mo = Math.round((n % 365) / 30.44);
+  // 余数四舍五入可能凑满 12 个月（如 725 天 → 1 年 12 个月），得进位
+  if (mo >= 12) { y += 1; mo = 0; }
+  const rough = y >= 1 ? `，约 ${y} 年${mo ? ` ${mo} 个月` : ''}` : '';
+  return `距今 ${n} 天${rough}`;
+}
+
+/* 有效期那一格改一下就更新旁边的红字，不用等到点「生成」才发现 */
+function refreshValidityHint() {
+  const el = $('#cd-valid-hint');
+  if (!el) return;
+  el.textContent = validityHint($('#cd-valid').value);
+}
+
+/**
+ * 默认填【2 年后的 12 月 31 日】。
+ *
+ * 只是预填，不锁定 —— 想填别的（包括更早的日期）照填不误。
+ * 取年底是因为卡面上印「2028-12-31」比印「2028-03-17」好记好核对，
+ * 整批卡的作废时间也集中，不会一年到头零零散散地过期。
+ *
+ * ★ 只在这一格【还是空的】时候填。已经填过就别动 ——
+ *   切个标签页回来把人家改好的日期冲掉，是最招人烦的那种「智能」。
+ */
+function defaultValidTo() {
+  const el = $('#cd-valid');
+  if (!el || el.value) return;
+  el.value = `${new Date().getFullYear() + 2}-12-31`;
+  refreshValidityHint();
+}
+
 async function loadCards() {
   const d = await api('/cards/batches', undefined, 'GET');
+  defaultValidTo();
 
   const tot = d.batches.reduce((a, b) => ({
     total: a.total + b.total, stock: a.stock + b.stock,
@@ -599,6 +698,27 @@ async function loadTiers() {
       .map(t => `<option value="${esc(t.code)}">${esc(t.name)}${
         t.multiplier !== 1 ? `（${t.multiplier} 倍积分）` : ''}</option>`).join('');
     if (keep) sel.value = keep;
+  }
+
+  /**
+   * 两个门槛格受全局「门槛口径」管：口径没选的那一格置灰。
+   * 和「配置 → 奖励规则」里那两项是同一套规矩 —— 两个页面必须一致，
+   * 否则同一件事这边能改那边不能改，只会让人以为哪边坏了。
+   */
+  const byVisits = (d.reward_mode || 'visits') === 'visits';
+  const thv = $('#tier-thv'), tha = $('#tier-tha'), why = $('#tier-th-why');
+  if (thv && tha) {
+    thv.disabled = !byVisits;
+    tha.disabled = byVisits;
+    thv.closest('label').classList.toggle('cfg-off', !byVisits);
+    tha.closest('label').classList.toggle('cfg-off', byVisits);
+  }
+  if (why) {
+    why.textContent = byVisits
+      ? '当前口径是「按次数」，所以只有「几次送 1 次」那一格可填。'
+        + '要按金额的话，去「配置 → 奖励规则 → 门槛口径」改。'
+      : '当前口径是「按金额」，所以只有「满额送 1 次」那一格可填。'
+        + '要按次数的话，去「配置 → 奖励规则 → 门槛口径」改。';
   }
 
   const list = $('#tier-list');
@@ -749,6 +869,9 @@ $('#btn-card-void').onclick = async () => {
   } catch (e) { toast(e.message, 'err'); }
 };
 
+$('#cd-valid').addEventListener('input',  refreshValidityHint);
+$('#cd-valid').addEventListener('change', refreshValidityHint);
+
 $('#btn-card-gen').onclick = async () => {
   const batch = $('#cd-batch').value.trim();
   const count = +$('#cd-count').value || 0;
@@ -766,12 +889,21 @@ $('#btn-card-gen').onclick = async () => {
    * 一旦印错，整批卡的合规基础就没了 —— 而且是印完才发现。
    * 多按一次确认，换的是这个。
    */
+  /**
+   * 距今多少天用红字单独摆一行。
+   *
+   * 日期本身是「对不对」看不出来的东西 —— 2028 还是 2029，盯着看也就那样。
+   * 换算成天数就不一样了：记错一年，数字差出三四百天，一眼就不对。
+   * 这一句是给「脑子一时反应错」准备的，不是给系统校验准备的。
+   */
+  // 红字排在正文【下面】，所以把日期挪到最后一行 —— 数字才紧挨着日期
   if (!await UI.confirm(
-    `请再核对一次有效期：\n\n` +
-    `        ${valid}\n\n` +
     `这个日期会印在卡面上，也是客人唯一能看到的告知。\n` +
-    `与印刷稿不一致的话，整批卡都得重印。`,
-    { okText: '日期没错', cancelText: '我再看看' })) return;
+    `与印刷稿不一致的话，整批卡都得重印。\n\n` +
+    `请再核对一次有效期：\n\n` +
+    `        ${valid}`,
+    { okText: '日期没错', cancelText: '我再看看',
+      highlight: validityHint(valid) })) return;
 
   if (!await UI.confirm(
     `生成 ${count} 张新卡（有效期至 ${valid}）？\n\n` +

@@ -252,6 +252,22 @@ $cfgSeed = [
     'manual_entry_enabled'    => '1',
     'manual_entry_limit'      => '200.00',
     'manual_entry_daily_alert'=> '5',
+    /**
+     * ★ 防刷闸门在【绝大多数段落里必须关掉】。
+     *
+     * 冒烟用的假订单结账时间是固定的 2026-08-13，跑测试的那天永远比它晚 ——
+     * 于是每一单都算「补记」，每一次 grant 都会被拦成 manager_required。
+     * 那样测到的全是闸门，而不是这些段落真正要测的分配算法。
+     *
+     * 闸门本身在 ㉒ 段单独测：那一段会把它打开，并且用【当天】的订单
+     * 走完「拦下 → 经理带原因放行」的全过程。
+     */
+    'late_grant_minutes'      => '0',
+    'max_grants_per_period'   => '0',
+    'alert_grants_per_day'    => '0',
+    'alert_span_hours'        => '0',
+    'merge_span_minutes'      => '60',
+    'merge_max_orders'        => '8',
 ];
 foreach ($cfgSeed as $k => $v) {
     $app->cfg()->set($k, $v);
@@ -273,6 +289,23 @@ foreach ($rules as $r) {
     $app->mealRuleRepo()->upsert($r);
 }
 eq(3, $app->mealRuleRepo()->load()->count(), '写入 3 条套餐规则');
+
+/**
+ * 餐期 —— 以前冒烟不灌这个，因为没有任何代码读 meal_period。
+ *
+ * 现在「一张卡一个餐期最多 1 次」要靠它分中午和晚上，不灌的话
+ * MealPeriod 会退回「同一营业日」这个更粗的口径，于是
+ * 「中午来过、晚上又来」被当成同一顿，测出来的是错的结论。
+ * 这一条是写这段测试时踩到的：断言先红了，才发现库里一条餐期都没有。
+ */
+$db->exec('DELETE FROM meal_period WHERE store_code = ?', [SMOKE_STORE]);
+foreach ([['白天', '11:00:00', '18:00:00', 0, 1],
+          ['晚上', '19:30:00', '02:00:00', 1, 2]] as [$nm, $st, $en, $cross, $so]) {
+    $db->exec('INSERT INTO meal_period (store_code, period_name, start_time, end_time, cross_midnight, sort_order)
+               VALUES (?,?,?,?,?,?)', [SMOKE_STORE, $nm, $st, $en, $cross, $so]);
+}
+eq(2, (int)$db->value('SELECT COUNT(*) FROM meal_period WHERE store_code = ?', [SMOKE_STORE]),
+   '写入 2 个餐期（白天 / 晚上）');
 
 // ── 5. 构造假 POS 数据 ───────────────────────────────────────
 step('构造 POS 夹具（形态照搬真实导出）');
@@ -1718,6 +1751,363 @@ ok(isset($op2['names']['zh'], $op2['names']['es']),
 
 $db->exec('DELETE FROM operator_session WHERE store_code = ? AND operator_id = ?', [SMOKE_STORE, $langOp]);
 $db->exec('DELETE FROM operator WHERE store_code = ? AND id = ?', [SMOKE_STORE, $langOp]);
+
+step('㉒ 防刷：同行分桌要放行，捡小票要挡住');
+
+/**
+ * 这一整段的前提写在 docs/03 §12：
+ *
+ * 「同行分桌」和「捡了几张别人的小票」在系统里长得【一模一样】——
+ * 都是多张订单记进同一张卡。能把两者分开的只有时间：
+ *   · 同行分桌永远是当场，几张单结账时间也挨在一起
+ *   · 捡小票在物理上必须发生在结账之后，来源必然分散
+ *
+ * 所以下面每一条都在验时间维度的判据，以及「拦下之后还有没有活路」——
+ * 一刀拒绝的代价是柜台当面回绝客人，那正是投诉的来源。
+ */
+
+// ★ 必须新建 App：ConfigRepo 按实例缓存，下面要反复改闸门的开关
+$rk = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$rkDb = $rk->localDb();
+
+// 造三张【刚刚结账】的同桌单，模拟一大帮人坐了三桌一起结账
+$rkPos = new FakePosSource();
+$rkPos->now = date('Y-m-d H:i:s');
+$mkOrder = function (string $serial, int $ohid, string $table, string $amt, string $when) use ($rkPos) {
+    $rkPos->addHead([
+        'serial_id' => $serial, 'order_head_id' => $ohid, 'check_id' => 1,
+        'table_name' => $table, 'eat_type' => 0, 'customer_num' => 3,
+        'original_amount' => $amt, 'should_amount' => $amt, 'actual_amount' => $amt,
+        'order_end_time' => $when,
+    ]);
+    $rkPos->addDetail($ohid, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', $amt, 2)]);
+};
+$nowTs = time();
+$mkOrder('9909990001', 990001, 'R1', '47.80', date('Y-m-d H:i:s', $nowTs - 120));
+$mkOrder('9909990002', 990002, 'R2', '47.80', date('Y-m-d H:i:s', $nowTs - 300));
+$mkOrder('9909990003', 990003, 'R3', '47.80', date('Y-m-d H:i:s', $nowTs - 420));
+// 第四张：同一天但隔了 5 小时 —— 「捡小票」的形状
+$mkOrder('9909990004', 990004, 'R9', '47.80', date('Y-m-d H:i:s', $nowTs - 5 * 3600));
+/**
+ * 第五张：和前三桌【同一顿】，专门留给 ⑤ 段测餐期上限。
+ *
+ * ★ 不能拿上面那张 5 小时前的单来测上限 —— 它和前三桌很可能不在同一个餐期
+ *   （比如现在 21:46 属「晚上」，5 小时前 16:46 属「白天」），
+ *   于是 countGrantsInSitting 一条都数不到，闸门根本不会触发。
+ *   这条测试因此会【随一天中的时刻时绿时红】：跑在 18:00–19:30 那个
+ *   餐期空档里就恰好是绿的，因为那时两张单都落在餐期之外、退回按天比。
+ *   加餐期种子之前它一直是绿的，正是这个原因。
+ */
+$mkOrder('9909990005', 990005, 'R5', '47.80', date('Y-m-d H:i:s', $nowTs - 60));
+$rk->setPosSource($rkPos);
+
+foreach (['R1', 'R2', 'R3', 'R9', 'R5'] as $tb) {
+    $rk->points()->locate($tb, 600);
+}
+eq(5, (int)$rkDb->value('SELECT COUNT(*) FROM pos_order WHERE store_code=? AND serial_id LIKE ?',
+                        [SMOKE_STORE, '99099900%']), '五张测试订单已落镜像');
+
+$rkMid = (int)$rk->members()->create('TK-00099901-RSK', null, null, null)['id'];
+$rkOpS = ['id' => 1, 'name' => '收银员', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => false];
+$rkOpM = ['id' => 2, 'name' => '经理',   'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+
+// ── ① 多桌合并：三桌整单记进一张卡 ─────────────────────
+$rk->cfg()->set('late_grant_minutes', '60');
+$rk->cfg()->set('merge_span_minutes', '60');
+$rk->cfg()->set('max_grants_per_period', '0');
+
+$mg = $rk->points()->grantMerged(['9909990001', '9909990002', '9909990003'], $rkMid, $rkOpS);
+ok($mg['ok'], '★★ 同行分桌：三桌一次记进一张卡' . ($mg['ok'] ? '' : '（' . ($mg['error'] ?? '?') . '）'));
+eq(3, count($mg['entries'] ?? []), '  └ 产出三笔流水（每桌一笔，金额守恒仍是逐单校验的）');
+$grp = $mg['group'] ?? '';
+ok($grp !== '', "  └ 三笔盖同一个组号：{$grp}");
+eq(3, (int)$rkDb->value('SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND grant_group=?',
+                        [SMOKE_STORE, $grp]), '★ 库里查得到这一组');
+eq(1, (int)$rkDb->value('SELECT COUNT(DISTINCT member_id) FROM point_ledger WHERE store_code=? AND grant_group=?',
+                        [SMOKE_STORE, $grp]), '★ 全部记给同一位会员');
+$mSum = $rkDb->one('SELECT points_balance, visit_count FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $rkMid]);
+eq(141, (int)$mSum['points_balance'], '★★ 三桌 47.80 × 3 = 143.40 → 141 分（逐单向下取整 47+47+47）');
+eq(6, (int)$mSum['visit_count'], '  └ 计次 6（每桌 2 份套餐）');
+
+// ── ② 合并算「一次」，不是「三次」──────────────────────
+/**
+ * 这一条是整套限次能不能用的关键。
+ * 按订单数算的话，一个五桌的大团一次就顶满上限，
+ * 而这恰恰是最应该放行的正当场景。
+ */
+$rk->cfg()->set('max_grants_per_period', '2');
+$ref = $rkDb->one('SELECT order_end_time FROM pos_order WHERE store_code=? AND serial_id=?',
+                  [SMOKE_STORE, '9909990001']);
+$rm = new ReflectionMethod(Vip\Service\PointsService::class, 'countGrantsInSitting');
+$rm->setAccessible(true);
+eq(1, $rm->invoke($rk->points(), $rkMid, (string)$ref['order_end_time'], []),
+   '★★★ 三桌合并只算【1 次】—— 按订单数算的话大团一次就顶满上限，而那正是最该放行的');
+
+// ── ③ 时间跨度：隔了 5 小时的单不能混进同一组 ────────────
+$mg2 = $rk->points()->grantMerged(['9909990001', '9909990004'], $rkMid, $rkOpS);
+ok(!$mg2['ok'], '★★ 隔了 5 小时的两单不让合并');
+ok(in_array($mg2['error'] ?? '', ['merge_span_too_wide', 'merge_not_same_sitting'], true),
+   "  └ 理由说得清：{$mg2['error']}");
+
+// ── ④ 补记时限：超时要经理带原因 ────────────────────────
+$lateR = $rk->points()->grant('9909990004', [['member_id' => $rkMid, 'amount_cents' => 4780, 'portions' => 2]],
+                              Vip\PointsEngine::MODE_WHOLE, $rkOpS);
+ok(!$lateR['ok'] && $lateR['error'] === 'manager_required',
+   '★★ 5 小时前的单，普通收银员记不了（补记要经理）');
+ok(($lateR['detail']['gates'][0]['gate'] ?? '') === 'late_grant',
+   '  └ 告诉前端撞的是哪道闸门，好让界面说人话');
+
+// 经理但不写原因 —— 照样不行
+$noReason = $rk->points()->grant('9909990004', [['member_id' => $rkMid, 'amount_cents' => 4780, 'portions' => 2]],
+                                 Vip\PointsEngine::MODE_WHOLE, $rkOpM, ['reason' => '   ']);
+eq('reason_required', $noReason['error'] ?? '', '★★ 经理也必须写原因 —— 破例不留痕等于没有规则');
+
+// 普通收银员就算自己填了原因也不行
+$notMgr = $rk->points()->grant('9909990004', [['member_id' => $rkMid, 'amount_cents' => 4780, 'portions' => 2]],
+                               Vip\PointsEngine::MODE_WHOLE, $rkOpS, ['reason' => '客人忘带卡']);
+eq('forbidden', $notMgr['error'] ?? '', '★★ 普通收银员自己填原因也破不了例');
+
+// 经理 + 原因 → 放行
+$forced = $rk->points()->grant('9909990004', [['member_id' => $rkMid, 'amount_cents' => 4780, 'portions' => 2]],
+                               Vip\PointsEngine::MODE_WHOLE, $rkOpM, ['reason' => '客人忘带卡，隔天拿小票来补']);
+ok($forced['ok'] ?? false, '★★ 经理写了原因就能补记 —— 一刀拒绝的代价是柜台当面回绝客人');
+ok($forced['forced'] ?? false, '  └ 返回值标着这是破例');
+/**
+ * ★★ 破例要【单独一个 action】，不能混在普通记账里。
+ *
+ * 后台「审计」页是按 action 筛的。混在 point_grant 里的话，
+ * 想回答「这个月破了几次例、谁放的行」就得把当月几千条记账
+ * 一条条翻 detail —— 等于查不了。
+ */
+eq(1, (int)$rkDb->value(
+    'SELECT COUNT(*) FROM audit_log WHERE store_code=? AND action=? AND detail LIKE ?',
+    [SMOKE_STORE, 'point_grant_forced', '%忘带卡%']),
+   '★★ 破例单独记一条 point_grant_forced，带着原因 —— 筛一下就是全部破例');
+eq('经理', (string)$rkDb->value(
+    'SELECT operator_name FROM audit_log WHERE store_code=? AND action=? ORDER BY id DESC LIMIT 1',
+    [SMOKE_STORE, 'point_grant_forced']), '  └ 记着是谁放的行');
+
+// ── ⑤ 餐期上限 ──────────────────────────────────────────
+$rk->cfg()->set('late_grant_minutes', '0');     // 只测上限，把补记闸门让开
+$rk->cfg()->set('max_grants_per_period', '1');
+// ★ 用同一顿的那张（9909990005），不是 5 小时前那张 —— 理由见上面造单处
+$capR = $rk->points()->grant('9909990005', [['member_id' => $rkMid, 'amount_cents' => 1, 'portions' => 0]],
+                             Vip\PointsEngine::MODE_WHOLE, $rkOpS);
+ok(!$capR['ok'] && $capR['error'] === 'manager_required', '★★ 同一餐期超过上限，普通收银员记不了');
+ok(($capR['detail']['gates'][0]['gate'] ?? '') === 'period_cap', "  └ 撞的是次数上限");
+
+// ── ⑥ 整组撤销 ──────────────────────────────────────────
+$rk->cfg()->set('max_grants_per_period', '0');
+$before = (int)$rkDb->value('SELECT points_balance FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $rkMid]);
+$rg = $rk->points()->reverseGroup($grp, '客人反悔，改为各记各的', $rkOpM);
+ok($rg['ok'] ?? false, '★★ 整组撤销成功');
+eq(3, $rg['count'] ?? 0, '  └ 三笔一起撤（合并是一次操作，撤销也该是一次操作）');
+$after = (int)$rkDb->value('SELECT points_balance FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $rkMid]);
+eq($before - 141, $after, '★★ 三桌的分一次全退干净');
+eq(0, (int)$rkDb->value(
+    'SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND grant_group=? AND entry_type=1 AND status=1',
+    [SMOKE_STORE, $grp]), '  └ 组内已无有效的消费流水');
+$allocBack = $rkDb->value('SELECT allocated_amount FROM pos_order WHERE store_code=? AND serial_id=?',
+                          [SMOKE_STORE, '9909990001']);
+eq('0.00', (string)$allocBack, '★★ 订单的已分配额也退回去了 —— 这几桌可以重新记账');
+ok(!($rk->points()->reverseGroup($grp, '再撤一次', $rkOpM)['ok'] ?? false),
+   '★ 撤过的组不能再撤（幂等）');
+
+// ── ⑦ 告警：拦不住内部人，但要留下痕迹 ──────────────────
+/**
+ * 上面每一道闸门都建立在「收银员是诚实的」之上，
+ * 可员工本人就是收银员 —— 他要么有经理 PIN，要么干脆就是经理。
+ * 对内部作案事前拦截在结构上无效，能做的只有让它留痕。
+ */
+$rk->cfg()->set('alert_span_hours', '2');
+$rk->cfg()->set('alert_grants_per_day', '2');
+$rkDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type LIKE ?', [SMOKE_STORE, 'grant_%']);
+foreach (['9909990001', '9909990002', '9909990003', '9909990004'] as $sn) {
+    $rk->points()->grant($sn, [['member_id' => $rkMid, 'amount_cents' => 4780, 'portions' => 2]],
+                         Vip\PointsEngine::MODE_WHOLE, $rkOpS);
+}
+$alerts = $rkDb->all('SELECT alert_type, message FROM alert WHERE store_code=? AND alert_type LIKE ?',
+                     [SMOKE_STORE, 'grant_%']);
+$types = array_column($alerts, 'alert_type');
+ok(in_array('grant_many_per_day', $types, true), '★★ 一天记太多次 → 告警');
+ok(in_array('grant_span_wide', $types, true),
+   '★★ 几单结账时间跨度太大 → 告警（「攒了一把小票一起来兑」的形状）');
+ok(count($alerts) <= 2, '  └ 同一张卡同一类型不重复刷屏（raiseOnce）');
+
+// 告警只观察不拦人
+eq(4, (int)$rkDb->value(
+    'SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND member_id=? AND entry_type=1 AND status=1 AND grant_group IS NULL',
+    [SMOKE_STORE, $rkMid]), '★★ 告警不影响记账 —— 四笔都记上了，只是后台多了两条待处理');
+
+// 清理
+$rkDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type LIKE ?', [SMOKE_STORE, 'grant_%']);
+$rkDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $rkMid]);
+$rkDb->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $rkMid]);
+$rkDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id LIKE ?', [SMOKE_STORE, '99099900%']);
+
+step('㉓ 计次口径：一张卡，一个餐期，最多 1 次');
+
+/**
+ * 这是「十送一」口径的一次根本改变：从【买 10 份套餐】变成【来 10 趟】。
+ *
+ * 旧口径（by_portion）没法防：一桌 10 个人 10 份套餐，整单记给一个人
+ * = 一次 10 次计次，当场就够十送一。也就是说【一张小票 = 一顿免费的饭】——
+ * 捡到一张就直接换，连攒都不用攒。
+ *
+ * 新口径下：
+ *   · 一桌 4 人有 4 张卡 → 4 张各记 1 次
+ *   · 一桌 4 人只有 2 张卡 → 只记那 2 张，另外 2 份的次数【就是没有了】，
+ *     不会挪给在场的卡
+ *   · 捡一张 10 人的小票 → 1 次
+ *
+ * ★ 积分不受影响。钱是真花了的，不给分才是错的。
+ */
+
+$vc   = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$vcDb = $vc->localDb();
+$vc->cfg()->set('visit_count_mode', 'once_per_period');
+$vc->cfg()->set('late_grant_minutes', '0');       // 只测计次，别撞补记闸门
+$vc->cfg()->set('max_grants_per_period', '0');
+$vc->cfg()->set('alert_grants_per_day', '0');
+$vc->cfg()->set('alert_span_hours', '0');
+
+$vcPos = new FakePosSource();
+$vcPos->now = date('Y-m-d H:i:s');
+$today = date('Y-m-d');
+$mk = function (string $serial, int $ohid, string $table, int $portions, string $clock) use ($vcPos, $today) {
+    $amt = number_format(23.90 * $portions, 2, '.', '');
+    $vcPos->addHead([
+        'serial_id' => $serial, 'order_head_id' => $ohid, 'check_id' => 1,
+        'table_name' => $table, 'eat_type' => 0, 'customer_num' => $portions,
+        'original_amount' => $amt, 'should_amount' => $amt, 'actual_amount' => $amt,
+        'order_end_time' => $today . ' ' . $clock,
+    ]);
+    $vcPos->addDetail($ohid, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', $amt, $portions)]);
+};
+// 白天餐期（11:00–18:00）两单，晚市（19:30–02:00）一单
+$mk('9808880001', 980001, 'V1', 3, '13:10:00');
+$mk('9808880002', 980002, 'V2', 2, '13:40:00');
+$mk('9808880003', 980003, 'V3', 4, '21:15:00');
+$mk('9808880004', 980004, 'V4', 4, '13:20:00');
+$vc->setPosSource($vcPos);
+foreach (['V1', 'V2', 'V3', 'V4'] as $tb) { $vc->points()->locate($tb, 1200); }
+
+$mA = (int)$vc->members()->create('TK-00098801-AAA', null, null, null)['id'];
+$mB = (int)$vc->members()->create('TK-00098802-BBB', null, null, null)['id'];
+$mC = (int)$vc->members()->create('TK-00098803-CCC', null, null, null)['id'];
+$mD = (int)$vc->members()->create('TK-00098804-DDD', null, null, null)['id'];
+$vcOp = ['id' => 1, 'name' => '收银员', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => false];
+$visitsOf = fn(int $id): int => (int)$vcDb->value(
+    'SELECT visit_count FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $id]);
+$pointsOf = fn(int $id): int => (int)$vcDb->value(
+    'SELECT points_balance FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $id]);
+
+// ── ① 3 份套餐记给一个人 = 1 次，不是 3 次 ──────────────
+$r1 = $vc->points()->grant('9808880001', [['member_id' => $mA, 'amount_cents' => 7170, 'portions' => 3]],
+                           Vip\PointsEngine::MODE_WHOLE, $vcOp);
+ok($r1['ok'], '记账成功');
+eq(1, $visitsOf($mA), '★★★ 3 份套餐整单记给一个人 = 【1 次】—— 旧口径下这里是 3 次');
+eq(71, $pointsOf($mA), '  └ 积分照常给 71 分（钱是真花了的，不给分才是错的）');
+
+// ── ② 同一餐期再来一单 = 0 次，但积分照给 ────────────────
+$r2 = $vc->points()->grant('9808880002', [['member_id' => $mA, 'amount_cents' => 4780, 'portions' => 2]],
+                           Vip\PointsEngine::MODE_WHOLE, $vcOp);
+ok($r2['ok'], '同一餐期第二单也记得上（不是拒绝）');
+eq(1, $visitsOf($mA), '★★★ 同一餐期第二单【不再计次】—— 一张卡一个餐期最多 1 次');
+eq(0, (int)$r2['entries'][0]['visits'], '  └ 返回值里明写着这一单计次为 0，前端好告诉收银员');
+eq(71 + 47, $pointsOf($mA), '★★ 但积分照加 —— 不计次不等于不积分');
+
+// ── ③ 换个餐期又能记一次 ────────────────────────────────
+$r3 = $vc->points()->grant('9808880003', [['member_id' => $mA, 'amount_cents' => 9560, 'portions' => 4]],
+                           Vip\PointsEngine::MODE_WHOLE, $vcOp);
+ok($r3['ok'], '晚市这一单记账成功');
+eq(2, $visitsOf($mA), '★★ 中午记过、晚上又来 → 再记 1 次（一天两个餐期各算各的）');
+
+// ── ④ 一桌 4 人 4 张卡：各记 1 次 ───────────────────────
+$vcDb->exec('DELETE FROM point_ledger WHERE store_code=? AND serial_id=?', [SMOKE_STORE, '9808880004']);
+$vcDb->exec('UPDATE pos_order SET allocated_amount=0, allocated_portions=0 WHERE store_code=? AND serial_id=?',
+            [SMOKE_STORE, '9808880004']);
+$r4 = $vc->points()->grant('9808880004', [
+    ['member_id' => $mB, 'amount_cents' => 2390, 'portions' => 1],
+    ['member_id' => $mC, 'amount_cents' => 2390, 'portions' => 1],
+    ['member_id' => $mD, 'amount_cents' => 2390, 'portions' => 1],
+], Vip\PointsEngine::MODE_SPLIT, $vcOp);
+ok($r4['ok'], '一桌 3 张卡同时记账');
+eq([1, 1, 1], [$visitsOf($mB), $visitsOf($mC), $visitsOf($mD)],
+   '★★★ 三张卡【各记 1 次】—— 这正是新规则要的形状');
+
+// ── ⑤ 一桌 4 人只有 2 张卡：剩下的次数就是没有了 ─────────
+/**
+ * ★★★ 这一条是整条规则的重点。
+ *
+ * 那一桌确实吃了 4 份，但只有 2 位客人带了卡。
+ * 剩下 2 份的次数【不会挪给在场的两张卡】—— 挪过去就等于
+ * 「一桌 2 个人计入一个名下」，正是这次要禁掉的事。
+ */
+$mk('9808880005', 980005, 'V5', 4, '13:50:00');
+$vc->setPosSource($vcPos);
+$vc->points()->locate('V5', 1200);
+$mE = (int)$vc->members()->create('TK-00098805-EEE', null, null, null)['id'];
+$mF = (int)$vc->members()->create('TK-00098806-FFF', null, null, null)['id'];
+$r5 = $vc->points()->grant('9808880005', [
+    ['member_id' => $mE, 'amount_cents' => 4780, 'portions' => 2],
+    ['member_id' => $mF, 'amount_cents' => 4780, 'portions' => 2],
+], Vip\PointsEngine::MODE_SPLIT, $vcOp);
+ok($r5['ok'], '4 人桌记给 2 张卡');
+eq(2, $visitsOf($mE) + $visitsOf($mF),
+   '★★★ 一桌 4 份、只有 2 张卡 → 全桌只记 2 次（各 1 次），另外 2 份的次数没有了');
+eq(1, $visitsOf($mE), '  └ 每张各 1 次，不是一张 2 次');
+
+// ── ⑥ 多桌合并：三桌并给一张卡也只有 1 次 ───────────────
+/**
+ * ★★ 这一条守的是【同一个事务内】的可见性。
+ *
+ * 合并是在一个事务里连着调 grantOne 三遍。第一遍插进去的流水
+ * 必须被第二遍查得到，否则三桌各记 1 次 —— 等于什么都没防住。
+ * 判定查库而不是缓存，正是为了这个。
+ */
+$mk('9808880011', 980011, 'W1', 2, '13:05:00');
+$mk('9808880012', 980012, 'W2', 2, '13:12:00');
+$mk('9808880013', 980013, 'W3', 2, '13:18:00');
+$vc->setPosSource($vcPos);
+foreach (['W1', 'W2', 'W3'] as $tb) { $vc->points()->locate($tb, 1200); }
+$mG = (int)$vc->members()->create('TK-00098807-GGG', null, null, null)['id'];
+$mgOp = ['id' => 2, 'name' => '经理', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$r6 = $vc->points()->grantMerged(['9808880011', '9808880012', '9808880013'], $mG, $mgOp);
+ok($r6['ok'], '三桌合并成功' . ($r6['ok'] ? '' : '（' . ($r6['error'] ?? '?') . '）'));
+eq(1, $visitsOf($mG),
+   '★★★ 三桌并给一张卡，计次仍然只有【1 次】—— 同一事务内第一笔要被后两笔看见');
+eq(141, $pointsOf($mG), '  └ 但三桌的积分全都进来了（并的是积分，不是次数）');
+eq([1, 0, 0], array_map(static fn(array $e): int => (int)$e['visits'], $r6['entries']),
+   '  └ 逐笔看：第一桌记 1 次，后两桌 0 次');
+
+// ── ⑦ 老口径仍然能用 ────────────────────────────────────
+$vc->cfg()->set('visit_count_mode', 'by_portion');
+$mk('9808880021', 980021, 'X1', 5, '14:10:00');
+$vc->setPosSource($vcPos);
+$vc->points()->locate('X1', 1200);
+$mH = (int)$vc->members()->create('TK-00098808-HHH', null, null, null)['id'];
+$vc->points()->grant('9808880021', [['member_id' => $mH, 'amount_cents' => 11950, 'portions' => 5]],
+                     Vip\PointsEngine::MODE_WHOLE, $vcOp);
+eq(5, $visitsOf($mH), '★ 切回 by_portion：5 份 = 5 次（店家想回去也回得去）');
+
+$vc->cfg()->set('visit_count_mode', 'by_order');
+$mk('9808880022', 980022, 'X2', 5, '14:20:00');
+$vc->setPosSource($vcPos);
+$vc->points()->locate('X2', 1200);
+$mI = (int)$vc->members()->create('TK-00098809-III', null, null, null)['id'];
+$vc->points()->grant('9808880022', [['member_id' => $mI, 'amount_cents' => 11950, 'portions' => 5]],
+                     Vip\PointsEngine::MODE_WHOLE, $vcOp);
+eq(1, $visitsOf($mI), '★ 切到 by_order：整笔算 1 次');
+
+// 清理
+$vc->cfg()->set('visit_count_mode', 'by_portion');
+$ids = [$mA, $mB, $mC, $mD, $mE, $mF, $mG, $mH, $mI];
+$in  = implode(',', array_fill(0, count($ids), '?'));
+$vcDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ($in)", array_merge([SMOKE_STORE], $ids));
+$vcDb->exec("DELETE FROM coupon WHERE store_code=? AND member_id IN ($in)", array_merge([SMOKE_STORE], $ids));
+$vcDb->exec("DELETE FROM member WHERE store_code=? AND id IN ($in)", array_merge([SMOKE_STORE], $ids));
+$vcDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id LIKE ?', [SMOKE_STORE, '98088800%']);
 
 step('⑬ 不变量总校验');
 

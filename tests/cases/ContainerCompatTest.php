@@ -264,6 +264,14 @@ T::group('容器兼容 · 桥接副本不能漂移');
  * 而我们部署的那份还是旧的，diagnose() 里两种包看起来一模一样。
  *
  * apk/ 目录不部署到门店服务器，所以那里跑测试时这一组自动跳过。
+ *
+ * ⚠️ 2026-08：apk/ 已从本仓库整个删除（容器源码另行保管）。
+ *   于是这一条【永远处于跳过状态】—— 它不会再报错，也不会再挡住任何漂移。
+ *   现在 wwwroot/assets/sushivip-bridge.js 是本仓库里唯一的一份，
+ *   等于默认它就是对的。容器方那边改了桥接，这里没有任何东西会提醒。
+ *
+ *   保留这段代码是因为它零成本：哪天 apk/doc/ 回到这个仓库（或建个软链），
+ *   比对会自动重新生效。真要恢复这道保障，就把原件放回 apk/doc/。
  */
 $apkBridge = __DIR__ . '/../../apk/doc/sushivip-bridge.js';
 $webBridge = $root . 'assets/sushivip-bridge.js';
@@ -271,10 +279,64 @@ $webBridge = $root . 'assets/sushivip-bridge.js';
 T::true(is_file($webBridge), '部署副本存在（缺了就取不到原生设备 ID）');
 
 if (!is_file($apkBridge)) {
-    echo "  \033[33m–\033[0m 跳过副本比对：apk/ 不在（门店服务器上属正常）\n";
+    echo "  \033[33m–\033[0m 跳过副本比对：apk/doc/ 不在。"
+         . "门店服务器上属正常；开发机上则意味着【桥接漂移无人看着】\n";
 } else {
     T::eq(md5_get($apkBridge), md5_get($webBridge),
         '★ wwwroot 里的桥接与 apk/doc/ 的原件逐字节一致');
 }
 
 function md5_get(string $f): string { return md5((string)file_get_contents($f)); }
+
+T::group('容器契约 · 只能调容器真的提供的原生方法');
+
+/**
+ * ★ 容器（APK）的 JS 桥【只暴露一个方法】：window.AppBridge.getDeviceId()。
+ *   见容器方的《功能与组件说明》§2.2 与 §4。
+ *
+ *   调一个它没有的方法不会报错 —— `bridge.foo` 是 undefined，
+ *   我们的代码里到处是 `typeof x === 'function'` 的守卫，于是安静地走兜底。
+ *   而「安静地走兜底」正是最难在现场发现的那类问题：
+ *   功能看着能用，只是永远拿不到原生那一份数据。
+ *
+ *   所以把容器实际提供的方法名列在这里当白名单。
+ *   容器以后新增了能力，先更新这份名单，再在 Web 侧用。
+ */
+$bridgeSrc = (string)file_get_contents(__DIR__ . '/../../wwwroot/assets/sushivip-bridge.js');
+
+/** 容器当前真正实现的原生方法（对齐容器方文档 §2.2） */
+$nativeApi = ['getDeviceId'];
+
+preg_match_all('/AppBridge\s*\.\s*([A-Za-z_]\w*)/', $bridgeSrc, $m);
+$called = array_values(array_unique($m[1]));
+$unknown = array_diff($called, $nativeApi);
+
+T::true($unknown === [],
+    '★★ 只调了容器确实提供的原生方法（' . implode('、', $called) . '）'
+    . ($unknown
+        ? "\n      容器没有这些：" . implode('、', $unknown)
+          . "\n      —— 调用不会报错，会安静地走兜底，现场查不出来"
+        : ''));
+T::true(in_array('getDeviceId', $called, true), '  └ getDeviceId 确实在用（不是正则没匹配上）');
+
+T::group('容器契约 · 登录 Cookie 必须能落盘');
+
+/**
+ * ★★ 这一条直接对应一次现场事故与容器方的一条要求。
+ *
+ *   容器在 onPause/onStop 里做 CookieManager.flush() 把 Cookie 落盘，
+ *   但 **flush 只能持久化带 Expires / Max-Age 的 Cookie** ——
+ *   不带这两个属性的是「会话 Cookie」，按定义就不落盘，进程一死必然丢。
+ *
+ *   现在 setToken() 传了 expires，PHP 会同时发出 expires= 与 Max-Age=。
+ *   哪天有人把它改成会话 Cookie（比如「更安全」地去掉过期时间），
+ *   熄屏掉登录的毛病会立刻回来，而且在开发机上永远复现不出来
+ *   —— 桌面浏览器不会杀进程。
+ */
+$apiSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/Http/Api.php');
+T::true((bool)preg_match("/setcookie\(\s*self::COOKIE.*?'expires'\s*=>\s*time\(\)\s*\+/s", $apiSrc),
+    '★★ 登录 Cookie 带明确的过期时间，不是会话 Cookie —— 否则容器 flush 也救不回来');
+
+// 令牌还要有请求头这条后备路（Cookie 真丢了的时候）
+T::true(str_contains($apiSrc, 'HTTP_X_SESSION_TOKEN'),
+    '★ readToken 认请求头 —— Cookie 丢了还有第二条路');

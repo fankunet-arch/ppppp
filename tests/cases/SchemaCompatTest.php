@@ -355,6 +355,66 @@ T::eq(null, \Vip\ConfigSchema::validate('reward_mode', 'amount'), '合法选项�
 T::eq(null, \Vip\ConfigSchema::validate('business_day_cutoff', '02:00'), '时间格式通过');
 T::true(\Vip\ConfigSchema::validate('business_day_cutoff', '25:00') !== null, '非法时间被拒');
 
+T::group('配置 · 两个门槛由「门槛口径」决定哪个能改');
+
+/**
+ * 后台里「几次送一次」和「累计消费多少送一次」两格并排，而实际只有一格
+ * 在起作用 —— 起哪一格由「门槛口径」定。两格都能填的话，店家改了不起作用
+ * 的那一格，会以为规则变了而其实没变，等客人来问才发现。
+ *
+ * ★ 置灰【不影响存储】：值照旧在库里，口径切回去原样还在。
+ *   这里连带钉住这一点 —— 免得以后有人「顺手」在切口径时把另一格清空。
+ */
+$byVisits = ['reward_mode' => 'visits'];
+$byAmount = ['reward_mode' => 'amount'];
+$visitsItem = \Vip\ConfigSchema::ITEMS['reward_threshold_visits'];
+$amountItem = \Vip\ConfigSchema::ITEMS['reward_threshold_amount'];
+
+T::true(\Vip\ConfigSchema::isActive($visitsItem, $byVisits),  '★ 按次数时「几次送一次」可改');
+T::true(!\Vip\ConfigSchema::isActive($amountItem, $byVisits), '★★ 按次数时「累计消费多少送一次」置灰');
+T::true(\Vip\ConfigSchema::isActive($amountItem, $byAmount),  '★ 按金额时「累计消费多少送一次」可改');
+T::true(!\Vip\ConfigSchema::isActive($visitsItem, $byAmount), '★★ 按金额时「几次送一次」置灰');
+
+// 没声明依赖的项一律可改 —— 别让这套机制误伤其他配置
+T::true(\Vip\ConfigSchema::isActive(\Vip\ConfigSchema::ITEMS['reward_enabled'], $byVisits),
+    '没声明依赖的项不受影响');
+
+/**
+ * ★★ 老库里根本没有 reward_mode 这一项时，两格都要放行。
+ *   按「不等于就置灰」判的话两格【同时】锁死，管理员一格都改不了 ——
+ *   而唯一的解法（改口径）本身就在这个页面上，等于把自己关在门外。
+ */
+T::true(\Vip\ConfigSchema::isActive($visitsItem, []),
+    '★★ 库里没有 reward_mode 时「几次送一次」仍可改');
+T::true(\Vip\ConfigSchema::isActive($amountItem, []),
+    '★★ 「累计消费多少送一次」也可改 —— 两格同时锁死等于把管理员关在门外');
+T::true(!\Vip\ConfigSchema::isActive($amountItem, ['reward_mode' => '']),
+    '  └ 但有这一项、值是空串时照常判（那是数据脏，不是没有）');
+
+// 置灰要给理由，否则看着就是坏了
+$hint = \Vip\ConfigSchema::inactiveHint($amountItem);
+T::true(is_string($hint) && str_contains($hint, '门槛口径'),
+    "★★ 置灰时说清要先改哪一项：「{$hint}」");
+T::true(str_contains((string)$hint, '按金额'),
+    '  └ 并且点名要改成哪个选项（照抄下拉框里的原话，不另造词）');
+T::eq(null, \Vip\ConfigSchema::inactiveHint(\Vip\ConfigSchema::ITEMS['reward_enabled']),
+    '没依赖的项没有这句话');
+
+// grouped() 要把结论一并带给前端，否则后台还得自己算一遍
+$groups = \Vip\ConfigSchema::grouped(['reward_mode' => 'visits',
+                                       'reward_threshold_visits' => '10',
+                                       'reward_threshold_amount' => '300.00']);
+$found = null;
+foreach ($groups as $g) {
+    foreach ($g['items'] as $it) {
+        if ($it['key'] === 'reward_threshold_amount') { $found = $it; }
+    }
+}
+T::true($found !== null, 'grouped() 里找得到这一项');
+T::true(($found['active'] ?? null) === false, '★ grouped() 直接给出 active=false');
+T::eq('300.00', $found['value'] ?? null,
+    '★★ 置灰的项【值照样带出来】—— 置灰只是不让改，不是清空');
+
 // ⑤ 用户点名要的三项必须在
 foreach (['reward_mode' => '按次还是按金额',
           'reward_threshold_visits' => '几送一',
@@ -891,3 +951,76 @@ foreach (['008_card_valid_to.sql', '009_operator_lang.sql', '010_operator_name_e
     T::true(is_file($f) && str_contains((string)file_get_contents($f), 'information_schema'),
         "{$n} 用 information_schema 做了存在性判定");
 }
+
+T::group('Schema 文档没有落后于迁移');
+
+/**
+ * ★★ 这条测试是补一次真实的文档腐烂。
+ *
+ *   写完防刷那一版之后回头看 docs/04-本地库Schema.md，发现它【落后了三个迁移】：
+ *     · point_ledger 缺 grant_group / tier_code / tier_multiplier
+ *     · coupon 缺 tier_code / threshold_used
+ *     · pos_order 缺 original_amount / allocated_portions / is_redeemed / redeem_amount
+ *     · card、card_tier、operator、alert、operator_session、schema_migration
+ *       这六张表【整张都没写进去】
+ *
+ *   没人会主动去发现这件事 —— 文档不会报错，测试也不跑它。
+ *   下一个人照着 docs/04 建表，建出来的东西跑不起来，
+ *   而他会先怀疑自己而不是怀疑文档。
+ *
+ * 判定方式：从 db/migrations/*.sql 里抠出所有 CREATE TABLE 与 ADD COLUMN 的列名，
+ * 逐个到文档里找。找不到就是文档没跟上。
+ *
+ * 只查【存在性】不查注释是否准确 —— 后者机器判不了，
+ * 但「整列漏写」这种最常见也最伤人的情况，这一条就能全挡掉。
+ */
+$docPath = __DIR__ . '/../../docs/04-本地库Schema.md';
+$doc     = (string)file_get_contents($docPath);
+T::true($doc !== '', 'docs/04 读得到');
+
+$migDir = __DIR__ . '/../../db/migrations';
+$files  = glob($migDir . '/*.sql') ?: [];
+T::true(count($files) >= 14, '找得到迁移文件（' . count($files) . ' 个）');
+
+/** 这些不是业务表，或纯属实现细节，文档不必逐列写 */
+$skipTables = [];
+
+$declared = [];        // table => [col, ...]
+foreach ($files as $f) {
+    $sql = (string)file_get_contents($f);
+
+    // CREATE TABLE 块里的列
+    if (preg_match_all('/CREATE TABLE(?:\s+IF NOT EXISTS)?\s+`([a-z_]+)`\s*\((.*?)\n\)/is', $sql, $ms, PREG_SET_ORDER)) {
+        foreach ($ms as $m) {
+            preg_match_all('/^\s*`([a-z_]+)`\s+[A-Za-z]/m', $m[2], $cm);
+            foreach ($cm[1] as $col) { $declared[$m[1]][] = $col; }
+        }
+    }
+    // 后续迁移里 ADD COLUMN 的列（含 information_schema + PREPARE 那种拼字符串的写法）
+    if (preg_match_all('/ALTER TABLE `?([a-z_]+)`? ADD COLUMN `([a-z_]+)`/i', $sql, $am, PREG_SET_ORDER)) {
+        foreach ($am as $m) { $declared[$m[1]][] = $m[2]; }
+    }
+}
+T::true(count($declared) >= 10, '从迁移里解析出 ' . count($declared) . ' 张表');
+
+$missing = [];
+foreach ($declared as $table => $cols) {
+    if (in_array($table, $skipTables, true)) { continue; }
+    if (!preg_match('/\b' . preg_quote($table, '/') . '\b/', $doc)) {
+        $missing[] = "整张表 `{$table}` 没写";
+        continue;
+    }
+    foreach (array_unique($cols) as $col) {
+        // 必须是「`列名` 类型」这种定义形态 —— 出现在 KEY(...) 里不算
+        if (!preg_match('/`' . preg_quote($col, '/') . '`\\s+[A-Z]/', $doc)) {
+            $missing[] = "{$table}.{$col}";
+        }
+    }
+}
+T::true($missing === [],
+    '★★ docs/04 覆盖了迁移里的每一张表、每一列'
+    . ($missing
+        ? "\n      文档里找不到：" . implode('、', array_slice($missing, 0, 12))
+          . (count($missing) > 12 ? ' …共 ' . count($missing) . ' 处' : '')
+          . "\n      —— 加了迁移就要同步更 docs/04，否则下一个人照着文档建表会建错"
+        : ''));

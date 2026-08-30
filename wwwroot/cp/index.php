@@ -177,7 +177,8 @@ vip_no_store();
       <div class="row">
         <label>批次号<input id="cd-batch" type="text" placeholder="留空自动按日期生成"></label>
         <label>数量<input id="cd-count" type="number" min="1" max="5000" value="200"></label>
-        <label>有效期至（必填）<input id="cd-valid" type="date"></label>
+        <label>有效期至（必填）<input id="cd-valid" type="date">
+          <b class="date-far" id="cd-valid-hint"></b></label>
         <label>卡片等级<select id="cd-tier"></select></label>
       </div>
       <button id="btn-card-gen" class="primary">生成</button>
@@ -187,7 +188,9 @@ vip_no_store();
       <p class="muted small">
         客人查不到任何线上信息，手里只有一张卡 —— <b>卡面那行日期就是唯一的告知证据</b>。
         库里和卡面对不上，等于没有告知过。<br>
-        建议取 <b>3 年后的 12 月 31 日</b>，与印刷稿一起定下来再回来填。
+        已默认填好 <b>2 年后的 12 月 31 日</b> —— 只是预填，改成别的照填不误。
+        取年底是因为卡面上印「12-31」比印「03-17」好记好核对，整批卡的作废时间也集中。<br>
+        日期右边的红字是<b>距今多少天</b>：年份打错时天数会差出好几倍，一眼就看得出来。
         单批最多 5000 张，顺序号自动接上一批，不会重号。
       </p>
       <p class="muted small">
@@ -222,6 +225,7 @@ vip_no_store();
         <label>券有效期（天）<input id="tier-cvd" type="number" min="0" placeholder="跟随全局" style="width:7em"></label>
         <label>排序<input id="tier-sort" type="number" value="10" style="width:5em"></label>
       </div>
+      <p class="muted small" id="tier-th-why"></p>
       <button id="btn-tier-save" class="primary">保存</button>
       <p class="muted small">
         <b>标识</b>是给机器认的（小写字母、数字、下划线），定了就别改 ——
@@ -291,7 +295,10 @@ vip_no_store();
       <select id="audit-action">
         <option value="">全部</option>
         <option value="point_grant">发放积分</option>
+        <option value="point_grant_merged">多桌合并记账</option>
+        <option value="point_grant_forced">★ 破例记账（经理放行）</option>
         <option value="point_reverse">撤销/冲正</option>
+        <option value="point_reverse_group">整组撤销</option>
         <option value="member_create">新建会员</option>
         <option value="data_erase">数据删除/假名化</option>
         <option value="coupon_redeem">卡券核销</option>

@@ -201,6 +201,48 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
 .mode b { display: block; font-size: 17px; margin-bottom: 3px; }
 .mode span { color: var(--muted); font-size: 14px; }
 
+/**
+ * ★ 视觉优先级必须和使用频率一致 —— 这是一条现场反馈修回来的。
+ *
+ * 之前这一屏上【唯一有颜色的是「标记为免费餐」】：一个既危险又极少用的
+ * 按钮。而每天要点几百次的「均摊 AA」是白底黑字，和旁边的说明文字一样平。
+ * 结果收银员求快时眼睛先落在那抹红色上，点错的正是它。
+ *
+ * 其余每一屏都有一个 .primary 主按钮，只有这一屏没有 —— 因为这里的
+ * 「主按钮」是两张卡片，当初没给它们做主色。补上。
+ */
+.mode-main {
+  background: #eef4fe;
+  border-color: #9dc0f5;
+  border-left: 5px solid var(--primary);
+}
+.mode-main b { color: #17509f; }
+.mode-main span { color: #3f628f; }
+
+/* 选订单那一屏同理：能点的订单卡才是主动作，不能点的（外带、已核销）保持灰 */
+.card.pickable {
+  background: #eef4fe;
+  border-color: #9dc0f5;
+  border-left: 5px solid var(--primary);
+}
+.card.pickable .amount { color: #17509f; }
+
+/**
+ * 危险/降级动作单独隔开 —— 光换颜色不够，还要让手指够不到。
+ * 上面一条分隔线 + 一段留白，快速连点时不会顺势滑到这里。
+ */
+.danger-zone {
+  margin-top: 22px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--line);
+}
+.danger-zone .ghost { margin-top: 0; }
+.danger-zone-note {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+
 /* ── 分配区 ───────────────────────────────────────── */
 .people { display: grid; gap: 10px; margin: 14px 0; }
 
@@ -364,3 +406,7 @@ hr { border: none; border-top: 1px solid var(--line); margin: 16px 0; }
   background: #fff4f4; border: 1px solid #f0c9c9;
   border-radius: 8px; padding: 7px 10px; color: #9a2c2c;
 }
+
+/* 结果卡里「这一单没计次」那一行 —— 必须让收银员看见，
+   不然客人回头问「怎么没给我盖章」时谁也说不清（docs/03 §13） */
+.warn-line { color: var(--warn, #b26a00); font-weight: 600; }

@@ -26,7 +26,11 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 免费餐当次的额外消费（饮料甜品）是否计金额积分
 
 -- ── 计次 ──────────────────────────────────────────────────
-(@store,'visit_count_mode','by_portion',@now),
+(@store,'visit_count_mode','once_per_period',@now),
+  -- 🔴 一张卡一个餐期最多记 1 次 —— 十送一数的是「来了几趟」不是「买了几份」。
+  -- 按份数算的话，一桌 10 人 10 份套餐整单记给一个人 = 一次 10 次计次，
+  -- 也就是【一张小票 = 一顿免费的饭】，捡到一张就直接换，连攒都不用攒。
+  -- 老口径 by_portion / by_order 仍然可选，见 docs/03 §13。
   -- by_portion = 按 counts_visit=1 菜品的 SUM(quantity) 计次（已确认采用）
   -- by_ledger  = 每笔流水最多计 1 次（备用口径）
 
@@ -97,6 +101,24 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
 (@store,'invoice_lookup_max_days','7',@now),
   -- 小票 Factura Simplificada 号可回溯的最大天数（0 = 不限）。
   -- 小票可以隔天补记，但不该让人拿半年前的小票来领分。
+
+-- ── 防刷与风控 ────────────────────────────────────────────
+-- 设计前提见 docs/03 §12：同行分桌与捡小票在系统里长得一样，
+-- 唯一能分开两者的是【时间】，所以下面全是时间参数。
+(@store,'late_grant_minutes','60',@now),
+  -- 结账后多久之内记账算「当场」。超过算补记，要经理放行 + 写原因。
+  -- 60 分钟：同行分桌是一起结账当场就记，一小时绰绰有余；
+  -- 而捡小票在物理上必须发生在结账之后，往往隔了几小时甚至几天。
+(@store,'merge_span_minutes','60',@now),
+  -- 多桌合并时，最早与最晚那一单的结账时间最多差多久。
+(@store,'merge_max_orders','8',@now),
+  -- 一次最多合几桌。超过要分两次做。
+(@store,'max_grants_per_period','3',@now),
+  -- 同一餐期同一张卡最多记几次账（一次多桌合并算 1 次）。0 = 不限。
+(@store,'alert_grants_per_day','6',@now),
+  -- 一天超过几次就告警（不拦，只记）。0 = 关闭。
+(@store,'alert_span_hours','6',@now),
+  -- 当天记的几单结账时间跨度超过多少小时就告警。0 = 关闭。
 
 -- ── 十送一核销识别 ────────────────────────────────────────
 (@store,'redeem_line_patterns','TARJETA 10+1,10+1',@now)

@@ -25,6 +25,7 @@ final class ConfigSchema
         'manual'   => ['title' => '手工录入',           'desc' => '系统查不到订单时的降级通道'],
         'ui'       => ['title' => '界面',                 'desc' => '收银台 Pad 的显示语言'],
         'card'     => ['title' => '实体卡有效期',       'desc' => '卡面印的日期怎么用 —— 提前多久提醒换卡、过期后还能补救多久'],
+        'risk'     => ['title' => '防刷与风控',         'desc' => '同行分桌要放行，捡小票来兑换要挡住 —— 这一组管的是两者的分界'],
         'compliance' => ['title' => '合规与隐私',       'desc' => 'LOPDGDD / GDPR 相关'],
         'sync'     => ['title' => '同步与巡检',         'desc' => '技术参数，一般不用动'],
     ];
@@ -54,11 +55,13 @@ final class ConfigSchema
             'label' => '几次送一次',
             'desc'  => '「按次数」口径下生效。填 10 就是十送一，填 8 就是八送一。'
                      . '改完之后历史进度会自动重算，不会重复发也不会漏发',
+            'active_when' => ['key' => 'reward_mode', 'value' => 'visits'],
         ],
         'reward_threshold_amount' => [
             'group' => 'reward', 'type' => 'decimal', 'unit' => '€',
             'label' => '累计消费多少送一次',
             'desc'  => '「按金额」口径下生效',
+            'active_when' => ['key' => 'reward_mode', 'value' => 'amount'],
         ],
         'reward_auto_grant' => [
             'group' => 'reward', 'type' => 'bool',
@@ -99,9 +102,15 @@ final class ConfigSchema
         'visit_count_mode' => [
             'group' => 'points', 'type' => 'select',
             'label' => '计次口径',
-            'desc'  => '一桌点了 3 份套餐记给同一个人时，算 3 次还是 1 次',
-            'options' => ['by_portion' => '按套餐份数（3 份 = 3 次）',
-                          'by_order'   => '按订单（整单只算 1 次）'],
+            'desc'  => '决定「十送一」数的是什么。'
+                     . '★ 默认「一人一餐期一次」＝ 来 10 趟送 1 次，'
+                     . '一桌 4 人有 4 张卡就 4 张各记 1 次，只有 2 张卡就只记那 2 张，'
+                     . '剩下的次数不会挪给在场的卡。'
+                     . '另外两种是「买 N 份送 1 份」的老口径 —— '
+                     . '那种口径下一张 10 人的小票一次就顶 10 次，捡到一张直接换一顿饭',
+            'options' => ['once_per_period' => '一人一餐期一次（推荐 · 来 10 趟送 1 次）',
+                          'by_portion'      => '按套餐份数（3 份 = 3 次）',
+                          'by_order'        => '按订单（每笔账算 1 次）'],
         ],
         'reversal_window_hours' => [
             'group' => 'points', 'type' => 'int', 'unit' => '小时',
@@ -126,6 +135,56 @@ final class ConfigSchema
             'desc'  => '客人拿着小票补记积分，最多允许多少天前的。填 0 不限制。'
                      . '小票号（Factura Simplificada）查单最精确，不受上面的分钟窗限制',
         ],
+        // ── 防刷与风控 ──────────────────────────────────────
+        /**
+         * 这一组的设计前提写在 docs/03 §12：
+         * 「同行分桌」和「捡小票」在系统里长得一模一样 —— 都是多张订单
+         * 记进同一张卡。能把两者分开的只有【时间】：
+         *   · 同行分桌永远是当场，几分钟内，几张单结账时间也挨着
+         *   · 捡小票在物理上必须发生在结账之后，而且小票来源分散
+         * 所以这里的每一项都是时间参数，不是数量参数。
+         */
+        'late_grant_minutes' => [
+            'group' => 'risk', 'type' => 'int', 'unit' => '分钟',
+            'label' => '超过多久算「补记」',
+            'desc'  => '结账后这么久之内记账属正常，收银员自己就能做。'
+                     . '超过就算补记 —— 仍然可以记，但要经理放行并写明原因。'
+                     . '客人忘带卡、隔天拿小票来补，走的就是这条路。填 0 = 不区分',
+        ],
+        'merge_span_minutes' => [
+            'group' => 'risk', 'type' => 'int', 'unit' => '分钟',
+            'label' => '多桌合并的时间跨度上限',
+            'desc'  => '几桌一起记账时，最早和最晚那一单的结账时间最多能差多久。'
+                     . '同行分桌是一起结的账，通常只差几分钟；'
+                     . '差了几小时的两张单不该出现在同一次合并里',
+        ],
+        'merge_max_orders' => [
+            'group' => 'risk', 'type' => 'int', 'unit' => '桌',
+            'label' => '一次最多合并几桌',
+            'desc'  => '超过这个数就要分两次做（每次都要经理放行）。'
+                     . '按实际包桌规模设，一般 6~10 桌够用',
+        ],
+        'max_grants_per_period' => [
+            'group' => 'risk', 'type' => 'int', 'unit' => '次',
+            'label' => '同一餐期一张卡最多记几次账',
+            'desc'  => '★ 一次多桌合并算【1 次】，不是算 3 次 —— 所以大团不会被误伤。'
+                     . '超过要经理放行。一天两个餐期各自计数，中午来一次晚上来一次互不影响。'
+                     . '填 0 = 不限',
+        ],
+        'alert_grants_per_day' => [
+            'group' => 'risk', 'type' => 'int', 'unit' => '次',
+            'label' => '一天记账超过几次就告警',
+            'desc'  => '★ 这一条不拦人，只在后台「告警」页留个记录。'
+                     . '上面那些限制都建立在「收银员是诚实的」之上，而员工本人就是收银员 —— '
+                     . '对内部人，事前拦不住，只有事后看得见。填 0 = 关闭',
+        ],
+        'alert_span_hours' => [
+            'group' => 'risk', 'type' => 'int', 'unit' => '小时',
+            'label' => '一天里记账的订单时间跨度超过多少小时就告警',
+            'desc'  => '同一张卡当天记的几单，最早和最晚结账时间差得太远 —— '
+                     . '这是「攒了一把小票一起来兑」的典型形状。同样只告警不拦。填 0 = 关闭',
+        ],
+
         'redeem_line_patterns' => [
             'group' => 'lookup', 'type' => 'text',
             'label' => '核销折扣行的名称',
@@ -252,6 +311,47 @@ final class ConfigSchema
     ];
 
     /** 后台要的完整结构：分组 → 项目（带当前值） */
+    /**
+     * 这一项当下用不用得上。
+     *
+     * ★ 「用不上」不等于「无效」：值照旧存在库里，只是现在的口径不看它。
+     *   所以判定只影响后台能不能编辑，不影响存储，也不影响任何历史数据 ——
+     *   口径切回去，原来填的值原样还在。
+     */
+    public static function isActive(array $meta, array $current): bool
+    {
+        $aw = $meta['active_when'] ?? null;
+        if ($aw === null) {
+            return true;
+        }
+        /**
+         * ★ 依赖项在库里【根本没有】时一律放行。
+         *
+         * 置灰是个便利，不是约束。老库缺 reward_mode 的话，按「不等于」判
+         * 会把两个门槛【同时】锁死 —— 管理员一格都改不了，而唯一的解法
+         * （改口径）本身也在这个页面上。宁可两格都能改，也不能锁死。
+         */
+        if (!array_key_exists($aw['key'], $current)) {
+            return true;
+        }
+        return (string)$current[$aw['key']] === (string)$aw['value'];
+    }
+
+    /** 置灰时给一句人话，说明要改它得先改哪一项 —— 否则看着像坏了 */
+    public static function inactiveHint(array $meta): ?string
+    {
+        $aw = $meta['active_when'] ?? null;
+        if ($aw === null) {
+            return null;
+        }
+        $dep = self::ITEMS[$aw['key']] ?? null;
+        if ($dep === null) {
+            return null;
+        }
+        $optLabel = $dep['options'][$aw['value']] ?? $aw['value'];
+        return "当前用不上 —— 把「{$dep['label']}」改成「{$optLabel}」之后才生效";
+    }
+
     public static function grouped(array $current): array
     {
         $out = [];
@@ -264,8 +364,11 @@ final class ConfigSchema
                 continue;
             }
             $out[$g]['items'][] = $meta + [
-                'key'   => $key,
-                'value' => (string)($current[$key] ?? ''),
+                'key'    => $key,
+                'value'  => (string)($current[$key] ?? ''),
+                // 依赖别项的（比如两个门槛只有一个当口径），当下用不上的置灰
+                'active' => self::isActive($meta, $current),
+                'inactive_hint' => self::inactiveHint($meta),
             ];
         }
         // 库里有、但这里没登记的项，兜底放到最后，免得改不了

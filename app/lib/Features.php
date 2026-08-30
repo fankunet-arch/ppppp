@@ -28,11 +28,37 @@ final class Features
     /**
      * @param bool  $collectPii     是否开启了收集联系方式
      * @param array $readyChannels  已配齐凭据的渠道（Messaging::readyChannels()）
+     * @param bool  $countOncePerPeriod 计次口径是不是「一人一餐期一次」
+     * @param int   $mealPeriodCount    库里配了几个餐期
      * @return array<int, array{key:string, level:string, text:string}>
      */
-    public static function warnings(bool $collectPii, array $readyChannels = []): array
+    public static function warnings(bool $collectPii, array $readyChannels = [],
+                                    bool $countOncePerPeriod = false, int $mealPeriodCount = 0): array
     {
         $out = [];
+
+        /**
+         * 计次按餐期算，却一个餐期都没配 —— 这会【静默地把规则改严】。
+         *
+         * MealPeriod 查不到餐期时退回「同一营业日」这个更粗的口径
+         * （不这么退的话，没配餐期的店连合并都用不了）。于是：
+         *   本意：中午来一次、晚上来一次 = 2 次
+         *   实际：一天不管来几趟 = 1 次
+         *
+         * 客人少拿一半的次数，而且没有任何地方会报错 ——
+         * 等客人来问「我明明来了两回」才发现，那时已经过去几个月。
+         * 所以挂在顶栏上，直到配好为止。
+         */
+        if ($countOncePerPeriod && $mealPeriodCount === 0) {
+            $out[] = [
+                'key'   => 'meal_period_missing',
+                'level' => 'error',
+                'text'  => '计次口径是「一人一餐期一次」，但一个餐期都没配 —— '
+                         . '系统只能退回按【整个营业日】算，于是「中午来一次、晚上又来一次」'
+                         . '会被当成同一顿，客人少拿一半的次数。'
+                         . '请到「配置」里补上餐期（例：白天 11:00–18:00、晚上 19:30–次日 02:00）。',
+            ];
+        }
 
         if ($collectPii && !self::OUTBOUND_MESSAGING) {
             $out[] = [

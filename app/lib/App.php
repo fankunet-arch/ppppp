@@ -200,6 +200,12 @@ final class App
         return $this->once('bizDay', fn() => new BusinessDay($this->cfg()->get('business_day_cutoff', '02:00')));
     }
 
+    /** 餐期归属 —— 风控按「同一餐期」限次时用（docs/03 §12） */
+    public function mealPeriods(): MealPeriod
+    {
+        return $this->once('mealPeriods', fn() => new MealPeriod($this->localDb(), $this->storeCode()));
+    }
+
     public function auth(): AuthService
     {
         return $this->once('auth', fn() => new AuthService(
@@ -253,6 +259,7 @@ final class App
             $this->mealRules(),
             $this->businessDay(),
             $this->cardTiers(),
+            $this->mealPeriods(),
         ));
     }
 }
