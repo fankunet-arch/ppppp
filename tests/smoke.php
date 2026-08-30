@@ -2109,6 +2109,241 @@ $vcDb->exec("DELETE FROM coupon WHERE store_code=? AND member_id IN ($in)", arra
 $vcDb->exec("DELETE FROM member WHERE store_code=? AND id IN ($in)", array_merge([SMOKE_STORE], $ids));
 $vcDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id LIKE ?', [SMOKE_STORE, '98088800%']);
 
+step('㉔ 同一张卡不能在同一张单上记两次');
+
+/**
+ * ★ 这一段来自一次现场质疑：屏幕上「+27 分」，同时又提示
+ *   「本餐期已记过 1 次，这一单只记积分不计次」，怀疑重复计分了。
+ *
+ *   查下来【没有重复计分】—— 金额守恒挡着，那是同一张单的另一半。
+ *   但守恒挡不住「把一张单分两次都记给同一个人」：AA 拆成两半，
+ *   两半都选同一张卡，金额照样守恒，只是分了两笔。
+ *   收银员完全没法判断这是正常的下半单，还是自己点重了。
+ *
+ *   而把 AA 的两半都给同一个人，现实中基本只可能是误操作 ——
+ *   真要整单给一个人，人数填 1 就行，不必拆。所以直接禁掉。
+ *
+ * 下面两件事都要钉住：① 确实没有重复计分 ② 第二次会被拒。
+ */
+$dupApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$dupDb  = $dupApp->localDb();
+$dupApp->cfg()->set('late_grant_minutes', '0');
+$dupApp->cfg()->set('max_grants_per_period', '0');
+$dupApp->cfg()->set('visit_count_mode', 'once_per_period');
+
+$dupPos = new FakePosSource();
+$dupPos->now = date('Y-m-d H:i:s');
+$dupPos->addHead([
+    'serial_id' => '9707770001', 'order_head_id' => 970001, 'check_id' => 1,
+    'table_name' => 'DUP', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '55.75', 'should_amount' => '55.75', 'actual_amount' => '55.75',
+    'order_end_time' => date('Y-m-d H:i:s'),
+]);
+$dupPos->addDetail(970001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '55.75', 2)]);
+$dupApp->setPosSource($dupPos);
+$dupApp->points()->locate('DUP', 600);
+
+$dupMid = (int)$dupApp->members()->create('TK-00097701-DUP', null, null, null)['id'];
+$dupOp  = ['id' => 1, 'name' => '收银员', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => false];
+
+// ── ① 第一次记一半 ──
+$d1 = $dupApp->points()->grant('9707770001',
+    [['member_id' => $dupMid, 'amount_cents' => 2788, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $dupOp);
+ok($d1['ok'], '第一次记一半（€ 27.88）');
+eq(1, (int)$d1['entries'][0]['visits'], '  └ 计次 1');
+
+// ── ② 同一张卡再记另一半 → 拒 ──
+$d2 = $dupApp->points()->grant('9707770001',
+    [['member_id' => $dupMid, 'amount_cents' => 2787, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $dupOp);
+ok(!$d2['ok'] && $d2['error'] === 'member_already_on_order',
+   '★★★ 同一张卡在同一张单上记第二次 → 被拒（' . ($d2['error'] ?? '竟然成功了') . '）');
+// 卡号入库时会走 Crockford 归一化（去连字符、U→V 等），所以认序号那一段
+ok(str_contains((string)($d2['detail']['card_no'] ?? ''), '00097701'),
+   '  └ 告诉前端是哪张卡（' . ($d2['detail']['card_no'] ?? '没给') . '），好把话说清楚');
+
+// ── ③ 换一张卡记另一半 → 正常 ──
+$dupMid2 = (int)$dupApp->members()->create('TK-00097702-DUP', null, null, null)['id'];
+$d3 = $dupApp->points()->grant('9707770001',
+    [['member_id' => $dupMid2, 'amount_cents' => 2787, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $dupOp);
+ok($d3['ok'], '★★ 换一张卡记另一半照常 —— 挡的是「同一张卡」，不是「分两次」');
+
+// ── ④ 钉住「本来就没有重复计分」──
+/**
+ * ★★ 这一条是回答现场那个质疑的正题：
+ *   即便当初两半都记给了同一张卡，金额也是守恒的 —— 总额没有翻倍。
+ */
+$ord = $dupDb->one('SELECT total_amount, allocated_amount FROM pos_order WHERE store_code=? AND serial_id=?',
+                   [SMOKE_STORE, '9707770001']);
+ok((float)$ord['allocated_amount'] <= (float)$ord['total_amount'],
+   sprintf('★★★ 金额守恒：已分配 €%s ≤ 总额 €%s —— 分几次记都不会重复计分',
+           $ord['allocated_amount'], $ord['total_amount']));
+eq('55.75', (string)$ord['allocated_amount'], '  └ 两半加起来正好是整单，不多不少');
+
+// ── ⑤ 撤销之后可以重记 ──
+$revId = (int)$dupDb->value(
+    'SELECT id FROM point_ledger WHERE store_code=? AND serial_id=? AND member_id=? AND entry_type=1 AND status=1',
+    [SMOKE_STORE, '9707770001', $dupMid]);
+$dupApp->points()->reverse($revId, '冒烟测试 · 撤销后重记', $dupOp);
+$d5 = $dupApp->points()->grant('9707770001',
+    [['member_id' => $dupMid, 'amount_cents' => 2788, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $dupOp);
+ok($d5['ok'], '★★ 撤销那一笔之后，同一张卡可以重新记 —— 挡的是有效流水，不是历史');
+
+// 清理
+$dupDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id IN (?,?)', [SMOKE_STORE, $dupMid, $dupMid2]);
+$dupDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id IN (?,?)', [SMOKE_STORE, $dupMid, $dupMid2]);
+$dupDb->exec('DELETE FROM member WHERE store_code=? AND id IN (?,?)', [SMOKE_STORE, $dupMid, $dupMid2]);
+$dupDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, '9707770001']);
+
+step('㉕ 份数必须带金额：钱和次数绑在一起');
+
+/**
+ * ★ 这一段来自客人（店主）自己推演出来的一个洞，实测确实存在：
+ *
+ *     A 拿走全部金额 €71.70 / 1 份 → 积分 71、计次 1
+ *     B 提交「金额 € 0 / 要 1 份」  → 竟然也成功，积分 0、计次 1
+ *
+ *   金额守恒只管上限，管不住「0 元也要一份」。而次数才是奖励的真正来源
+ *   （十送一），金额分完之后份数还剩着，等于把最值钱的那一半白送出去。
+ *
+ *   规则因此改成：一笔分配要么【钱和次一起计】，要么整笔拒绝。
+ *   反过来「有钱没份」照常允许 —— 只点酒水没点套餐是正常生意。
+ */
+$binApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$binDb  = $binApp->localDb();
+$binApp->cfg()->set('late_grant_minutes', '0');
+$binApp->cfg()->set('max_grants_per_period', '0');
+$binApp->cfg()->set('visit_count_mode', 'once_per_period');
+
+$binPos = new FakePosSource();
+$binPos->now = date('Y-m-d H:i:s');
+$binPos->addHead([
+    'serial_id' => '9606660001', 'order_head_id' => 960001, 'check_id' => 1,
+    'table_name' => 'BIND', 'eat_type' => 0, 'customer_num' => 3,
+    'original_amount' => '71.70', 'should_amount' => '71.70', 'actual_amount' => '71.70',
+    'order_end_time' => date('Y-m-d H:i:s'),
+]);
+$binPos->addDetail(960001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '71.70', 3)]);
+$binApp->setPosSource($binPos);
+$binApp->points()->locate('BIND', 601);
+
+$binA = (int)$binApp->members()->create('TK-00098801-BND', null, null, null)['id'];
+$binB = (int)$binApp->members()->create('TK-00098802-BND', null, null, null)['id'];
+$binOp = ['id' => 1, 'name' => '收银员', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => false];
+
+// ── ① A 正常记 47.80 / 2 份 ──
+$b1 = $binApp->points()->grant('9606660001',
+    [['member_id' => $binA, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok($b1['ok'], 'A 记 € 47.80 / 2 份');
+eq(1, (int)$b1['entries'][0]['visits'], '  └ 计次 1');
+
+// ── ② B 想「0 元换一次」→ 拒 ──
+$b2 = $binApp->points()->grant('9606660001',
+    [['member_id' => $binB, 'amount_cents' => 0, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok(!$b2['ok'] && $b2['error'] === 'portions_without_amount',
+   '★★★ 「金额 € 0、要 1 份」→ 被拒（' . ($b2['error'] ?? '竟然成功了') . '）—— 这就是那个洞');
+
+// ── ③ 同一次提交里夹带一个 0 元的人 → 整笔拒 ──
+$b3 = $binApp->points()->grant('9606660001',
+    [['member_id' => $binB, 'amount_cents' => 2390, 'portions' => 1],
+     ['member_id' => $binA, 'amount_cents' => 0,    'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok(!$b3['ok'], '★★ 一笔里混进 0 元的人 → 整笔拒绝，要么一起计要么一起拒');
+eq(0, (int)$binDb->value(
+        'SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND serial_id=? AND member_id=?',
+        [SMOKE_STORE, '9606660001', $binB]),
+   '  └ 整笔回滚：B 那半边也没落库（不能一半成功一半失败）');
+
+// ── ④ B 老老实实分餐费 → 照常通过 ──
+$b4 = $binApp->points()->grant('9606660001',
+    [['member_id' => $binB, 'amount_cents' => 2390, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok($b4['ok'], '★★ B 分到 € 23.90 / 1 份 → 通过（挡的是白拿，不是拆分）');
+eq(1, (int)$b4['entries'][0]['visits'], '  └ 计次 1');
+
+// ── ⑤ 有钱没份照常允许（点了不计次的 MENÚ DEL DIA）──
+$binPos->addHead([
+    'serial_id' => '9606660002', 'order_head_id' => 960002, 'check_id' => 1,
+    'table_name' => 'BIND2', 'eat_type' => 0, 'customer_num' => 1,
+    'original_amount' => '15.90', 'should_amount' => '15.90', 'actual_amount' => '15.90',
+    'order_end_time' => date('Y-m-d H:i:s'),
+]);
+$binPos->addDetail(960002, 1, [FakePosSource::line(1590, 'MENÚ DEL DIA', '15.90', '15.90', 1)]);
+$binApp->points()->locate('BIND2', 602);
+$binC = (int)$binApp->members()->create('TK-00098803-BND', null, null, null)['id'];
+$b5 = $binApp->points()->grant('9606660002',
+    [['member_id' => $binC, 'amount_cents' => 1590, 'portions' => 0]],
+    Vip\PointsEngine::MODE_WHOLE, $binOp);
+ok($b5['ok'], '★★ 有金额、0 份 → 通过（该积分、不该计次：绑定只有一个方向）');
+eq(0, (int)$b5['entries'][0]['visits'], '  └ 计次 0');
+
+// ── ⑥ 全库不变量：不存在「0 元却计了次」的流水 ──
+eq([], $binDb->all(
+    'SELECT serial_id, member_id, amount, counted_visit
+       FROM point_ledger
+      WHERE store_code = ? AND entry_type = 1 AND status = 1
+        AND counted_visit > 0 AND amount <= 0',
+    [SMOKE_STORE]),
+   '★★★ 全库不存在「金额 0 却计了次」的有效流水 —— 次数永远跟着钱走');
+
+// ── ⑦ 反面：有钱却没份数，次数会凭空少掉 ──
+/**
+ * ★ 这是 ②③ 的镜像，店主同一轮里点出来的：「也要防止有积分但没份数」。
+ *
+ *   AA 均摊时份数除不尽，余数原本【全堆给第一位】——
+ *   这在旧口径 by_portion 下没问题（第一位记 3 次，总数守恒）；
+ *   换成 once_per_period 之后就变成：
+ *
+ *     3 份 4 人 → [3, 0, 0, 0] → 第一位 1 次，后三位付了钱【一次都没有】
+ *
+ *   而且不报错、不告警。客人要等到攒够十次那天才发现少了两次，
+ *   那时候已经没法查了。份数余数因此改成【一人一份地摊开】。
+ */
+$binPos->addHead([
+    'serial_id' => '9606660003', 'order_head_id' => 960003, 'check_id' => 1,
+    'table_name' => 'BIND3', 'eat_type' => 0, 'customer_num' => 4,
+    'original_amount' => '71.70', 'should_amount' => '71.70', 'actual_amount' => '71.70',
+    'order_end_time' => date('Y-m-d H:i:s'),
+]);
+$binPos->addDetail(960003, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '71.70', 3)]);
+$binApp->points()->locate('BIND3', 603);
+
+$binFour  = [];
+$binAlloc = [];
+$shares   = Vip\PointsEngine::splitEvenly(7170, 3, 4);   // 3 份分给 4 个人
+foreach ($shares as $i => $sh) {
+    $mid = (int)$binApp->members()->create(sprintf('TK-0009881%d-BND', $i), null, null, null)['id'];
+    $binFour[]  = $mid;
+    $binAlloc[] = ['member_id' => $mid] + $sh;
+}
+eq([1, 1, 1, 0], array_column($shares, 'portions'),
+   '★★★ 3 份 4 人 → 份数摊成 [1,1,1,0]，不是 [3,0,0,0]');
+
+$b7 = $binApp->points()->grant('9606660003', $binAlloc, Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok($b7['ok'], '四人 AA 一次提交成功');
+eq([1, 1, 1, 0], array_map(static fn(array $e): int => (int)$e['visits'], $b7['entries']),
+   '★★★ 三位各记 1 次，第四位 0 次 —— 而不是第一位 1 次、后三位全空');
+// ★ 积分是【逐人】取整的，所以四个人加起来会比整单少几分 ——
+//   这是 AA 本来就有的性质，不是这次改动带来的。这里钉的是「谁都没被漏掉」。
+ok(count(array_filter($b7['entries'], static fn(array $e): bool => (int)$e['points'] > 0)) === 4,
+   '  └ 四个人都拿到了积分（钱谁都没少花，分谁都不该少）');
+ok((int)$b7['entries'][3]['points'] > 0,
+   '★★ 第四位【有积分、没次数】—— 这张单确实只有 3 份计次套餐，他没点');
+
+// 清理
+$binDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id IN (' . implode(',', $binFour) . ')', [SMOKE_STORE]);
+$binDb->exec('DELETE FROM coupon      WHERE store_code=? AND member_id IN (' . implode(',', $binFour) . ')', [SMOKE_STORE]);
+$binDb->exec('DELETE FROM member      WHERE store_code=? AND id        IN (' . implode(',', $binFour) . ')', [SMOKE_STORE]);
+$binDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id IN (?,?,?)', [SMOKE_STORE, $binA, $binB, $binC]);
+$binDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id IN (?,?,?)', [SMOKE_STORE, $binA, $binB, $binC]);
+$binDb->exec('DELETE FROM member WHERE store_code=? AND id IN (?,?,?)', [SMOKE_STORE, $binA, $binB, $binC]);
+$binDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id IN (?,?,?)', [SMOKE_STORE, '9606660001', '9606660002', '9606660003']);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

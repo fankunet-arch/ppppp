@@ -80,6 +80,23 @@ h3 { font-size: 18px; margin: 0 0 12px; }
 .small { font-size: 14px; }
 .err   { color: var(--err); font-weight: 600; margin: 10px 0 0; }
 
+/**
+ * 提醒，不是错误。
+ *
+ * ★ 刻意用 --warn（暖橙）而不是 --err（红）：这一条挡不住提交，
+ *   也常常是对的（客人真的只点了酒水）。用红色会把「必须处理」
+ *   和「看一眼」混成一档，几天之后两种都不会有人看。
+ */
+.hint-warn {
+  color: var(--warn);
+  font-weight: 600;
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  background: #fdf6ec;
+  border-left: 4px solid #e6c99a;
+  border-radius: 4px;
+}
+
 /* ── 表单 ─────────────────────────────────────────── */
 label { display: block; margin: 12px 0; font-size: 15px; color: var(--muted); }
 

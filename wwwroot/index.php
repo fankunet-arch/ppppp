@@ -181,6 +181,9 @@ $appVersion = vip_app_version([
     <h2>④ <span id="assign-title"></span></h2>
     <!-- 份数明细：买单人数 / 付费套餐 / 免费套餐，全部读自 POS 明细 -->
     <div id="portion-detail" class="portion-detail" hidden></div>
+    <!-- 这张单已经记给过哪些卡（卡号打码）。上一屏有、这一屏以前没有，
+         于是「+27 分」和「本餐期已记过 1 次」同屏出现时没人看得懂 -->
+    <div id="assign-done" class="ledger-box" hidden></div>
     <div id="assign-body"></div>
     <div id="assign-people" class="people"></div>
     <div class="totals">
@@ -188,6 +191,9 @@ $appVersion = vip_app_version([
             / <span data-i18n="assign.total">可分配</span> <b id="sum-total">0.00</b></span>
       <span><span data-i18n="assign.portions">份数</span> <b id="sum-port">0</b> / <b id="sum-port-total">0</b></span>
     </div>
+    <!-- 「有金额但没份数」的提醒。不是错误 —— 只点酒水的客人本来就该是这样，
+         但更多时候是份数填漏了，而漏掉的次数事后没有任何地方会报出来 -->
+    <p id="assign-noportion" class="hint-warn" hidden></p>
     <button id="btn-submit" class="primary big" data-i18n="assign.submit">提交积分</button>
     <p id="assign-err" class="err" hidden></p>
     <button class="ghost" data-back="step-mode" data-i18n="common.back">返回</button>

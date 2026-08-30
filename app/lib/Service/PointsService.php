@@ -506,6 +506,37 @@ final class PointsService
                 return ['ok' => false, 'error' => 'zero_amount'];
             }
 
+            /**
+             * ★ 同一张卡不能在同一张订单上记两次。
+             *
+             *   金额守恒本来就挡住了「多拿」—— 第二次超额会被 exceeds_total 拒掉，
+             *   所以【不存在重复计分】。但它挡不住「把一张单分两次都记给同一个人」：
+             *   AA 拆成两半，两半都选同一张卡，金额照样守恒，只是分了两笔。
+             *
+             *   现场看到的就是这个：屏幕上「+27 分」，同时又提示
+             *   「本餐期已记过 1 次，这一单只记积分不计次」，
+             *   收银员完全没法判断这是正常的下半单，还是自己点重了。
+             *
+             *   而把 AA 的两半都给同一个人，现实中基本只可能是误操作 ——
+             *   真要整单给一个人，人数填 1 就行，不必拆。
+             *
+             *   PointsEngine 里那条 duplicate_member 只管【一次提交内】重复；
+             *   这里管的是【跨提交】重复，两者都需要。
+             */
+            $already = [];
+            foreach ($this->ledger->activeBySerial($serialId) as $row) {
+                if ((int)$row['entry_type'] === LedgerRepo::T_EARN) {
+                    $already[(int)$row['member_id']] = (string)($row['card_no'] ?? '');
+                }
+            }
+            foreach ($allocations as $a) {
+                $mid = (int)($a['member_id'] ?? 0);
+                if (isset($already[$mid])) {
+                    return ['ok' => false, 'error' => 'member_already_on_order',
+                            'detail' => ['member_id' => $mid, 'card_no' => $already[$mid]]];
+                }
+            }
+
             // ★ 金额守恒校验（纯函数，见 PointsEngine::validateAllocations 与其测试）
             $v = PE::validateAllocations($allocations, $total, $allocated, $totalPort, $allocPort);
             if (!$v['ok']) {
@@ -552,7 +583,7 @@ final class PointsService
                 //   再计一次就等于「拿奖励的同时又攒一次」。
                 //   金额可以照常积分（取决于 free_meal_extra_earns），但次数不给。
                 $visits = $freeish ? 0
-                        : $this->visitsFor($countMode, $memberId, $prt, (string)$order['order_end_time']);
+                        : $this->visitsFor($countMode, $memberId, $prt, $amt, (string)$order['order_end_time']);
 
                 $lid = $this->ledger->insert([
                     'member_id'          => $memberId,
@@ -637,9 +668,25 @@ final class PointsService
      * 老口径，店家要回去也回得去。by_portion 是「买 N 份送 1 份」，
      * by_order 是「每笔账算 1 次」（同一餐期分两次结账会算 2 次）。
      */
-    private function visitsFor(string $mode, int $memberId, int $portions, string $orderEndTime): int
-    {
+    private function visitsFor(
+        string $mode,
+        int $memberId,
+        int $portions,
+        int $amountCents,
+        string $orderEndTime
+    ): int {
         if ($portions <= 0) {
+            return 0;
+        }
+        /**
+         * ★ 没有金额就没有次数 —— 与 PointsEngine 的 portions_without_amount 同一条规则。
+         *
+         *   那边是【校验】，在事务最前面把整笔拒掉；这里是【兜底】，
+         *   保证就算哪天有人绕开校验直接构造分配，写进流水的也不会是
+         *   「0 元 1 次」这种账。规则写在两处不是重复：
+         *   校验决定「能不能提交」，这里决定「流水长什么样」。
+         */
+        if ($amountCents <= 0) {
             return 0;
         }
         if ($mode === 'by_portion') {

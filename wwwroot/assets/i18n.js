@@ -179,6 +179,10 @@
                             es: 'Hay líneas con importe pero sin socio' },
     'assign.needOne':     { zh: '请至少为一位会员分配金额',
                             es: 'Asigne importe al menos a un socio' },
+    'assign.portionsNoAmount': { zh: '{card} 名下是 € 0，不能只记次数。请把他那份餐费也分给他，或把份数改成 0。',
+                            es: '{card} tiene € 0 asignados: no se puede contar la visita. Asígnele su parte del ticket o ponga 0 raciones.' },
+    'assign.noPortionHint': { zh: '有 {n} 位分到了金额但份数是 0，这几位这一次不计次（还剩 {left} 份没分）。只点酒水的客人本来就是这样；点了套餐的话请把份数补上。',
+                            es: '{n} persona(s) con importe pero 0 raciones: esta vez no se les cuenta la visita (quedan {left} raciones sin asignar). Es lo normal si solo tomaron bebida; si tomaron menú, añada sus raciones.' },
     'assign.overflow':    { zh: '（可分配 € {total}，已分配 € {allocated}）',
                             es: ' (disponible € {total}, asignado € {allocated})' },
 
@@ -261,6 +265,11 @@
     'member.scanNote':    { zh: '扫客人卡面的二维码；扫不出时照着卡面手输卡号也行。<b>不用纠结哪个是字母、哪个是数字</b>，看着像什么就输什么，系统会自动纠正。',
                             es: 'Escanee el QR de la tarjeta; si no lee, escriba el número tal como aparece. <b>No se preocupe por distinguir letras de números</b>: escriba lo que ve, el sistema lo corrige.' },
     'member.needInput':   { zh: '请输入查询内容', es: 'Escriba algo para buscar' },
+    'member.alreadyOnOrder': { zh: '这张单已经记给 {card} 了，不能再记一次。要改请先撤销那一笔。',
+                               es: 'Este ticket ya se apuntó a {card}; no se puede repetir. Para cambiarlo, anule primero ese apunte.' },
+    'assign.doneTitle':   { zh: '这张单已经记给：', es: 'Este ticket ya se apuntó a:' },
+    'assign.doneNote':    { zh: '同一张卡在同一张单上只能记一次。要改请回上一步撤销那一笔。',
+                            es: 'Una tarjeta solo puede apuntarse una vez por ticket. Para cambiarlo, vuelva atrás y anule ese apunte.' },
     // 隔离区的小字：说清这两个按钮为什么被单独放出来
     'freeMeal.zoneNote':  { zh: '下面这个只在客人用券免单时点 —— 点了这一单就不积分、不计次。',
                             es: 'Solo para canjes con vale: este ticket no sumará puntos ni visita.' },

@@ -232,3 +232,29 @@ if (isset($bc[1])) {
 // 危险动作那一档仍然是暖色 —— 别在「统一配色」时把它一起抹平了
 T::true((bool)preg_match('/\.ghost\.warn\s*\{[^}]*var\(--warn\)/', $padCss),
     '★★ .ghost.warn 仍然是暖色 —— 危险动作要保持可辨认');
+
+T::group('卡号在「已记过」列表里要打码');
+
+/**
+ * ★ 这两处显示的是【别人的】卡号 —— 屏幕朝着柜台，谁路过都看得见。
+ *   末尾那 3 位随机码正是防猜卡号的那一段，不该露在这里；
+ *   而顺序号足够收银员认出「哦，是刚才那张」。
+ *
+ *   所以列表里一律走 maskCard()。判定看的是【没有裸用 card_no】，
+ *   因为漏掉打码不会报错也不会变样 —— 只是多印了三位字符，没人会发现。
+ */
+$padJs = file_get_contents(__DIR__ . '/../../wwwroot/assets/pad.js');
+
+T::true(str_contains($padJs, 'function maskCard('), '★ maskCard() 存在');
+T::true((bool)preg_match('/slice\(0,\s*-3\)/', $padJs), '  └ 藏的是末尾 3 位（那段随机码）');
+
+// 「已记过」的两处列表都要打码
+foreach (['renderAlreadyOnOrder', 'renderSummary'] as $fn) {
+    T::true((bool)preg_match('/function ' . $fn . '\(.*?\n\}/s', $padJs, $m),
+        "找得到 {$fn}()");
+    $body = $m[0] ?? '';
+    if (str_contains($body, 'card_no') || str_contains($body, '.card')) {
+        T::true(str_contains($body, 'maskCard'),
+            "★★ {$fn}() 里的卡号走了 maskCard —— 屏幕朝着柜台，别把完整卡号印在屏幕上");
+    }
+}

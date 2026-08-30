@@ -667,7 +667,7 @@ function renderSummary(o) {
   const lb = $('#existing-ledger');
   if (o.existing_ledger && o.existing_ledger.length) {
     lb.innerHTML = `<b>${T('ledger.title')}</b>` + o.existing_ledger.map(l =>
-      `<div class="lrow"><span>${l.card_no || T('common.member')} · € ${l.amount} · ${l.points} ${T('common.points')}</span>
+      `<div class="lrow"><span>${l.card_no ? escapeHtml(maskCard(l.card_no)) : T('common.member')} · € ${escapeHtml(l.amount)} · ${l.points} ${T('common.points')}</span>
        <button class="link" data-rev="${l.id}">${T('ledger.reverse')}</button></div>`).join('');
     lb.hidden = false;
     $$('[data-rev]', lb).forEach(b => b.onclick = () => doReverse(parseInt(b.dataset.rev, 10)));
@@ -832,7 +832,61 @@ function addPerson() {
   if (S.mode === 3) refreshPickSelects();
 }
 
+/**
+ * 把「这张单已经记给谁了」摆在分配页最上面。
+ *
+ * 之前这个信息只在上一屏（记账方式）有，到了这一屏就看不见了 ——
+ * 于是现场出现「屏幕显示 +27 分，同时又说本餐期已记过 1 次」，
+ * 收银员完全没法判断这是正常的下半单，还是自己点重了。
+ */
+function renderAlreadyOnOrder() {
+  const box = $('#assign-done');
+  if (!box) return;
+  const rows = alreadyOnOrder();
+  if (!rows.length) { box.hidden = true; box.innerHTML = ''; return; }
+  box.innerHTML = `<b>${T('assign.doneTitle')}</b>` + rows.map(r =>
+    `<div class="lrow"><span>${escapeHtml(maskCard(r.card))} · € ${escapeHtml(r.amount)}</span></div>`).join('')
+    + `<div class="muted small">${T('assign.doneNote')}</div>`;
+  box.hidden = false;
+}
+
+/**
+ * 卡号打码：TK-00000123-4Q7 → TK-00000123-•••
+ *
+ * 藏掉的是末尾那 3 位随机码 —— 它正是防猜卡号的那一段。
+ * 留下的顺序号足够收银员认出「哦，是刚才那张」，
+ * 而屏幕被人瞄一眼也拼不出一个能用的完整卡号。
+ */
+function maskCard(no) {
+  const s = String(no || '');
+  return s.length <= 3 ? s : s.slice(0, -3) + '•••';
+}
+
+/**
+ * 这张订单已经记给过哪些卡。
+ *
+ * ★ 同一张卡不能在同一张单上记两次 —— 服务端会拒（member_already_on_order）。
+ *   但不能等到点了「提交积分」才报错：那时收银员已经填完金额、选完人，
+ *   还要退回来重做。所以在【选会员】这一步就挡住。
+ */
+function alreadyOnOrder() {
+  const rows = (S.order && S.order.existing_ledger) || [];
+  /**
+   * ★ 只认【消费流水】（entry_type = 1）。
+   *
+   *   这里第一版写成「counted_visit >= 0」，结果把【撤销流水】也算进来了 ——
+   *   撤销那一笔 entry_type = 2、status 仍然是有效，counted_visit 是负数或 0，
+   *   于是「0」那条溜了进去，把一张已经撤销干净的卡也锁死了。
+   *   浏览器测试当场撞出来的：撤销整组之后再记同一张卡，会员弹层打不开。
+   *
+   *   判定口径必须和服务端那条守卫一致（见 PointsService::grantOne）。
+   */
+  return rows.filter(l => Number(l.entry_type) === 1 && l.member_id)
+             .map(l => ({ id: Number(l.member_id), card: l.card_no || '', amount: l.amount }));
+}
+
 function renderPeople(keepItems) {
+  renderAlreadyOnOrder();
   const box = $('#assign-people');
   box.innerHTML = '';
   S.people.forEach((p, i) => {
@@ -888,6 +942,36 @@ function updateTotals() {
   const over = a > S.order.remaining_cents || q > S.order.remaining_portions;
   $('.totals').classList.toggle('over', over);
   $('#btn-submit').disabled = over || a <= 0;
+  noPortionHint();
+}
+
+/**
+ * 「付了钱但没份数」的提醒。
+ *
+ * ★ 这是 portions_without_amount 的【反面】，两个方向都要管：
+ *     有份没钱 → 白拿一次计次    → 硬拒（服务端）
+ *     有钱没份 → 这一次白吃了    → 提醒（这里）
+ *
+ *   为什么这一面只提醒不拒绝：它常常是对的 —— 只点酒水没点套餐的客人
+ *   本来就该 0 份，点选菜品模式下更是天天出现。
+ *
+ *   但更多时候是【份数填漏了】，而漏掉的次数事后【没有任何地方会报出来】：
+ *   积分照样进卡、小票照样打，客人要等到攒够十次那天才发现少了一次，
+ *   那时候已经没法查了。所以宁可在柜台前多说一句。
+ *
+ *   ★ 只在这张单【确实还有份数可分】时才提醒。整单 0 份（纯酒水单）
+ *     全场都是 0 份，这时候提醒等于每单都弹，几天就没人看了。
+ */
+function noPortionHint() {
+  const box = $('#assign-noportion');
+  if (!box) { return; }
+  const left = Number(S.order && S.order.remaining_portions) || 0;
+  const rows = left > 0
+    ? S.people.filter(p => p.amountCents > 0 && p.portions <= 0)
+    : [];
+  if (!rows.length) { box.hidden = true; box.textContent = ''; return; }
+  box.hidden = false;
+  box.textContent = T('assign.noPortionHint', { n: rows.length, left });
 }
 
 /* ── 奖励券 ──────────────────────────────────────── */
@@ -989,6 +1073,16 @@ $('#btn-submit').onclick = async () => {
   showErr('#assign-err', '');
   const missing = S.people.some(p => !p.member && p.amountCents > 0);
   if (missing) return showErr('#assign-err', T('assign.missingMember'));
+
+  // ★ 份数与金额绑定：0 元不能只记次数。
+  //   服务端 portions_without_amount 才是真正的把关（前端拦不住直接调接口的人），
+  //   这里先拦一道只是为了让收银员当场看到【是哪一位、该怎么改】——
+  //   等提交回来再报错，他还得回头一行行找。
+  const noAmount = S.people.find(p => p.member && p.portions > 0 && p.amountCents <= 0);
+  if (noAmount) {
+    return showErr('#assign-err',
+      T('assign.portionsNoAmount', { card: maskCard(noAmount.member.card_no) }));
+  }
 
   const allocations = S.people
     .filter(p => p.member && (p.amountCents > 0 || p.portions > 0))
@@ -1783,6 +1877,17 @@ function askVerdict(d) {
 }
 
 function useMember(m) {
+  /**
+   * ★ 这张卡已经在这张单上记过了 —— 当场拦住，别等提交时才报错。
+   *   服务端也会拒（member_already_on_order），这里只是把话提前说清楚：
+   *   收银员已经填完金额、选完人再被退回来重做，是最招人烦的。
+   */
+  if (typeof S.memberTarget === 'number') {
+    const dup = alreadyOnOrder().find(x => x.id === m.id);
+    if (dup) {
+      return showErr('#member-err', T('member.alreadyOnOrder', { card: maskCard(dup.card) }));
+    }
+  }
   if (S.memberTarget === 'merge') {
     S.merge.member = m;
     renderMerge();
