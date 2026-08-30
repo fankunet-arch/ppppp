@@ -171,7 +171,15 @@
       // 所以只能在用的时候才去问，不能在加载时取。
       ok.textContent = opts.okText || tr('common.confirm', '确定');
       ok.classList.toggle('ui-danger', !!opts.danger);
-      host.querySelector('.ui-cancel').textContent = opts.cancelText || tr('common.cancel', '取消');
+      var cancel = host.querySelector('.ui-cancel');
+      /**
+       * notice 只是告知，没有第二条路可选 —— 把「取消」藏掉。
+       *
+       * ★ 留着一个点了等于没点的按钮，比没有更糟：收银员会去想
+       *   「点取消会怎样、是不是就不记了」，而答案是什么都不会发生。
+       */
+      cancel.hidden = kind === 'notice';
+      cancel.textContent = opts.cancelText || tr('common.cancel', '取消');
 
       current = {
         resolve: resolve,
@@ -197,6 +205,16 @@
   /** 替代 prompt()：resolve(字符串) 或 resolve(null)（取消） */
   function askInput(message, opts) {
     return open('input', message, opts);
+  }
+
+  /**
+   * 只是告知，单按钮，没有「取消」。
+   *
+   * ★ 存在的理由和 confirm/prompt 一样：容器里的原生 alert 要么被吞掉、
+   *   要么长得像浏览器警告吓着客人。页内层至少长得像这个应用自己的东西。
+   */
+  function notice(message, opts) {
+    return open('notice', message, opts).then(function () { return true; });
   }
 
   /* ── 软键盘遮挡兜底 ────────────────────────────────────
@@ -272,6 +290,7 @@
   global.UI = {
     confirm: askConfirm,
     input:   askInput,
+    notice:  notice,
     /** 供页面注册自己的层级；ui.js 自己的弹层永远排在最上面 */
     back: {
       register: function (layer) { layers.push(layer); sync(); },

@@ -119,6 +119,13 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 一天超过几次就告警（不拦，只记）。0 = 关闭。
 (@store,'alert_span_hours','6',@now),
   -- 当天记的几单结账时间跨度超过多少小时就告警。0 = 关闭。
+(@store,'alert_invoice_miss','12',@now),
+  -- 一个操作员在下面那个时间窗里查不到几个小票号就告警。0 = 关闭。
+  -- 小票号是连号整数，往前减就能一个个试别人的单；界面上「查不到」与
+  -- 「超时效」说的是同一句话，试的人拿不到反馈，这一条记的是「有人在试」。
+  -- 照小票输错几个数字是常事，所以别设太低。
+(@store,'alert_invoice_window_min','30',@now),
+  -- 上面那个次数在多少分钟内计。
 
 -- ── 十送一核销识别 ────────────────────────────────────────
 (@store,'redeem_line_patterns','TARJETA 10+1,10+1',@now)

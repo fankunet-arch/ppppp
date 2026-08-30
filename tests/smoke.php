@@ -2291,58 +2291,115 @@ eq([], $binDb->all(
     [SMOKE_STORE]),
    '★★★ 全库不存在「金额 0 却计了次」的有效流水 —— 次数永远跟着钱走');
 
-// ── ⑦ 反面：有钱却没份数，次数会凭空少掉 ──
+// ── ⑦ 反面：份数余数要摊开，不能堆给第一位 ──
 /**
  * ★ 这是 ②③ 的镜像，店主同一轮里点出来的：「也要防止有积分但没份数」。
  *
  *   AA 均摊时份数除不尽，余数原本【全堆给第一位】——
- *   这在旧口径 by_portion 下没问题（第一位记 3 次，总数守恒）；
+ *   这在旧口径 by_portion 下没问题（第一位记 N 次，总数守恒）；
  *   换成 once_per_period 之后就变成：
  *
- *     3 份 4 人 → [3, 0, 0, 0] → 第一位 1 次，后三位付了钱【一次都没有】
+ *     10 份 4 人 → [4, 2, 2, 2]  第一位那多出来的 2 份完全白费，
+ *                                而如果是 3 份 4 人 → [3,0,0,0]，
+ *                                后三位付了钱【一次都没有】
  *
- *   而且不报错、不告警。客人要等到攒够十次那天才发现少了两次，
+ *   而且不报错、不告警。客人要等到攒够十次那天才发现少了，
  *   那时候已经没法查了。份数余数因此改成【一人一份地摊开】。
+ *
+ * ★ 这里用「10 份 4 人」而不是「3 份 4 人」：⑧ 那条会员数上限
+ *   （最多记到份数那么多位）已经把「份数比人少」的情况挡在门外了，
+ *   纯函数那一侧的形状由 AllocationTest 钉着。
  */
 $binPos->addHead([
     'serial_id' => '9606660003', 'order_head_id' => 960003, 'check_id' => 1,
     'table_name' => 'BIND3', 'eat_type' => 0, 'customer_num' => 4,
-    'original_amount' => '71.70', 'should_amount' => '71.70', 'actual_amount' => '71.70',
+    'original_amount' => '239.00', 'should_amount' => '239.00', 'actual_amount' => '239.00',
     'order_end_time' => date('Y-m-d H:i:s'),
 ]);
-$binPos->addDetail(960003, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '71.70', 3)]);
+$binPos->addDetail(960003, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '239.00', 10)]);
 $binApp->points()->locate('BIND3', 603);
 
 $binFour  = [];
 $binAlloc = [];
-$shares   = Vip\PointsEngine::splitEvenly(7170, 3, 4);   // 3 份分给 4 个人
+$shares   = Vip\PointsEngine::splitEvenly(23900, 10, 4);   // 10 份分给 4 个人
 foreach ($shares as $i => $sh) {
     $mid = (int)$binApp->members()->create(sprintf('TK-0009881%d-BND', $i), null, null, null)['id'];
     $binFour[]  = $mid;
     $binAlloc[] = ['member_id' => $mid] + $sh;
 }
-eq([1, 1, 1, 0], array_column($shares, 'portions'),
-   '★★★ 3 份 4 人 → 份数摊成 [1,1,1,0]，不是 [3,0,0,0]');
+eq([3, 3, 2, 2], array_column($shares, 'portions'),
+   '★★★ 10 份 4 人 → 份数摊成 [3,3,2,2]，不是 [4,2,2,2]');
 
 $b7 = $binApp->points()->grant('9606660003', $binAlloc, Vip\PointsEngine::MODE_SPLIT, $binOp);
 ok($b7['ok'], '四人 AA 一次提交成功');
-eq([1, 1, 1, 0], array_map(static fn(array $e): int => (int)$e['visits'], $b7['entries']),
-   '★★★ 三位各记 1 次，第四位 0 次 —— 而不是第一位 1 次、后三位全空');
-// ★ 积分是【逐人】取整的，所以四个人加起来会比整单少几分 ——
-//   这是 AA 本来就有的性质，不是这次改动带来的。这里钉的是「谁都没被漏掉」。
+eq([1, 1, 1, 1], array_map(static fn(array $e): int => (int)$e['visits'], $b7['entries']),
+   '★★★ 四位各记 1 次 —— 没有人因为份数被别人多占而落空');
 ok(count(array_filter($b7['entries'], static fn(array $e): bool => (int)$e['points'] > 0)) === 4,
-   '  └ 四个人都拿到了积分（钱谁都没少花，分谁都不该少）');
-ok((int)$b7['entries'][3]['points'] > 0,
-   '★★ 第四位【有积分、没次数】—— 这张单确实只有 3 份计次套餐，他没点');
+   '  └ 四个人都拿到了积分');
+
+// ── ⑧ 一张单最多记几位 = 计次套餐份数（0 份的单只准 1 位）──
+/**
+ * ★ 店主提的第三条：「添加会员也不可以无限添加，最多只能添加到份数的会员；
+ *   如果没有套餐（套餐数 0），则只能添加 1 个会员」。
+ *
+ *   这一条挡得住守恒挡不住的形状：3 份的单拆给 5 个人、
+ *   份数填成 [1,1,1,0,0] —— 份数没超、金额没超，前两层全都放行。
+ *   份数是这张单上「有几个人在这儿吃了饭」唯一可信的凭据。
+ */
+$binPos->addHead([
+    'serial_id' => '9606660004', 'order_head_id' => 960004, 'check_id' => 1,
+    'table_name' => 'BIND4', 'eat_type' => 0, 'customer_num' => 5,
+    'original_amount' => '71.70', 'should_amount' => '71.70', 'actual_amount' => '71.70',
+    'order_end_time' => date('Y-m-d H:i:s'),
+]);
+$binPos->addDetail(960004, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '71.70', 3)]);
+$binApp->points()->locate('BIND4', 604);
+
+$binFive = [];
+for ($i = 0; $i < 5; $i++) {
+    $binFive[] = (int)$binApp->members()->create(sprintf('TK-0009882%d-BND', $i), null, null, null)['id'];
+}
+// 3 份的单，5 个人，份数填成 [1,1,1,0,0] —— 份数与金额都不超
+$capAlloc = [];
+foreach ($binFive as $i => $mid) {
+    $capAlloc[] = ['member_id' => $mid, 'amount_cents' => 1434, 'portions' => $i < 3 ? 1 : 0];
+}
+$b8 = $binApp->points()->grant('9606660004', $capAlloc, Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok(!$b8['ok'] && $b8['error'] === 'too_many_members',
+   '★★★ 3 份的单要记 5 位 → 被拒（' . ($b8['error'] ?? '竟然成功了') . '）—— 份数与金额都没超，守恒那两层看不出来');
+eq(3, (int)($b8['detail']['cap'] ?? 0), '  └ 告诉前端上限是几位（3），好把话说清楚');
+
+// 3 位正好，通过
+$b8b = $binApp->points()->grant('9606660004', array_slice($capAlloc, 0, 3),
+                                Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok($b8b['ok'], '★★ 同一张单记 3 位 → 通过（挡的是超出份数，不是拆分）');
+
+// 第 4 位再来（换一张没记过的卡）→ 仍然被拒，跨提交也算数
+$b8c = $binApp->points()->grant('9606660004',
+    [['member_id' => $binFive[3], 'amount_cents' => 1434, 'portions' => 0]],
+    Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok(!$b8c['ok'] && $b8c['error'] === 'too_many_members',
+   '★★★ 记满 3 位之后第 4 位再来 → 还是拒 —— 上限算的是【这张单一共几位】，不是【这一笔几位】');
+
+// 0 份的单只准 1 位：9606660002 是 MENÚ DEL DIA（算餐费、积分，但不计次）
+$binZero = (int)$binApp->members()->create('TK-00098830-BND', null, null, null)['id'];
+$b8d = $binApp->points()->grant('9606660002',
+    [['member_id' => $binZero, 'amount_cents' => 100, 'portions' => 0]],
+    Vip\PointsEngine::MODE_SPLIT, $binOp);
+ok(!$b8d['ok'] && $b8d['error'] === 'too_many_members',
+   '★★★ 0 份的单已经记了 1 位，第 2 位 → 拒（' . ($b8d['error'] ?? '竟然成功了') . '）');
+ok((int)($b8d['detail']['cap'] ?? 0) === 1,
+   '  └ 上限是 1 位 —— 纯酒水单该给积分，但证明不了几个人吃了饭，所以不给拆');
 
 // 清理
-$binDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id IN (' . implode(',', $binFour) . ')', [SMOKE_STORE]);
-$binDb->exec('DELETE FROM coupon      WHERE store_code=? AND member_id IN (' . implode(',', $binFour) . ')', [SMOKE_STORE]);
-$binDb->exec('DELETE FROM member      WHERE store_code=? AND id        IN (' . implode(',', $binFour) . ')', [SMOKE_STORE]);
+$binExtra = implode(',', array_merge($binFour, $binFive, [$binZero]));
+$binDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$binExtra})", [SMOKE_STORE]);
+$binDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$binExtra})", [SMOKE_STORE]);
+$binDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$binExtra})", [SMOKE_STORE]);
 $binDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id IN (?,?,?)', [SMOKE_STORE, $binA, $binB, $binC]);
 $binDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id IN (?,?,?)', [SMOKE_STORE, $binA, $binB, $binC]);
 $binDb->exec('DELETE FROM member WHERE store_code=? AND id IN (?,?,?)', [SMOKE_STORE, $binA, $binB, $binC]);
-$binDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id IN (?,?,?)', [SMOKE_STORE, '9606660001', '9606660002', '9606660003']);
+$binDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id IN (?,?,?,?)', [SMOKE_STORE, '9606660001', '9606660002', '9606660003', '9606660004']);
 
 step('⑬ 不变量总校验');
 

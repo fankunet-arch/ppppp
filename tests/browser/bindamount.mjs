@@ -96,6 +96,12 @@ await page.click('#btn-login');
 await page.waitForSelector('#view-main.active', { timeout: 8000 });
 
 /** 找单 → 均摊 AA 两人 → 两位都选上卡 */
+const doSplitN = async (n) => {
+  await page.fill('#aa-people', String(n));
+  await page.click('#btn-aa');
+  await page.waitForTimeout(800);
+};
+
 const pickMember = async (i, card) => {
   await page.locator('#assign-people .person').nth(i).locator('button').first().click();
   await page.waitForSelector('#member-modal:not([hidden])', { timeout: 5000 });
@@ -181,33 +187,35 @@ await page.fill('[data-prt="1"]', '1');
 await page.waitForTimeout(250);
 ok(await page.locator('#assign-noportion').isHidden(), '  └ 份数补回去，提醒就消失');
 
-console.log('\n【④ AA 除不尽时，份数要摊开而不是堆给第一位】');
+console.log('\n【④ 人数封顶：一张单最多记到份数那么多位】');
 /**
- * ★ 4 份【5 人】才测得出来 —— 4 份 4 人是 [1,1,1,1]，摊不摊都一样。
+ * ★ 份数除不尽时怎么摊（[3,3,2,2] 而不是 [4,2,2,2]），
+ *   由纯函数用例 AllocationTest 和 smoke ㉕⑦ 端到端钉着 ——
+ *   浏览器这一侧测不出新旧差别（4 份 3 人两种写法都给 [2,1,1]）。
  *
- *   堆给第一位 → [4,0,0,0,0]：后四位付了钱一次都拿不到。
- *   旧口径 by_portion 下这没问题（第一位记 4 次，总数守恒），
- *   换成 once_per_period 之后凭空少掉 3 次，而且不报错、不告警。
+ *   这里改测浏览器【独有】的那一半：人数根本填不进超过份数的数字。
+ *   不封的话，一张 € 200 的单可以拆给十张卡，
+ *   而其中大部分人根本没来过这家店。
  */
-await page.fill('#aa-people', '5');
-await page.click('#btn-aa');
-await page.waitForTimeout(800);
-const five = await page.evaluate(() => S.people.map(p => p.portions));
-const totalPrt = five.reduce((s, n) => s + n, 0);
-ok(five.length === 5, `改成 5 人重新均摊（这张单共 ${totalPrt} 份计次套餐）`);
-ok(Math.max(...five) === 1,
-   `★★★ 份数摊成 [${five.join(',')}]，没有人拿到 2 份以上 —— 不是 [${totalPrt},0,0,0,0]`);
-ok(five.filter(n => n > 0).length === Math.min(totalPrt, 5),
-   `★★★ ${Math.min(totalPrt, 5)} 位拿到份数（= min(份数, 人数)）—— 让尽可能多的人记上次`);
-ok(!(await page.locator('#assign-noportion').isHidden()),
-   '  └ 第五位没份数，橙色提醒自动挂出来（他确实没点套餐，但收银员得知道）');
+const cap = await page.evaluate(() => Number(S.order.portions_counted) || 0);
+ok(await page.locator('#aa-people').getAttribute('max') === String(cap),
+   `★★★ AA 人数框的 max 就是这张单的计次份数（${cap}）—— 原来写死 50`);
+
+await page.fill('#aa-people', String(cap + 6));
+await page.waitForTimeout(300);
+ok(await page.locator('#aa-people').inputValue() === String(cap),
+   `★★★ 打进 ${cap + 6} → 当场改回 ${cap}，服务员想拆也拆不出来`);
+
+await doSplitN(cap);
+ok(await page.evaluate(() => S.people.length) === cap, `按 ${cap} 人分摊出 ${cap} 行`);
+const prts = await page.evaluate(() => S.people.map(p => p.portions));
+ok(prts.every(n => n > 0),
+   `★★ ${cap} 份 ${cap} 人 → [${prts.join(',')}]，每一位都分到了份数（没人白吃）`);
 
 console.log('\n【⑤ 把餐费分给他，就能正常提交】');
 // 回到两人 AA。★ 重拆一次 S.people 会被整个重建，会员选择也跟着没了 ——
 //   所以这里要重新选一遍卡，不能沿用 ①② 那次的选择
-await page.fill('#aa-people', '2');
-await page.click('#btn-aa');
-await page.waitForTimeout(800);
+await doSplitN(2);
 await pickMember(0, F.cardA);
 await pickMember(1, F.cardB);
 await page.waitForTimeout(200);

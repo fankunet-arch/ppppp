@@ -29,6 +29,7 @@
     'common.back':        { zh: '返回',        es: 'Volver' },
     'common.cancel':      { zh: '取消',        es: 'Cancelar' },
     'common.confirm':     { zh: '确认',        es: 'Confirmar' },
+    'common.ok':          { zh: '知道了',      es: 'Entendido' },
     'common.submit':      { zh: '提交',        es: 'Enviar' },
     'common.next':        { zh: '下一步',      es: 'Siguiente' },
     'common.later':       { zh: '稍后再说',    es: 'Ahora no' },
@@ -72,8 +73,22 @@
     'lookup.invoice':     { zh: '小票号',      es: 'Nº de ticket' },
     'lookup.table':       { zh: '桌号',        es: 'Nº de mesa' },
     'lookup.find':        { zh: '查找订单',    es: 'Buscar ticket' },
-    'lookup.invoiceHint': { zh: '输小票上 <b>Factura Simplificada</b> 那一行的号（如 <code>000092521</code>，前面的 0 可不输）。最准，不受 30 分钟限制。',
-                            es: 'Escriba el número de la línea <b>Factura Simplificada</b> del ticket (p. ej. <code>000092521</code>; los ceros del principio no hacen falta). Es lo más exacto y no tiene límite de 30 minutos.' },
+    /**
+     * ★ 这里【不举具体号码】。
+     *
+     *   原来这里举了一个具体号码当例子：位数对、前导零对，而中间那几位
+     *   正好压在当时的实际号段上（查下来在库里就是一张真单）。
+     *   等于把「号长什么样、现在数到哪儿了」一起印在了界面上，
+     *   照着往前减就能一个个试别人的单。
+     *
+     *   ★ 连注释里也不要写回那个号 —— 这份文件是发到 Pad 上的静态资源，
+     *     注释照样跟着一起发。
+     *
+     *   而这句话本来要解决的问题只是「读小票上哪一行」，指到那一行就够了，
+     *   号码本身客人手里那张小票上就印着。
+     */
+    'lookup.invoiceHint': { zh: '输小票上 <b>Factura Simplificada</b> 那一行的号，照原样输就行（前面的 0 可不输）。最准，不受 30 分钟限制。',
+                            es: 'Escriba el número que aparece en la línea <b>Factura Simplificada</b> del ticket, tal cual (los ceros del principio no hacen falta). Es lo más exacto y no tiene límite de 30 minutos.' },
     'lookup.tableHint':   { zh: '查找最近 {min} 分钟内该桌已结账的订单',
                             es: 'Busca tickets cobrados en esa mesa en los últimos {min} minutos' },
     'lookup.needTable':   { zh: '请输入桌号',  es: 'Escriba el número de mesa' },
@@ -81,10 +96,19 @@
                             es: 'Escriba el número de Factura Simplificada del ticket' },
     'lookup.noneInWindow':{ zh: '最近 {min} 分钟内没找到 {table} 桌的已结账订单',
                             es: 'No hay tickets cobrados en la mesa {table} en los últimos {min} minutos' },
-    'lookup.tooOld':      { zh: '这张小票是 {date} 的，超过 {days} 天不再受理，请找经理处理',
-                            es: 'Este ticket es del {date}; pasados {days} días ya no se admite, avise al encargado' },
-    'lookup.invoiceNone': { zh: '没找到小票号 {no} 对应的订单，请核对 Factura Simplificada 那一行',
-                            es: 'No se encuentra el ticket nº {no}, compruebe la línea Factura Simplificada' },
+    /**
+     * ★ 普通收银员只有这一句 —— 「查不到」和「太旧了」必须长得一模一样。
+     *
+     *   下面两句带日期、带「没找到这个号」的，只有经理会看到
+     *   （服务端按角色砍字段，见 api/routes.php 的 locate-invoice）。
+     *   留着它们是因为查错和对账要分得清，不是给收银台用的。
+     */
+    'lookup.invoiceUnavailable': { zh: '订单不存在或已超过时效，请联系经理处理',
+                            es: 'El ticket no existe o está fuera de plazo; avise al encargado' },
+    'lookup.tooOldMgr':   { zh: '【经理可见】这张小票是 {date} 的，超过 {days} 天不再受理',
+                            es: '[Solo encargado] Este ticket es del {date}; pasados {days} días ya no se admite' },
+    'lookup.invoiceNoneMgr': { zh: '【经理可见】没找到小票号 {no} 对应的订单，请核对 Factura Simplificada 那一行',
+                            es: '[Solo encargado] No se encuentra el ticket nº {no}, compruebe la línea Factura Simplificada' },
     'lookup.widen':       { zh: '放宽到 {min} 分钟再找', es: 'Ampliar a {min} minutos' },
     'lookup.useManual':   { zh: '改用手工录入', es: 'Usar entrada manual' },
 
@@ -148,6 +172,7 @@
     'assign.portionsPaid':{ zh: '付费套餐 <b>{n}</b> 份', es: '<b>{n}</b> menús de pago' },
     'assign.portionsFree':{ zh: '免费套餐 <b>{n}</b> 份', es: '<b>{n}</b> menús gratis' },
     'assign.portionsDone':{ zh: '已分配 {n} 份', es: '{n} menús ya asignados' },
+    'assign.portionsLeft':{ zh: '还剩 <b>{n}</b> 份', es: 'quedan <b>{n}</b>' },
     'assign.noDetail':    { zh: '⚠ 这一单的<b>菜品明细还没同步过来</b>，所以份数显示 0。<br>这不是没点套餐，也不是规则没配 —— 过几分钟再查一次即可。<br>若急着发分，份数请按实际用餐人数手工填写。',
                             es: '⚠ <b>Las líneas de este ticket aún no se han sincronizado</b>, por eso aparecen 0 menús.<br>No es que no pidieran menú ni que falten reglas: vuelva a buscarlo en unos minutos.<br>Si hay prisa, escriba los menús a mano según los comensales reales.' },
     'assign.noRule':      { zh: '⚠ 这些菜品不在「套餐规则」里，份数按 0 计：',
@@ -181,6 +206,18 @@
                             es: 'Asigne importe al menos a un socio' },
     'assign.portionsNoAmount': { zh: '{card} 名下是 € 0，不能只记次数。请把他那份餐费也分给他，或把份数改成 0。',
                             es: '{card} tiene € 0 asignados: no se puede contar la visita. Asígnele su parte del ticket o ponga 0 raciones.' },
+    'assign.addMemberFull': { zh: '这张单最多记 {n} 位（按付费套餐份数）',
+                            es: 'Máximo {n} socio(s) en este ticket (según menús de pago)' },
+    'assign.cappedPeople': { zh: '这张单最多记 {n} 位，已经帮你改回来了',
+                            es: 'Máximo {n} socio(s) en este ticket; se ha corregido' },
+    'assign.noMenuHi':    { zh: '本订单没有付费套餐',
+                            es: 'Este ticket no tiene menús de pago' },
+    'assign.noMenuBody':  { zh: '这一单里没有可计次的套餐，所以只能记 1 位会员，而且这一次不计次（十送一不加）。金额照常给积分。如果客人确实点了套餐，请让经理到后台补「套餐规则」，别在这里手工凑数字。',
+                            es: 'Este ticket no incluye ningún menú que cuente para la visita, así que solo se puede apuntar a 1 socio y esta vez no cuenta visita (no suma para el 10+1). El importe sí da puntos. Si el cliente sí tomó menú, pida al encargado que lo añada a las reglas de menús; no ajuste los números a mano aquí.' },
+    'assign.cappedPortions': { zh: '这张单只剩 {n} 份可分，已经帮你改回来了',
+                            es: 'Solo quedan {n} ración(es) en este ticket; se ha corregido' },
+    'assign.cappedAmount': { zh: '这张单只剩 € {money} 可分，已经帮你改回来了',
+                            es: 'Solo quedan € {money} en este ticket; se ha corregido' },
     'assign.noPortionHint': { zh: '有 {n} 位分到了金额但份数是 0，这几位这一次不计次（还剩 {left} 份没分）。只点酒水的客人本来就是这样；点了套餐的话请把份数补上。',
                             es: '{n} persona(s) con importe pero 0 raciones: esta vez no se les cuenta la visita (quedan {left} raciones sin asignar). Es lo normal si solo tomaron bebida; si tomaron menú, añada sus raciones.' },
     'assign.overflow':    { zh: '（可分配 € {total}，已分配 € {allocated}）',
@@ -268,6 +305,12 @@
     'member.alreadyOnOrder': { zh: '这张单已经记给 {card} 了，不能再记一次。要改请先撤销那一笔。',
                                es: 'Este ticket ya se apuntó a {card}; no se puede repetir. Para cambiarlo, anule primero ese apunte.' },
     'assign.doneTitle':   { zh: '这张单已经记给：', es: 'Este ticket ya se apuntó a:' },
+    'assign.lockedRow':   { zh: '已记入 · 不可更改', es: 'Ya apuntado · no editable' },
+    'assign.donePortions':{ zh: '套餐 <b>{n}</b> 份', es: '<b>{n}</b> menú(s)' },
+    'assign.doneVisits':  { zh: '已计 <b>{n}</b> 次', es: '<b>{n}</b> visita(s) contada(s)' },
+    'assign.doneNoVisit': { zh: '本次未计次', es: 'sin contar visita' },
+    'assign.doneLeft':    { zh: '这张单还剩 <b>€ {money}</b> · <b>{n}</b> 份可分',
+                            es: 'Quedan por asignar <b>€ {money}</b> · <b>{n}</b> ración(es)' },
     'assign.doneNote':    { zh: '同一张卡在同一张单上只能记一次。要改请回上一步撤销那一笔。',
                             es: 'Una tarjeta solo puede apuntarse una vez por ticket. Para cambiarlo, vuelva atrás y anule ese apunte.' },
     // 隔离区的小字：说清这两个按钮为什么被单独放出来

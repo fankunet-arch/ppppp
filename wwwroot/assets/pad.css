@@ -87,6 +87,15 @@ h3 { font-size: 18px; margin: 0 0 12px; }
  *   也常常是对的（客人真的只点了酒水）。用红色会把「必须处理」
  *   和「看一眼」混成一档，几天之后两种都不会有人看。
  */
+/* 黄框里那条「还剩多少可分」—— 服务员真正要照着填的数，
+   跟上面几行「已经记给谁」拉开一档 */
+.ledger-box .lrow.left {
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed rgba(0, 0, 0, .18);
+  font-size: 15px;
+}
+
 .hint-warn {
   color: var(--warn);
   font-weight: 600;
@@ -320,6 +329,33 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
 .person .prt { width: 84px; }
 .person .amt input, .person .prt input { margin: 0; padding: 9px 10px; font-size: 16px; }
 .person .rm { border: none; background: none; color: var(--err); min-height: auto; }
+
+/**
+ * 已经记掉的那一行：长得像一行，但一眼看得出【不能点】。
+ *
+ * ★ 用的是「已停用」那一套视觉（灰底、虚线框、卡号不加粗成蓝），
+ *   而不是红色或橙色 —— 它不是错误，也不需要处理，
+ *   只是这个位子有人了。红橙两档要留给「必须处理」和「看一眼」，
+ *   第三种状态再挤进去，三种就都不管用了。
+ */
+.person.locked {
+  background: #f1f3f6;
+  border-style: dashed;
+  border-color: var(--exit-line);
+  color: var(--muted);
+}
+.person.locked .who b { color: var(--exit); font-variant-numeric: tabular-nums; }
+.person.locked .lockmark {
+  flex: 0 0 auto;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--exit);
+  background: var(--exit-bg);
+  border: 1px solid var(--exit-line);
+  border-radius: 999px;
+  padding: 4px 12px;
+  white-space: nowrap;
+}
 
 .totals {
   display: flex;

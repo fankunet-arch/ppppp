@@ -195,6 +195,18 @@ await page.waitForSelector('#step-mode.active', { timeout: 5000 });
  */
 await page.click('.mode[data-mode="2"]');
 await page.waitForSelector('#step-assign.active', { timeout: 5000 });
+/**
+ * ★ T1 是夹具里的桌 30 —— 那张单【明细缺套餐行】，计次份数为 0，
+ *   进分配页会弹一层「本订单没有付费套餐」。
+ *   不先点掉的话：① 它盖住 #btn-aa，点不动；
+ *   ② 后面那句 waitForSelector('.ui-ask:not([hidden])') 等的是
+ *      经理放行那一层，会误读成这一层，测出来是个假的绿。
+ */
+await page.waitForTimeout(400);
+if (await page.locator('.ui-ask:not([hidden])').count() > 0) {
+  await page.click('.ui-ask .ui-ok');
+  await page.waitForTimeout(300);
+}
 await page.fill('#aa-people', '1');
 await page.click('#btn-aa');
 await page.waitForTimeout(800);

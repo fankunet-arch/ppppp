@@ -249,8 +249,32 @@ $api->on('POST', '/order/locate', static function () use ($app, $requireOperator
  * 小票印的是零填充的 000092521，这里接受任意形式（带前导零、带空格都行）。
  * 与按桌号查并存：手边有小票就输号（精确），没有就照旧输桌号。
  */
+/**
+ * 按小票号找单。
+ *
+ * ── 🔴 这个接口是全站唯一一个「按连号整数直接取别人订单」的入口 ──
+ *
+ * 小票号就是 order_head_id，连号。手里有一张自己的小票就知道号段在哪儿，
+ * 往前减一个个试就能把别人的单翻出来。所以这里的回话必须当成
+ * 【会被人拿去当探针】来设计：
+ *
+ *   ① 查不到与过了时效，对普通收银员是【同一句话】。
+ *      区分开的话，「这张小票是 2026-08-12 的、超过 7 天」本身就告诉了
+ *      对方：这个号是真的，而且那天有生意。一句一句试下去就能把号段
+ *      和营业日都摸出来。
+ *
+ *   ② 差异只留给经理。查错、对账要分得清是「没这张单」还是「太旧了」，
+ *      所以经理照常拿到真实原因和日期。
+ *
+ *   ③ 【要在服务端就砍掉】，不能只改前端文案。
+ *      Pad 是柜台上一台安卓平板，返回的 JSON 谁都看得见 ——
+ *      前端换个说法而 reason/order_end_time 照发，等于没做。
+ *
+ *   ④ 查不到的每一次都留痕，短时间内连着太多次就告警（见 watchInvoiceProbe）。
+ *      前三条管的是「试出来能知道什么」，这一条记的是「有人在试」。
+ */
 $api->on('POST', '/order/locate-invoice', static function () use ($app, $requireOperator): void {
-    $requireOperator();
+    $op  = $requireOperator();
     $b   = Api::body();
     $raw = trim((string)($b['invoice_no'] ?? ''));
     // 小票上是 000092521，去掉前导零与分隔符；只留数字
@@ -265,11 +289,23 @@ $api->on('POST', '/order/locate-invoice', static function () use ($app, $require
     if (!$r['ok'] && ($r['reason'] ?? '') === 'pos_unavailable') {
         Api::fail('pos_unavailable', 503);
     }
+
+    $isManager = (bool)($op['is_manager'] ?? false);
+    $found     = $r['candidates'] !== [];
+
+    if (!$found) {
+        $app->points()->watchInvoiceProbe($invoice, $op);
+    }
+
     Api::ok([
         'invoice_no' => $invoice,
-        'reason'     => $r['reason'] ?? null,
-        'max_days'   => $r['max_days'] ?? null,
-        'order_end_time' => $r['order_end_time'] ?? null,
+        // ★ 普通收银员一律拿到 'unavailable'：查不到、太旧、号不合法，长得一模一样
+        'reason'     => $found ? null
+                      : ($isManager ? ($r['reason'] ?? 'not_found') : 'unavailable'),
+        // ★ 这两个字段本身就是答案，非经理连字段都不给（给 null 也比给值安全）
+        'max_days'       => $isManager ? ($r['max_days'] ?? null) : null,
+        'order_end_time' => $isManager ? ($r['order_end_time'] ?? null) : null,
+        'is_manager'     => $isManager,
         'candidates' => $r['candidates'],
     ]);
 });

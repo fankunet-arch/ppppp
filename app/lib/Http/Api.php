@@ -79,6 +79,7 @@ final class Api
         // 跨提交的重复：这张单已经记给过这张卡了。不是重复计分（金额守恒挡着），
         // 但把一张单分两次都记给同一个人，现实中基本只可能是误操作
         'member_already_on_order'=> '这张单已经记给过这张卡了，不能再记一次',
+        'too_many_members'       => '这张单的付费套餐份数不够记这么多位客人',
         'empty_allocation'       => '请至少为一位会员分配金额',
         'invalid_member'         => '会员信息不完整',
         'member_not_found'       => '未找到该会员',
@@ -167,6 +168,7 @@ final class Api
         'duplicate_member'       => 'El mismo cliente aparece repetido, revíselo',
         'portions_without_amount'=> 'Este cliente no tiene importe asignado: no se puede contar la visita sin su parte del ticket',
         'member_already_on_order'=> 'Este ticket ya se apuntó a esa tarjeta; no se puede repetir',
+        'too_many_members'       => 'Este ticket no tiene menús de pago suficientes para tantos socios',
         'empty_allocation'       => 'Asigne importe al menos a un cliente',
         'invalid_member'         => 'Los datos del cliente están incompletos',
         'member_not_found'       => 'No se ha encontrado ese cliente',

@@ -308,8 +308,10 @@ await page.click('#lang-main .lang-btn[data-lang=zh]');
 await page.waitForTimeout(500);
 // 直接进到分配步骤造一个「填了一半」的现场
 await page.evaluate(() => {
+  // ★ portions_counted 不能省：份数为 0 的单会弹「本订单没有付费套餐」，
+  //   那个页内层会盖住后面所有的点击，错得完全不像一个缺字段的问题
   S.order = { serial_id: 1, table_name: '9', remaining_cents: 5000, remaining_portions: 2,
-              excluded: 0, existing_ledger: [], customer_num: 2 };
+              portions_counted: 2, excluded: 0, existing_ledger: [], customer_num: 2 };
   S.mode = 1;
   startAssign();
 });

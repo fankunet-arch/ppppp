@@ -28,4 +28,27 @@ final class AuditRepo
             ]
         );
     }
+
+    /**
+     * 某个操作员最近 N 分钟内做了多少次某个动作。
+     *
+     * 给「有人在枚举小票号」这类判断用：单看一次查不到什么都说明不了，
+     * 短时间内连着查不到十几次才是信号。
+     */
+    public function countRecent(string $action, ?int $operatorId, int $minutes): int
+    {
+        $since = date('Y-m-d H:i:s', strtotime($this->db->now()) - max(1, $minutes) * 60);
+        if ($operatorId === null) {
+            return (int)$this->db->value(
+                'SELECT COUNT(*) FROM audit_log
+                  WHERE store_code = ? AND action = ? AND created_at >= ?',
+                [$this->storeCode, $action, $since]
+            );
+        }
+        return (int)$this->db->value(
+            'SELECT COUNT(*) FROM audit_log
+              WHERE store_code = ? AND action = ? AND operator_id = ? AND created_at >= ?',
+            [$this->storeCode, $action, $operatorId, $since]
+        );
+    }
 }
