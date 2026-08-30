@@ -260,6 +260,7 @@ final class App
             $this->businessDay(),
             $this->cardTiers(),
             $this->mealPeriods(),
+            $this->cardNumber(),
         ));
     }
 }

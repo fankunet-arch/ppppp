@@ -51,11 +51,11 @@ php bin/why.php --ref E202-7F3A21    # 按界面上的错误代码翻日志拿�
 ## 测试
 
 ```bash
-php tests/run.php                 # 820 项，不需要数据库
-php tests/smoke.php --fresh       # 430 项，需要一个【专用空库】
+php tests/run.php                 # 892 项，不需要数据库
+php tests/smoke.php --fresh       # 458 项，需要一个【专用空库】
 php tests/e2e_pos.php             # 95 项，需要 POS 可达
-php tests/http_sweep.php          # 53 项，对着跑起来的站点打全部接口
-node tests/browser/*.mjs          # 446 项，真浏览器，仅开发机
+php tests/http_sweep.php          # 67 项，对着跑起来的站点打全部接口
+node tests/browser/*.mjs          # 525 项，真浏览器，仅开发机
 ```
 
 > 🔴 `smoke.php --fresh` 会 `DROP TABLE`，**务必给它一个专用空库**

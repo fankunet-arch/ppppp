@@ -60,6 +60,17 @@ const F = JSON.parse(php(`
 setCfg('visit_count_mode', 'once_per_period');
 setCfg('late_grant_minutes', 0);
 setCfg('max_grants_per_period', 0);
+/**
+ * ★ 把找单窗口放宽到 3 小时。
+ *
+ * 夹具是按「几分钟前结账」注入的，默认 30 分钟的窗口一过就找不到单，
+ * 于是用例会随着「注入后过了多久」时绿时红 —— 而那和代码对不对无关。
+ * 窗口本来就是店家可调的配置，这里调大只是让用例不去赌时间。
+ * 跑完在末尾恢复原值。
+ */
+const WIN0 = php(`require "app/bootstrap.php"; $c = require "app/config/config.php";
+  echo (new Vip\\App($c))->cfg()->get('order_lookup_window_min', '30');`);
+setCfg('order_lookup_window_min', 180);
 
 const browser = await launch();
 const page = await (await browser.newContext({ viewport: { width: 1280, height: 900 } })).newPage();
@@ -215,6 +226,7 @@ php(`
   $db->exec('DELETE FROM card WHERE batch_no = ?', ['${TAG}']);
   foreach ([${F.midA}, ${F.midB}] as $id) { $db->exec('DELETE FROM member WHERE id = ?', [$id]); }
 `);
+setCfg('order_lookup_window_min', WIN0);
 
 console.log(`\n${'─'.repeat(50)}\n${fail === 0 ? '全部通过' : '失败 ' + fail}  ${pass + fail} 项\n`);
 process.exit(fail ? 1 : 0);

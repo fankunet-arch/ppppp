@@ -583,11 +583,27 @@ async function locateByInvoice() {
   try {
     const d = await api('/order/locate-invoice', { invoice_no: raw });
     if (!d.candidates.length) {
+      /**
+       * ★ 普通收银员看到的永远是【同一句话】，不管是查不到还是过了时效。
+       *
+       *   分开说的话，「这张小票是 8 月 12 号的、超过 7 天」这句本身
+       *   就等于告诉对方：这个号是真的。小票号是连号的整数，
+       *   一个一个往前试，就能把号段和哪天有生意都摸出来。
+       *
+       *   服务端已经把 reason 按角色砍过了（见 api/routes.php），
+       *   这里只是照着说 —— 前端不做判断，也就没有「前端漏改一处」这回事。
+       *
+       *   ★ 结账日期【谁都拿不到】，经理也一样：他要分的只是
+       *     「没这张单」还是「有单但太旧了」，具体是哪天不需要。
+       *     经理账号一旦外泄，泄露面不该比收银员大。
+       */
       if (d.reason === 'too_old') {
-        showErr('#locate-err',
-          T('lookup.tooOld', { date: (d.order_end_time || '').slice(0, 10), days: d.max_days }));
+        // ★ 不带日期 —— 服务端也不再发了（见 api/routes.php 与 locateByInvoice）
+        showErr('#locate-err', T('lookup.tooOldMgr', { days: d.max_days }));
+      } else if (d.reason === 'not_found') {
+        showErr('#locate-err', T('lookup.invoiceNoneMgr', { no: d.invoice_no }));
       } else {
-        showErr('#locate-err', T('lookup.invoiceNone', { no: d.invoice_no }));
+        showErr('#locate-err', T('lookup.invoiceUnavailable'));
       }
       $('#locate-fallback').hidden = false;
       return;
@@ -667,7 +683,7 @@ function renderSummary(o) {
   const lb = $('#existing-ledger');
   if (o.existing_ledger && o.existing_ledger.length) {
     lb.innerHTML = `<b>${T('ledger.title')}</b>` + o.existing_ledger.map(l =>
-      `<div class="lrow"><span>${l.card_no || T('common.member')} · € ${l.amount} · ${l.points} ${T('common.points')}</span>
+      `<div class="lrow"><span>${l.card_no ? escapeHtml(maskCard(l.card_no)) : T('common.member')} · € ${escapeHtml(l.amount)} · ${l.points} ${T('common.points')}</span>
        <button class="link" data-rev="${l.id}">${T('ledger.reverse')}</button></div>`).join('');
     lb.hidden = false;
     $$('[data-rev]', lb).forEach(b => b.onclick = () => doReverse(parseInt(b.dataset.rev, 10)));
@@ -725,7 +741,12 @@ function renderPortionBreakdown(o) {
   if (o.customer_num) bits.push(T('assign.paidBy', { n: o.customer_num }));
   if (o.portions_paid)  bits.push(T('assign.portionsPaid', { n: o.portions_paid }));
   if (o.portions_free)  bits.push(T('assign.portionsFree', { n: o.portions_free }));
-  if (o.allocated_portions) bits.push(T('assign.portionsDone', { n: o.allocated_portions }));
+  // ★ 分过一部分之后，「还剩几份」比「共几份」有用得多 ——
+  //   服务员要填的就是这个数。没分过时不写，那时它等于总份数，纯噪音
+  if (o.allocated_portions) {
+    bits.push(T('assign.portionsDone', { n: o.allocated_portions }));
+    bits.push(T('assign.portionsLeft', { n: o.remaining_portions }));
+  }
 
   let html = bits.length ? `<div class="port-bits">${bits.join(' · ')}</div>` : '';
 
@@ -744,6 +765,26 @@ function renderPortionBreakdown(o) {
   el.hidden = !html;
 }
 
+/**
+ * 「这张单一份付费套餐都没有」的告知。
+ *
+ * ★ 用页内层（UI.notice）而不是系统 alert：容器里的原生 alert 要么被吞掉，
+ *   要么长得像浏览器警告 —— 屏幕朝着客人，那一下很难解释。
+ *
+ * ★ 同一张单只弹一次。收银员在这一屏和上一屏之间来回是常事，
+ *   每回都弹的话，他会养成「闭着眼点确定」的习惯，
+ *   那这个提示就等于不存在了。
+ */
+let noMenuTold = '';
+function tellNoMenu(o) {
+  if ((Number(o.portions_counted) || 0) > 0) { return; }
+  if (noMenuTold === o.serial_id) { return; }
+  noMenuTold = o.serial_id;
+  try {
+    UI.notice(T('assign.noMenuBody'), { highlight: T('assign.noMenuHi'), okText: T('common.ok') });
+  } catch (e) { /* 弹层挂了也不能挡住记账 */ }
+}
+
 /* ── 步骤 4：分配 ────────────────────────────────── */
 function startAssign() {
   const o = S.order;
@@ -751,6 +792,7 @@ function startAssign() {
   $('#sum-total').textContent = money(o.remaining_cents);
   $('#sum-port-total').textContent = o.remaining_portions;
   renderPortionBreakdown(o);
+  tellNoMenu(o);
   showErr('#assign-err', '');
   const body = $('#assign-body');
   body.innerHTML = '';
@@ -759,12 +801,38 @@ function startAssign() {
     S.people = [{ member: null, amountCents: o.remaining_cents, portions: o.remaining_portions }];
     renderPeople();
   } else if (S.mode === 2) {
+    /**
+     * ★ 默认人数要【扣掉已经记掉的那几位】。
+     *
+     *   买单 2 人、已经记给 1 张卡，默认还填 2 的话，
+     *   服务员一按「按人数分摊」就得到两行，其中一行注定用不上 ——
+     *   剩下的钱和份数还被摊成了两半，两边都不对。
+     *   扣完至少留 1，不然按钮按下去什么都没有。
+     */
+    const taken  = alreadyOnOrder().length;
+    // ★ 人数上限也是份数 —— 见 memberCap()。原来写死 50，
+    //   等于「随便填，提交时再说」
+    const aaMax  = Math.max(1, memberCap() - taken);
+    const aaInit = Math.min(aaMax, Math.max(1, (o.customer_num || 2) - taken));
     body.innerHTML = `<label>${T('assign.aaCount')}
-      <input id="aa-people" type="number" inputmode="numeric" min="1" max="50" value="${o.customer_num || 2}"></label>
+      <input id="aa-people" type="number" inputmode="numeric" min="1" max="${aaMax}" value="${aaInit}"></label>
       <button id="btn-aa" class="primary">${T('assign.aaSplit')}</button>`;
+    $('#aa-people').oninput = (e) => {
+      const raw = parseInt(e.target.value, 10) || 0;
+      if (raw > aaMax) {
+        e.target.value = String(aaMax);
+        toast(T('assign.cappedPeople', { n: aaMax }), 'err');
+      }
+    };
     $('#btn-aa').onclick = doSplit;
-    $('#assign-people').innerHTML = '';
-    updateTotals();
+    /**
+     * ★ 还没按「按人数分摊」之前就要把【已记掉的那几行】画出来。
+     *
+     *   原来这里是 innerHTML = ''，名单一片空白，服务员得先分摊一次
+     *   才看得到「哦，已经有一位记过了」—— 而那时候人数已经填错了。
+     */
+    S.people = [];
+    renderPeople();
   } else {
     renderPickItems(body);
   }
@@ -832,9 +900,148 @@ function addPerson() {
   if (S.mode === 3) refreshPickSelects();
 }
 
+/**
+ * 把「这张单已经记给谁了」摆在分配页最上面。
+ *
+ * 之前这个信息只在上一屏（记账方式）有，到了这一屏就看不见了 ——
+ * 于是现场出现「屏幕显示 +27 分，同时又说本餐期已记过 1 次」，
+ * 收银员完全没法判断这是正常的下半单，还是自己点重了。
+ */
+function renderAlreadyOnOrder() {
+  const box = $('#assign-done');
+  if (!box) return;
+  const rows = alreadyOnOrder();
+  if (!rows.length) { box.hidden = true; box.innerHTML = ''; return; }
+  const o = S.order || {};
+  /**
+   * ★ 每一行都要把【份数】写出来，不能只写金额。
+   *
+   *   金额说明不了问题：客人问的是「我这顿算上了吗」，
+   *   而「算上」在这套规则里等于【拿到了一份计次套餐】。
+   *   只写 € 27.88 的话，服务员还得回上一步、点开流水才答得出来 ——
+   *   客人就站在柜台前，那几下点击就是投诉的来源。
+   *
+   *   顺带写上「已计 N 次」：同一餐期第二单是【记积分不计次】的，
+   *   这时候份数有、次数是 0，不写出来没人解释得清。
+   */
+  const lines = rows.map(r => {
+    const bits = [`€ ${escapeHtml(r.amount)}`];
+    if (r.portions > 0) { bits.push(T('assign.donePortions', { n: r.portions })); }
+    bits.push(r.visits > 0 ? T('assign.doneVisits', { n: r.visits }) : T('assign.doneNoVisit'));
+    return `<div class="lrow"><span><b>${escapeHtml(maskCard(r.card))}</b> · ${bits.join(' · ')}</span></div>`;
+  }).join('');
+  // 「还剩多少可分」放在这里而不是只放在合计栏 —— 服务员的视线是从上往下的，
+  // 等他看到最底下的合计时，金额和份数已经填完了
+  const left = `<div class="lrow left"><span>${T('assign.doneLeft', {
+    money: money(o.remaining_cents || 0), n: Number(o.remaining_portions) || 0,
+  })}</span></div>`;
+  box.innerHTML = `<b>${T('assign.doneTitle')}</b>` + lines + left
+    + `<div class="muted small">${T('assign.doneNote')}</div>`;
+  box.hidden = false;
+}
+
+/**
+ * 卡号打码：TK-00000123-4Q7 → TK-00000123-•••
+ *
+ * 藏掉的是末尾那 3 位随机码 —— 它正是防猜卡号的那一段。
+ * 留下的顺序号足够收银员认出「哦，是刚才那张」，
+ * 而屏幕被人瞄一眼也拼不出一个能用的完整卡号。
+ */
+function maskCard(no) {
+  const s = String(no || '');
+  return s.length <= 3 ? s : s.slice(0, -3) + '•••';
+}
+
+/**
+ * 这张订单已经记给过哪些卡。
+ *
+ * ★ 同一张卡不能在同一张单上记两次 —— 服务端会拒（member_already_on_order）。
+ *   但不能等到点了「提交积分」才报错：那时收银员已经填完金额、选完人，
+ *   还要退回来重做。所以在【选会员】这一步就挡住。
+ */
+function alreadyOnOrder() {
+  const rows = (S.order && S.order.existing_ledger) || [];
+  /**
+   * ★ 只认【消费流水】（entry_type = 1）。
+   *
+   *   这里第一版写成「counted_visit >= 0」，结果把【撤销流水】也算进来了 ——
+   *   撤销那一笔 entry_type = 2、status 仍然是有效，counted_visit 是负数或 0，
+   *   于是「0」那条溜了进去，把一张已经撤销干净的卡也锁死了。
+   *   浏览器测试当场撞出来的：撤销整组之后再记同一张卡，会员弹层打不开。
+   *
+   *   判定口径必须和服务端那条守卫一致（见 PointsService::grantOne）。
+   */
+  return rows.filter(l => Number(l.entry_type) === 1 && l.member_id)
+             .map(l => ({
+               id:       Number(l.member_id),
+               card:     l.card_no || '',
+               amount:   l.amount,
+               portions: Number(l.portions_counted) || 0,
+               visits:   Number(l.counted_visit) || 0,
+             }));
+}
+
+/**
+ * 这张单最多能记几位会员。
+ *
+ *   有计次套餐 → 【份数】就是上限（一份餐对一位客人）
+ *   一份都没有 → 只允许 1 位
+ *
+ * ★ 为什么要有上限：不封的话，一张 € 200 的单可以拆给十张卡，
+ *   每张都拿一份积分 —— 而这十个人里只有几个真的在这儿吃过饭。
+ *   份数是这张单上「有几个人吃了饭」唯一可信的凭据，
+ *   所以人数就以它为准。
+ *
+ * ★ 0 份的单为什么还留 1 位：纯酒水单是正常生意，钱是真花的，
+ *   该给积分。只是它证明不了「几个人吃了饭」，所以不给拆。
+ */
+function memberCap() {
+  const o = S.order || {};
+  return Math.max(1, Number(o.portions_counted) || 0);
+}
+
+/** 这一屏还能再选几位（扣掉已经记掉的那几位） */
+function seatsLeft() {
+  return Math.max(0, memberCap() - alreadyOnOrder().length);
+}
+
 function renderPeople(keepItems) {
+  renderAlreadyOnOrder();
   const box = $('#assign-people');
   box.innerHTML = '';
+
+  /**
+   * ★ 已经记掉的那几份，就摆在名单最上面，长得像一行但【不能点】。
+   *
+   *   之前这些信息只在上面的黄框里。黄框回答的是「发生过什么」，
+   *   而服务员在这一屏要做的判断是「这一行我还能不能选人」——
+   *   两件事不一样。名单里全是清一色的「+ 选择会员」时，
+   *   他只能靠自己数：一共 2 份、已分配 1 份、所以只剩 1 个位子……
+   *   忙起来就会两行都选上人，然后撞服务端的 member_already_on_order
+   *   或 exceeds_portions，白填一遍。
+   *
+   *   现在直接把「这一位已经是 TK…•••」画出来：能选的和不能选的
+   *   一眼分得开，不用点开任何东西，也不用自己算。
+   */
+  alreadyOnOrder().forEach(r => {
+    const d = document.createElement('div');
+    d.className = 'person locked';
+    const bits = [`€ ${escapeHtml(r.amount)}`];
+    if (r.portions > 0) { bits.push(T('assign.donePortions', { n: r.portions })); }
+    bits.push(r.visits > 0 ? T('assign.doneVisits', { n: r.visits }) : T('assign.doneNoVisit'));
+    d.innerHTML = `
+      <div class="who">
+        <b>${escapeHtml(maskCard(r.card))}</b>
+        <small>${bits.join(' · ')}</small>
+      </div>
+      <div class="lockmark">${T('assign.lockedRow')}</div>`;
+    box.appendChild(d);
+  });
+
+  // 单行上限 = 这张单还剩的份数。跨行合计超了由合计栏那条红线管 ——
+  // 逐行去减「别人已占的」会让「从这行挪一份到那行」必须先减后加，
+  // 柜台上多一步就是多一次出错
+  const maxPort = Number((S.order || {}).remaining_portions) || 0;
   S.people.forEach((p, i) => {
     const d = document.createElement('div');
     d.className = 'person';
@@ -846,16 +1053,22 @@ function renderPeople(keepItems) {
           : `<button class="link" data-pick="${i}">${T('assign.pickMember')}</button>`}
       </div>
       <label class="amt">${T('assign.amount')}<input type="text" inputmode="decimal" data-amt="${i}" value="${money(p.amountCents)}"${S.mode === 3 ? ' readonly' : ''}></label>
-      <label class="prt">${T('assign.portions')}<input type="number" inputmode="numeric" min="0" data-prt="${i}" value="${p.portions}"${S.mode === 3 ? ' readonly' : ''}></label>
+      <label class="prt">${T('assign.portions')}<input type="number" inputmode="numeric" min="0" max="${maxPort}" data-prt="${i}" value="${p.portions}"${S.mode === 3 ? ' readonly' : ''}></label>
       ${S.people.length > 1 ? `<button class="rm" data-rm="${i}">${T('assign.remove')}</button>` : ''}`;
     box.appendChild(d);
   });
 
   if (S.mode !== 1 && !keepItems) {
+    // ★ 到上限就不再给「添加会员」——「按钮在那儿但一点就报错」
+    //   等于让人先做完再挨骂，不如干脆不给
     const add = document.createElement('button');
     add.className = 'ghost';
     add.textContent = T('assign.addMember');
     add.onclick = addPerson;
+    if (S.people.length >= seatsLeft()) {
+      add.disabled = true;
+      add.textContent = T('assign.addMemberFull', { n: memberCap() });
+    }
     box.appendChild(add);
   }
 
@@ -869,12 +1082,61 @@ function renderPeople(keepItems) {
     renderPeople();
     if (S.mode === 3) refreshPickSelects();
   });
-  $$('[data-amt]', box).forEach(inp => inp.oninput = () => {
-    S.people[parseInt(inp.dataset.amt, 10)].amountCents = cents(inp.value);
-    updateTotals();
+  $$('[data-amt]', box).forEach(inp => {
+    inp.oninput = () => {
+      const p = S.people[parseInt(inp.dataset.amt, 10)];
+      if (!p) { return; }                      // 同上：这一行可能已经被重建掉了
+      p.amountCents = cents(inp.value);
+      updateTotals();
+    };
+    /**
+     * ★ 金额只在【失焦】时封顶，不在每次按键时封顶。
+     *
+     *   按键时封顶会把小数敲不出来：想输 13.93，敲到 "13." 的中间态
+     *   在某些顺序下会被判超、被改写，人就再也对不准了。
+     *   份数是整数没这个问题，所以那一侧才敢边打边封。
+     */
+    inp.onblur = () => {
+      const i    = parseInt(inp.dataset.amt, 10);
+      /**
+       * ★ 这一行可能已经不在了。
+       *
+       *   blur 是在元素【被移走时】也会触发的：重新分摊、改人数、
+       *   甚至换一张单，都会把整个名单 innerHTML = '' 重建一遍，
+       *   而这个回调还挂在那个已经离开文档的 input 上。
+       *   不判空的话就是一句 Cannot read properties of undefined —— 
+       *   cachebust.mjs 的「零 JS 报错」那条当场就红了。
+       */
+      const p = S.people[i];
+      if (!p) { return; }
+      const cap = Number((S.order || {}).remaining_cents) || 0;
+      if (p.amountCents > cap) {
+        p.amountCents = cap;
+        inp.value = money(cap);
+        toast(T('assign.cappedAmount', { money: money(cap) }), 'err');
+      }
+      updateTotals();
+    };
   });
   $$('[data-prt]', box).forEach(inp => inp.oninput = () => {
-    S.people[parseInt(inp.dataset.prt, 10)].portions = parseInt(inp.value, 10) || 0;
+    const i   = parseInt(inp.dataset.prt, 10);
+    if (!S.people[i]) { return; }              // 同上
+    const raw = parseInt(inp.value, 10) || 0;
+    /**
+     * ★ 份数【封死】在订单剩余份数以内。
+     *
+     *   现场截图里就是这个：这张单只剩 1 份，输入框里却打进了 4。
+     *   服务端当然会拒（exceeds_portions），但那要等到点提交才知道 ——
+     *   客人已经站在那儿等了，服务员还得回头一行行找是哪里多了。
+     *
+     *   份数是整数、量又小，边打边封不会有小数那种中间态问题。
+     */
+    const val = Math.max(0, Math.min(raw, maxPort));
+    S.people[i].portions = val;
+    if (val !== raw) {
+      inp.value = String(val);
+      toast(T('assign.cappedPortions', { n: maxPort }), 'err');
+    }
     updateTotals();
   });
   updateTotals();
@@ -888,6 +1150,36 @@ function updateTotals() {
   const over = a > S.order.remaining_cents || q > S.order.remaining_portions;
   $('.totals').classList.toggle('over', over);
   $('#btn-submit').disabled = over || a <= 0;
+  noPortionHint();
+}
+
+/**
+ * 「付了钱但没份数」的提醒。
+ *
+ * ★ 这是 portions_without_amount 的【反面】，两个方向都要管：
+ *     有份没钱 → 白拿一次计次    → 硬拒（服务端）
+ *     有钱没份 → 这一次白吃了    → 提醒（这里）
+ *
+ *   为什么这一面只提醒不拒绝：它常常是对的 —— 只点酒水没点套餐的客人
+ *   本来就该 0 份，点选菜品模式下更是天天出现。
+ *
+ *   但更多时候是【份数填漏了】，而漏掉的次数事后【没有任何地方会报出来】：
+ *   积分照样进卡、小票照样打，客人要等到攒够十次那天才发现少了一次，
+ *   那时候已经没法查了。所以宁可在柜台前多说一句。
+ *
+ *   ★ 只在这张单【确实还有份数可分】时才提醒。整单 0 份（纯酒水单）
+ *     全场都是 0 份，这时候提醒等于每单都弹，几天就没人看了。
+ */
+function noPortionHint() {
+  const box = $('#assign-noportion');
+  if (!box) { return; }
+  const left = Number(S.order && S.order.remaining_portions) || 0;
+  const rows = left > 0
+    ? S.people.filter(p => p.amountCents > 0 && p.portions <= 0)
+    : [];
+  if (!rows.length) { box.hidden = true; box.textContent = ''; return; }
+  box.hidden = false;
+  box.textContent = T('assign.noPortionHint', { n: rows.length, left });
 }
 
 /* ── 奖励券 ──────────────────────────────────────── */
@@ -989,6 +1281,16 @@ $('#btn-submit').onclick = async () => {
   showErr('#assign-err', '');
   const missing = S.people.some(p => !p.member && p.amountCents > 0);
   if (missing) return showErr('#assign-err', T('assign.missingMember'));
+
+  // ★ 份数与金额绑定：0 元不能只记次数。
+  //   服务端 portions_without_amount 才是真正的把关（前端拦不住直接调接口的人），
+  //   这里先拦一道只是为了让收银员当场看到【是哪一位、该怎么改】——
+  //   等提交回来再报错，他还得回头一行行找。
+  const noAmount = S.people.find(p => p.member && p.portions > 0 && p.amountCents <= 0);
+  if (noAmount) {
+    return showErr('#assign-err',
+      T('assign.portionsNoAmount', { card: maskCard(noAmount.member.card_no) }));
+  }
 
   const allocations = S.people
     .filter(p => p.member && (p.amountCents > 0 || p.portions > 0))
@@ -1783,6 +2085,17 @@ function askVerdict(d) {
 }
 
 function useMember(m) {
+  /**
+   * ★ 这张卡已经在这张单上记过了 —— 当场拦住，别等提交时才报错。
+   *   服务端也会拒（member_already_on_order），这里只是把话提前说清楚：
+   *   收银员已经填完金额、选完人再被退回来重做，是最招人烦的。
+   */
+  if (typeof S.memberTarget === 'number') {
+    const dup = alreadyOnOrder().find(x => x.id === m.id);
+    if (dup) {
+      return showErr('#member-err', T('member.alreadyOnOrder', { card: maskCard(dup.card) }));
+    }
+  }
   if (S.memberTarget === 'merge') {
     S.merge.member = m;
     renderMerge();

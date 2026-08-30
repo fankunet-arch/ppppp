@@ -42,6 +42,7 @@ final class PointsService
         private BusinessDay $bizDay,
         private \Vip\Repo\CardTierRepo $tiers,
         private \Vip\MealPeriod $periods,
+        private \Vip\CardNumber $cardNo,
     ) {
     }
 
@@ -124,8 +125,24 @@ final class PointsService
             $cut = date('Y-m-d H:i:s', strtotime($this->pos->now()) - $maxDays * 86400);
             $fresh = array_values(array_filter($out, static fn($c) => $c['order_end_time'] >= $cut));
             if (!$fresh) {
+                /**
+                 * ★ 【不回结账日期】。
+                 *
+                 *   这里曾经把 order_end_time 一并带出去，界面上就成了
+                 *   「这张小票是 2026-08-16 的，超过 7 天」——
+                 *   而这句话本身就等于确认「这个号是真的，而且那天有生意」。
+                 *   小票号是连号整数，一个个试下去，号段和营业日都能画出来。
+                 *
+                 *   经理需要的只是【在期内还是在期外】这一个二值判断
+                 *   （是真单太旧了，还是收银员输错了号），不需要具体是哪天。
+                 *   所以连经理都不给日期 —— 经理账号一旦外泄，
+                 *   泄露的东西不该比收银员账号多。
+                 *
+                 *   真要查某张单是哪天的，走后台带审计的查询，
+                 *   而不是这个柜台上随手就能打的接口。
+                 */
                 return ['ok' => true, 'reason' => 'too_old', 'max_days' => $maxDays,
-                        'order_end_time' => $out[0]['order_end_time'], 'candidates' => []];
+                        'candidates' => []];
             }
             $out = $fresh;
         }
@@ -323,7 +340,21 @@ final class PointsService
             'unknown_items'      => $analysis['unknown_items'],
             'excluded'           => Money::toStr($excluded),
             'items'              => $analysis['display'],
-            'existing_ledger'    => $this->ledger->activeBySerial($o['serial_id']),
+            /**
+             * ★ 卡号要按【显示形态】发出去（TK-00000275-1A2），不能发库里那个normalized 串。
+             *
+             *   库里存的是去连字符的 TK000002751A2，而其他每一个接口
+             *   都在出口处 format 过（见 api/routes.php 里那一排）。
+             *   这里漏了 format 的后果是：同一张卡在「已经记给」那一栏
+             *   长成 TK00000275•••，在会员弹层里长成 TK-00000275-•••，
+             *   收银员对着两个不一样的串，得自己判断是不是同一张。
+             */
+            'existing_ledger'    => array_map(function (array $l): array {
+                if (isset($l['card_no']) && $l['card_no'] !== null) {
+                    $l['card_no'] = $this->cardNo->format((string)$l['card_no']);
+                }
+                return $l;
+            }, $this->ledger->activeBySerial($o['serial_id'])),
         ];
     }
 
@@ -506,6 +537,65 @@ final class PointsService
                 return ['ok' => false, 'error' => 'zero_amount'];
             }
 
+            /**
+             * ★ 同一张卡不能在同一张订单上记两次。
+             *
+             *   金额守恒本来就挡住了「多拿」—— 第二次超额会被 exceeds_total 拒掉，
+             *   所以【不存在重复计分】。但它挡不住「把一张单分两次都记给同一个人」：
+             *   AA 拆成两半，两半都选同一张卡，金额照样守恒，只是分了两笔。
+             *
+             *   现场看到的就是这个：屏幕上「+27 分」，同时又提示
+             *   「本餐期已记过 1 次，这一单只记积分不计次」，
+             *   收银员完全没法判断这是正常的下半单，还是自己点重了。
+             *
+             *   而把 AA 的两半都给同一个人，现实中基本只可能是误操作 ——
+             *   真要整单给一个人，人数填 1 就行，不必拆。
+             *
+             *   PointsEngine 里那条 duplicate_member 只管【一次提交内】重复；
+             *   这里管的是【跨提交】重复，两者都需要。
+             */
+            $already = [];
+            foreach ($this->ledger->activeBySerial($serialId) as $row) {
+                if ((int)$row['entry_type'] === LedgerRepo::T_EARN) {
+                    $already[(int)$row['member_id']] = (string)($row['card_no'] ?? '');
+                }
+            }
+            foreach ($allocations as $a) {
+                $mid = (int)($a['member_id'] ?? 0);
+                if (isset($already[$mid])) {
+                    return ['ok' => false, 'error' => 'member_already_on_order',
+                            'detail' => ['member_id' => $mid, 'card_no' => $already[$mid]]];
+                }
+            }
+
+            /**
+             * ★ 一张单最多能记几位会员 = 计次套餐的份数（0 份的单只准 1 位）。
+             *
+             *   份数是这张单上「有几个人在这儿吃了饭」唯一可信的凭据。
+             *   不封这个数的话，一张 € 200 的单可以拆给十张卡，
+             *   每张都拿一份积分 —— 而其中大部分人根本没来过。
+             *
+             *   ★ 这一条【挡得住 exceeds_portions 挡不住的形状】：
+             *     3 份的单拆给 5 个人、份数填成 [1,1,1,0,0]，
+             *     份数合计 3 没超、金额也没超，守恒那两层全都放行。
+             *
+             *   0 份的单还留 1 位：纯酒水单是正常生意，钱是真花的，
+             *   该给积分 —— 只是它证明不了几个人吃了饭，所以不给拆。
+             *
+             *   Pad 上「+ 添加会员」按钮到数就变灰、AA 人数框也封了顶，
+             *   但那是给正常操作省事的；这一层才是真的锁。
+             */
+            $seatCap = max(1, $totalPort);
+            $seats   = $already;
+            foreach ($allocations as $a) {
+                $seats[(int)($a['member_id'] ?? 0)] = true;
+            }
+            unset($seats[0]);
+            if (count($seats) > $seatCap) {
+                return ['ok' => false, 'error' => 'too_many_members',
+                        'detail' => ['cap' => $seatCap, 'requested' => count($seats)]];
+            }
+
             // ★ 金额守恒校验（纯函数，见 PointsEngine::validateAllocations 与其测试）
             $v = PE::validateAllocations($allocations, $total, $allocated, $totalPort, $allocPort);
             if (!$v['ok']) {
@@ -552,7 +642,7 @@ final class PointsService
                 //   再计一次就等于「拿奖励的同时又攒一次」。
                 //   金额可以照常积分（取决于 free_meal_extra_earns），但次数不给。
                 $visits = $freeish ? 0
-                        : $this->visitsFor($countMode, $memberId, $prt, (string)$order['order_end_time']);
+                        : $this->visitsFor($countMode, $memberId, $prt, $amt, (string)$order['order_end_time']);
 
                 $lid = $this->ledger->insert([
                     'member_id'          => $memberId,
@@ -637,9 +727,25 @@ final class PointsService
      * 老口径，店家要回去也回得去。by_portion 是「买 N 份送 1 份」，
      * by_order 是「每笔账算 1 次」（同一餐期分两次结账会算 2 次）。
      */
-    private function visitsFor(string $mode, int $memberId, int $portions, string $orderEndTime): int
-    {
+    private function visitsFor(
+        string $mode,
+        int $memberId,
+        int $portions,
+        int $amountCents,
+        string $orderEndTime
+    ): int {
         if ($portions <= 0) {
+            return 0;
+        }
+        /**
+         * ★ 没有金额就没有次数 —— 与 PointsEngine 的 portions_without_amount 同一条规则。
+         *
+         *   那边是【校验】，在事务最前面把整笔拒掉；这里是【兜底】，
+         *   保证就算哪天有人绕开校验直接构造分配，写进流水的也不会是
+         *   「0 元 1 次」这种账。规则写在两处不是重复：
+         *   校验决定「能不能提交」，这里决定「流水长什么样」。
+         */
+        if ($amountCents <= 0) {
             return 0;
         }
         if ($mode === 'by_portion') {
@@ -848,6 +954,61 @@ final class PointsService
      *   所以这里绝不返回错误、绝不影响记账结果，异常也吞掉：
      *   风控的副作用不该把已经算好的积分弄回滚。
      */
+    /**
+     * 「有人在枚举小票号」的观察者。
+     *
+     * ── 为什么要有 ────────────────────────────────────
+     * 小票号就是 order_head_id，是一个【连号的整数】。
+     * 手里有一张自己的小票，就知道当前号段在哪儿，往前减一个个试
+     * 就能把别人的单翻出来。
+     *
+     * 前面那两道（错误信息不区分、经理才看得到真原因）挡住的是
+     * 「试出来能知道什么」；这一道记的是「有人在试」。
+     *
+     * ★ 与 §12.4 同一个道理：能拿到收银机的就是店里的人，
+     *   事前拦截在结构上无效 —— 能做的是留下痕迹，并让它每周有人看一眼。
+     *
+     * ★ 不拦人。收银员照着小票输错几个数字是天天发生的事，
+     *   拦下来的代价是当着客人的面卡住，而这正是投诉的来源。
+     *
+     * 整段包在 try/catch 里：观察者坏了不该让找单也跟着失败。
+     */
+    public function watchInvoiceProbe(int $invoiceNo, array $operator): void
+    {
+        try {
+            $this->audit->log('invoice_lookup_miss', [
+                'target_type'   => 'invoice',
+                'target_id'     => (string)$invoiceNo,
+                'operator_id'   => $operator['id']   ?? null,
+                'operator_name' => $operator['name'] ?? null,
+                'device'        => $operator['device'] ?? null,
+            ]);
+
+            $max = $this->cfg->int('alert_invoice_miss', 0);
+            $win = $this->cfg->int('alert_invoice_window_min', 30);
+            if ($max <= 0) {
+                return;
+            }
+            $opId = isset($operator['id']) ? (int)$operator['id'] : null;
+            $n    = $this->audit->countRecent('invoice_lookup_miss', $opId, $win);
+            if ($n <= $max) {
+                return;
+            }
+            $this->alerts->raiseOnce(
+                'invoice_probe', 'operator', (string)($opId ?? 0),
+                sprintf('%s 在 %d 分钟内查了 %d 个查不到的小票号（阈值 %d）——'
+                      . '照小票输错几个数字是常事，但连着这么多次更像是在一个个试号',
+                        $operator['name'] ?? ('#' . (string)$opId), $win, $n, $max),
+                ['severity' => 2, 'detail' => [
+                    'operator_id' => $opId, 'count' => $n, 'window_min' => $win,
+                    'last_invoice' => $invoiceNo, 'device' => $operator['device'] ?? null,
+                ]]
+            );
+        } catch (\Throwable $e) {
+            error_log('[watchInvoiceProbe] ' . $e->getMessage());
+        }
+    }
+
     private function riskWatch(array $memberIds, array $operator): void
     {
         try {

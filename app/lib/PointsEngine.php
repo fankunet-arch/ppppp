@@ -529,6 +529,9 @@ final class PointsEngine
      * 恒定成立：SUM(已分配 + 本次) ≤ total_amount
      * 不信任客户端传来的金额，一律以本地镜像的 total_amount 为准。
      *
+     * 另一条恒定成立的：任何一笔分配，份数 > 0 ⇒ 金额 > 0。
+     * 见下方 portions_without_amount 处的说明。
+     *
      * @param array $allocations [['member_id'=>int,'amount_cents'=>int,'portions'=>int], ...]
      * @return array{ok:bool,error:string,sum_amount:int,sum_portions:int}
      */
@@ -569,6 +572,30 @@ final class PointsEngine
             if ($amt < 0 || $prt < 0) {
                 return $fail('negative_allocation');
             }
+
+            /**
+             * ★ 份数与金额【绑在一起】：要计次就得有钱。
+             *
+             *   守恒校验只管金额上限，管不住「0 元也要一份」。
+             *   于是有这么一个洞：一单 71.70 三份，A 先把 71.70 全拿走
+             *   （积分 71、计次 1），B 再提交「金额 0、份数 1」——
+             *   金额没超，份数没超，通过；B 白拿一次。
+             *   第三个人照样还能再来一次，直到份数用完。
+             *
+             *   现实里这是最容易被利用的一步：金额是死的、分完就没了，
+             *   而次数才是奖励的真正来源（十送一）。
+             *   所以规则改成：一笔分配要么【钱和次一起计】，要么整笔拒绝。
+             *
+             *   反过来【有钱没份】是允许的，那是正常生意 ——
+             *   只点酒水没点套餐，该积分不该计次。绑定只有这一个方向。
+             *
+             *   splitEvenly 不会造出这种分配（余数给第一位，
+             *   基数份额是同增同减的），所以 AA 正常拆分不受影响。
+             */
+            if ($prt > 0 && $amt === 0) {
+                return $fail('portions_without_amount');
+            }
+
             $sumAmount += $amt;
             $sumPort   += $prt;
         }
@@ -587,8 +614,26 @@ final class PointsEngine
     }
 
     /**
-     * 均摊 AA：把金额与份数分给 n 人，余数都给第一位。
-     * 保证分毫不差、份数不丢。
+     * 均摊 AA：把金额与份数分给 n 人。分毫不差、份数不丢。
+     *
+     * ── 金额与份数的余数处理【不一样】，这是有意的 ───────
+     *
+     * 金额余数（最多 n−1 分）全给第一位 —— 差几分钱没有意义。
+     *
+     * 份数余数【一人一份地摊开】，不能堆给第一位。
+     * 因为 once_per_period 口径下，份数已经不是「几份」而是
+     * 「这个人有没有吃计次套餐」这个是非题：
+     *
+     *   3 份 4 人，堆给第一位 → [3, 0, 0, 0]
+     *     第一位记 1 次，后三位【付了 € 17.92 却一次都没有】
+     *     —— 旧口径 by_portion 下第一位记 3 次，总数还守得住；
+     *        换成 once_per_period 之后凭空少掉 2 次，而且不报错。
+     *
+     *   摊开 → [1, 1, 1, 0]
+     *     三位各记 1 次，第四位确实没点计次套餐 —— 这才是真实形状。
+     *
+     * ★ 所以这里【不能】跟金额那条「余数给第一位」的规则保持一致。
+     *   改这一段前先读 docs/03 §3.2 与 §13。
      *
      * @return array<int,array{amount_cents:int,portions:int}>
      */
@@ -601,7 +646,7 @@ final class PointsEngine
         for ($i = 0; $i < $n; $i++) {
             $out[] = [
                 'amount_cents' => $amts[$i],
-                'portions'     => $base + ($i === 0 ? $rem : 0),
+                'portions'     => $base + ($i < $rem ? 1 : 0),
             ];
         }
         return $out;
