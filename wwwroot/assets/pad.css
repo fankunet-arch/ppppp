@@ -15,6 +15,22 @@
   --line: #d9dce1;
   --primary: #1f6feb;
   --primary-ink: #ffffff;
+  /**
+   * 安全出口（返回 / 取消 / 再加一桌）自己的一档颜色。
+   *
+   * 三档到此为止，不要再加第四种：
+   *   --primary 蓝  = 该点的那个
+   *   --exit   石墨 = 安全的退出，点错没有任何后果
+   *   --warn   暖橙 = 危险且不可逆（且要隔离摆放）
+   *
+   * 为什么是石墨不是青色：青和蓝在色相上挨得太近，
+   * 平板反光、斜着看会混。而混淆「该点的」和「退出」比不好看严重得多。
+   * 石墨靠【饱和度】而不是色相和另外两档拉开，零混淆风险，
+   * 语义上也正是「中性动作」。
+   */
+  --exit:      #2f3742;   /* 文字：对色块底 8.81:1 */
+  --exit-line: #5b6675;   /* 边框：对页面底 5.34:1，远超 UI 控件要求的 3:1 */
+  --exit-bg:   #d7dde7;   /* 色块底：要的就是「有分量」，不是白底描边 */
   --warn: #b45309;
   --err: #c0392b;
   --ok: #1a7f4b;
@@ -95,8 +111,32 @@ button:active { transform: translateY(1px); }
 button[disabled] { opacity: .5; cursor: not-allowed; }
 
 .primary { background: var(--primary); border-color: var(--primary); color: var(--primary-ink); font-weight: 600; }
-.ghost   { background: transparent; color: var(--muted); margin-top: 12px; }
-.ghost.warn { color: var(--warn); border-color: #e6c99a; }
+/**
+ * 「返回 / 取消」这类安全出口。
+ *
+ * ★ 现场问过「能不能给它们加红框」。不能 —— 但底下的诉求是真的。
+ *
+ *   量过：原来的边框 #d9dce1 对页面底色只有 **1.26:1**，
+ *   等于按钮的形状根本看不见；文字 #6b7280 是 4.43:1，也不够。
+ *   所以「找不到返回键」是真的，红色只是第一个想到的办法。
+ *
+ *   但红色在这一屏已经有含义了（免费餐核销、手工录入 = 危险且不可逆）。
+ *   返回/取消恰恰是【最安全】的操作，点错没有任何后果。
+ *   给最安全的动作配最强的警示色，等于把视觉优先级又反一次
+ *   —— 那正是上一版刚修好的问题。
+ *
+ *   所以改的是【看得见】而不是【看着危险】：白底立出形状，
+ *   边框 3.37:1、文字 7.68:1，都过 WCAG 对 UI 控件与正文的要求。
+ *
+ * 三档到此固定下来，不要再往里加颜色：
+ *   主色蓝   = 该点的那个
+ *   中性描边 = 安全的退出/返回
+ *   暖色+隔离 = 危险且不可逆
+ */
+.ghost   { background: var(--exit-bg); color: var(--exit); border-color: var(--exit-line);
+           font-weight: 600; margin-top: 12px; }
+/* 危险那一档要压回白底 —— 石墨色块的分量不该借给它 */
+.ghost.warn { background: #fff; color: var(--warn); border-color: #e6c99a; font-weight: 400; }
 .link    { border: none; background: none; color: var(--primary); min-height: auto; padding: 4px; }
 .big     { width: 100%; font-size: 18px; min-height: 54px; margin-top: 16px; }
 

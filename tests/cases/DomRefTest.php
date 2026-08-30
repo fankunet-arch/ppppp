@@ -176,3 +176,59 @@ foreach (['btn-free-meal', 'btn-manual'] as $id) {
          && !(bool)preg_match('/class="[^"]*primary[^"]*"[^>]*id="' . preg_quote($id, '/') . '"/', $padHtml),
         "★★ #{$id} 不是主色按钮 —— 危险动作永远不该是最显眼的那个");
 }
+
+T::group('按钮配色只有三档，红色专属于危险动作');
+
+/**
+ * ★ 现场问过「返回/取消能不能加红框」。量过之后没这么做，理由钉在这里。
+ *
+ *   真问题是【看不见】：原来的边框 #d9dce1 对页面底色只有 1.26:1，
+ *   按钮的形状根本立不出来。所以「找不到返回键」是真的。
+ *
+ *   但红色在这几屏上已经有含义了 —— 免费餐核销、手工录入这类
+ *   危险且不可逆的动作。返回/取消恰恰是最安全的操作，点错没有任何后果。
+ *   给最安全的动作配最强的警示色，等于把视觉优先级再反一次
+ *   （上一版刚修好过一次）。
+ *
+ *   所以改的是「看得见」而不是「看着危险」。三档固定下来：
+ *     主色蓝    = 该点的那个
+ *     中性描边  = 安全的退出/返回
+ *     暖色+隔离 = 危险且不可逆
+ */
+$padCss = file_get_contents(__DIR__ . '/../../wwwroot/assets/pad.css');
+
+// 抓 .ghost 那条规则本体（不含 .ghost.warn）
+T::true((bool)preg_match('/^\.ghost\s+\{([^}]*)\}/m', $padCss, $g),
+    '找得到 .ghost 的样式规则');
+$ghost = $g[1] ?? '';
+
+foreach (['--warn', '--err', 'var(--warn', 'var(--err'] as $needle) {
+    T::false(str_contains($ghost, $needle),
+        "★★ .ghost（返回/取消）没有用危险色 {$needle} —— 红色只留给不可逆的动作");
+}
+T::false((bool)preg_match('/#(c0392b|b45309|b26a00|d0021b)/i', $ghost),
+    '★★ .ghost 也没有硬编码的红/橙 —— 同上');
+
+// 边框要真的看得见，且必须走 --exit 这一档命名颜色（不是散落的 hex）
+T::true(str_contains($ghost, 'var(--exit'),
+    '★★ .ghost 用 --exit 这一档命名颜色 —— 三档要有名字才守得住');
+T::true((bool)preg_match('/--exit-line:\\s*#([0-9a-f]{6})/i', $padCss, $bc),
+    '★ 调色板里定义了 --exit-line');
+if (isset($bc[1])) {
+    $lum = static function (string $hex): float {
+        $c = array_map(static function (string $h): float {
+            $v = hexdec($h) / 255;
+            return $v <= 0.03928 ? $v / 12.92 : (($v + 0.055) / 1.055) ** 2.4;
+        }, str_split($hex, 2));
+        return 0.2126 * $c[0] + 0.7152 * $c[1] + 0.0722 * $c[2];
+    };
+    $bg = $lum('f4f5f7');
+    $fg = $lum($bc[1]);
+    $ratio = (max($bg, $fg) + 0.05) / (min($bg, $fg) + 0.05);
+    T::true($ratio >= 3.0,
+        sprintf('★★ 边框对页面底色 %.2f:1，过 WCAG 对 UI 控件的 3:1（原来是 1.26:1，等于看不见）', $ratio));
+}
+
+// 危险动作那一档仍然是暖色 —— 别在「统一配色」时把它一起抹平了
+T::true((bool)preg_match('/\.ghost\.warn\s*\{[^}]*var\(--warn\)/', $padCss),
+    '★★ .ghost.warn 仍然是暖色 —— 危险动作要保持可辨认');
