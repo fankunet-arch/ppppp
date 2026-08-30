@@ -85,8 +85,18 @@ ok(mgrOld.msg !== mgrFake.msg,
    `★★★ 经理看到的两句不一样 —— 超时效：「${mgrOld.msg.slice(0, 34)}…」`);
 ok(/经理可见/.test(mgrOld.msg) && /经理可见/.test(mgrFake.msg),
    '★★ 两句都标着「经理可见」—— 免得经理照着念给客人听');
-ok(/\d{4}-\d{2}-\d{2}/.test(mgrOld.msg), `  └ 超时效那句带日期，对账用得上：「${mgrOld.msg}」`);
-ok(mgrFake.msg.includes(FAKE), `  └ 不存在那句带号，好核对是不是输错了`);
+/**
+ * ★ 经理【也不给具体日期】—— 只给「在期内 / 在期外」这一个二值。
+ *
+ *   经理账号一旦外泄（借号、PIN 被看到、离职没停用），
+ *   泄露的东西不该比收银员账号多。一个日期就足以确认
+ *   「这个号是真的、那天有生意」，等于绕一圈又把预言机装回去。
+ */
+ok(!/\d{4}-\d{2}-\d{2}/.test(mgrOld.msg),
+   `★★★ 经理那句里也没有日期：「${mgrOld.msg}」`);
+ok(/超出|fuera del plazo/.test(mgrOld.msg),
+   '  └ 但说清了是「有单、只是超出受理期」—— 查错要的就是这一个二值');
+ok(mgrFake.msg.includes(FAKE), '  └ 不存在那句带号，好核对是不是输错了');
 
 console.log('\n【③ 界面上不举例子】');
 const ctx  = await browser.newContext();

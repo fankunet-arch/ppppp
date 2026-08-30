@@ -105,8 +105,16 @@
      */
     'lookup.invoiceUnavailable': { zh: '订单不存在或已超过时效，请联系经理处理',
                             es: 'El ticket no existe o está fuera de plazo; avise al encargado' },
-    'lookup.tooOldMgr':   { zh: '【经理可见】这张小票是 {date} 的，超过 {days} 天不再受理',
-                            es: '[Solo encargado] Este ticket es del {date}; pasados {days} días ya no se admite' },
+    /**
+     * ★ 【经理也不给具体日期】，只给「在期内 / 在期外」这一个二值。
+     *
+     *   原来是「这张小票是 {date} 的，超过 {days} 天」——
+     *   而那个日期本身就等于「这个号是真的，那天有生意」。
+     *   经理要分的只是「没这张单」还是「有单但太旧了」，到这一步就够查错了。
+     *   经理账号一旦外泄，泄露的东西不该比收银员账号多。
+     */
+    'lookup.tooOldMgr':   { zh: '【经理可见】这个号有单，但已超出 {days} 天的受理期',
+                            es: '[Solo encargado] El número existe, pero está fuera del plazo de {days} días' },
     'lookup.invoiceNoneMgr': { zh: '【经理可见】没找到小票号 {no} 对应的订单，请核对 Factura Simplificada 那一行',
                             es: '[Solo encargado] No se encuentra el ticket nº {no}, compruebe la línea Factura Simplificada' },
     'lookup.widen':       { zh: '放宽到 {min} 分钟再找', es: 'Ampliar a {min} minutos' },

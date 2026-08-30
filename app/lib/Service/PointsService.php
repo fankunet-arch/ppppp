@@ -125,8 +125,24 @@ final class PointsService
             $cut = date('Y-m-d H:i:s', strtotime($this->pos->now()) - $maxDays * 86400);
             $fresh = array_values(array_filter($out, static fn($c) => $c['order_end_time'] >= $cut));
             if (!$fresh) {
+                /**
+                 * ★ 【不回结账日期】。
+                 *
+                 *   这里曾经把 order_end_time 一并带出去，界面上就成了
+                 *   「这张小票是 2026-08-16 的，超过 7 天」——
+                 *   而这句话本身就等于确认「这个号是真的，而且那天有生意」。
+                 *   小票号是连号整数，一个个试下去，号段和营业日都能画出来。
+                 *
+                 *   经理需要的只是【在期内还是在期外】这一个二值判断
+                 *   （是真单太旧了，还是收银员输错了号），不需要具体是哪天。
+                 *   所以连经理都不给日期 —— 经理账号一旦外泄，
+                 *   泄露的东西不该比收银员账号多。
+                 *
+                 *   真要查某张单是哪天的，走后台带审计的查询，
+                 *   而不是这个柜台上随手就能打的接口。
+                 */
                 return ['ok' => true, 'reason' => 'too_old', 'max_days' => $maxDays,
-                        'order_end_time' => $out[0]['order_end_time'], 'candidates' => []];
+                        'candidates' => []];
             }
             $out = $fresh;
         }

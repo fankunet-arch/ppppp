@@ -590,12 +590,16 @@ async function locateByInvoice() {
        *   就等于告诉对方：这个号是真的。小票号是连号的整数，
        *   一个一个往前试，就能把号段和哪天有生意都摸出来。
        *
-       *   服务端已经把 reason / order_end_time 按角色砍过了（见 api/routes.php），
+       *   服务端已经把 reason 按角色砍过了（见 api/routes.php），
        *   这里只是照着说 —— 前端不做判断，也就没有「前端漏改一处」这回事。
+       *
+       *   ★ 结账日期【谁都拿不到】，经理也一样：他要分的只是
+       *     「没这张单」还是「有单但太旧了」，具体是哪天不需要。
+       *     经理账号一旦外泄，泄露面不该比收银员大。
        */
       if (d.reason === 'too_old') {
-        showErr('#locate-err',
-          T('lookup.tooOldMgr', { date: (d.order_end_time || '').slice(0, 10), days: d.max_days }));
+        // ★ 不带日期 —— 服务端也不再发了（见 api/routes.php 与 locateByInvoice）
+        showErr('#locate-err', T('lookup.tooOldMgr', { days: d.max_days }));
       } else if (d.reason === 'not_found') {
         showErr('#locate-err', T('lookup.invoiceNoneMgr', { no: d.invoice_no }));
       } else {

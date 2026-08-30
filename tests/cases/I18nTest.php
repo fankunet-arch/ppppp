@@ -265,7 +265,34 @@ T::true(str_contains((string)$i18nSrc, 'lookup.invoiceUnavailable'),
     '★★ 前端有那句笼统文案「订单不存在或已超过时效」');
 $padSrc = (string)file_get_contents(dirname(__DIR__, 2) . '/wwwroot/assets/pad.js');
 T::true(!preg_match('/lookup\.tooOld\b(?!Mgr)/', $padSrc),
-    '★ 前端不再用那句会泄底的 lookup.tooOld（带日期的那版只留给经理，叫 tooOldMgr）');
+    '★ 前端不再用那句会泄底的 lookup.tooOld（经理那版另起了名字 tooOldMgr）');
+
+/**
+ * ★ 连经理那一版也不能带日期。
+ *
+ *   经理要分的只是「没这张单」还是「有单但太旧了」，到这一步就够查错了。
+ *   给了日期，等于经理账号一外泄就把预言机原样装回去 ——
+ *   而借号、PIN 被人看到、离职没停用，都是店里天天可能发生的事。
+ */
+preg_match("/'lookup\.tooOldMgr'.*?\},/s", (string)$i18nSrc, $mgrLine);
+$mgrTxt = $mgrLine[0] ?? '';
+T::true($mgrTxt !== '', '找得到 lookup.tooOldMgr');
+T::true($mgrTxt !== '' && !str_contains($mgrTxt, '{date}'),
+    '★★★ 经理那句里没有 {date} 占位符 —— 一个日期就足以确认「这个号是真的、那天有生意」');
+T::true($mgrTxt !== '' && str_contains($mgrTxt, '{days}'),
+    '  └ 但仍然说得出「超出几天的受理期」—— 二值判断要给得完整');
+/**
+ * 只看小票号那个处理函数的函数体。
+ *
+ * ★ 不能整份 pad.js 一刀切：候选订单列表里要显示结账时间
+ *   （那几张单是收银员刚查出来的、客人手里就拿着小票），那是正当用途。
+ *   要断的是【查不到时的那条回话】里不许出现日期。
+ */
+$fn = strstr($padSrc, 'async function locateByInvoice()');
+$fn = $fn === false ? '' : substr($fn, 0, (int)strpos($fn, "\n}\n"));
+T::true($fn !== '', '找得到 locateByInvoice() 的函数体');
+T::true($fn !== '' && !preg_match('/order_end_time\s*\|\||d\.order_end_time\s*\)/', $fn),
+    '★★★ locateByInvoice() 里不再读 d.order_end_time —— 服务端也不发了，两头都断掉');
 
 T::group('测试文件里不能有会关掉 PHP 标签的注释');
 

@@ -263,8 +263,11 @@ $api->on('POST', '/order/locate', static function () use ($app, $requireOperator
  *      对方：这个号是真的，而且那天有生意。一句一句试下去就能把号段
  *      和营业日都摸出来。
  *
- *   ② 差异只留给经理。查错、对账要分得清是「没这张单」还是「太旧了」，
- *      所以经理照常拿到真实原因和日期。
+ *   ② 差异只留给经理，但也【只给到「在期内 / 在期外」这一个二值】。
+ *      经理要分的是「没这张单」还是「有单但太旧了」——
+ *      到这一步就够查错了，具体是哪天并不需要。
+ *      ★ 连经理都不给日期：经理账号一旦外泄，
+ *        泄露的东西不该比收银员账号多。
  *
  *   ③ 【要在服务端就砍掉】，不能只改前端文案。
  *      Pad 是柜台上一台安卓平板，返回的 JSON 谁都看得见 ——
@@ -302,9 +305,12 @@ $api->on('POST', '/order/locate-invoice', static function () use ($app, $require
         // ★ 普通收银员一律拿到 'unavailable'：查不到、太旧、号不合法，长得一模一样
         'reason'     => $found ? null
                       : ($isManager ? ($r['reason'] ?? 'not_found') : 'unavailable'),
-        // ★ 这两个字段本身就是答案，非经理连字段都不给（给 null 也比给值安全）
+        // 回溯天数是后台配置，经理本来就看得到，用来把话说完整（「超过 7 天」）
         'max_days'       => $isManager ? ($r['max_days'] ?? null) : null,
-        'order_end_time' => $isManager ? ($r['order_end_time'] ?? null) : null,
+        // ★ 结账日期【谁都不给】——「这张小票是 8-16 的」本身就是答案。
+        //   服务层已经不再带出来（见 locateByInvoice），这里再钉一道：
+        //   将来有人把它加回服务层，也不会顺着这个接口漏出去。
+        'order_end_time' => null,
         'is_manager'     => $isManager,
         'candidates' => $r['candidates'],
     ]);

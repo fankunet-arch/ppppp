@@ -356,6 +356,21 @@ ok(($dm['is_manager'] ?? false) === true, '经理会话认得出是经理', brie
 ok(in_array($dm['reason'] ?? '', ['too_old', 'not_found'], true),
    '★★ 经理拿到的是真实原因（' . ($dm['reason'] ?? '-') . '）—— 分不清就没法查错');
 
+/**
+ * ★ 但经理【也不给结账日期】。
+ *
+ *   经理要分的只是「没这张单」还是「有单但太旧了」，到这一步就够查错了；
+ *   具体是哪天并不需要。而经理账号一旦外泄，
+ *   泄露的东西不该比收银员账号多 —— 那样等于绕一圈又把预言机装回去了。
+ */
+ok(($dm['order_end_time'] ?? null) === null,
+   '★★★ 经理也拿不到结账日期 —— 经理账号外泄时，泄露面不该比收银员大');
+ok(!preg_match('/\d{4}-\d{2}-\d{2}/', (string)$raw),
+   '★★★ 整个响应体里没有任何日期（不只是那一个字段）'
+   . (preg_match('/\d{4}-\d{2}-\d{2}/', (string)$raw, $mm) ? '：找到 ' . $mm[0] : ''));
+ok(($dm['max_days'] ?? null) !== null,
+   '  └ 但回溯天数还给 —— 那是后台配置，经理本来就看得到，用来把话说完整');
+
 [$st, $raw, $j] = req($BASE . '/api.php/order/locate-invoice', 'POST',
     ['invoice_no' => $FAKE_INVOICE], $padJar);
 $dm2 = $j['data'] ?? $j;
