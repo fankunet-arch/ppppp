@@ -150,6 +150,17 @@ final class SyncService
      * 请求数翻倍。折中：补抓时只落订单头与金额，把 total/portions 留到
      * Pad 端 locate() 时再算（那时本来就要读明细）。
      * 这里先按「无排除项」估个 total，供后台报表与完整性监控使用。
+     *
+     * ★★★ upsert 的第二个参数是 false —— 这几个估算值只允许写进【新行】。
+     *
+     *   已经存在的行上，total / excluded / portions / is_redeemed 是
+     *   Pad 端 locate() 读了明细算出来的【真值】。原来这里会把它们
+     *   一并覆盖掉，而 Cron 每 20 分钟跑一轮，结账后一轮之内必然中招：
+     *
+     *       locate 之后   total=71.70  excl=18.30  份数=3  is_redeemed=1
+     *       cron  之后    total=90.00  excl=0.00   份数=0  is_redeemed=0
+     *
+     *   详见 OrderRepo::upsert() 的说明。改这一行之前请先读那一段。
      */
     private function storeOrder(array $o): void
     {
@@ -168,11 +179,13 @@ final class SyncService
             'original_cents'     => $o['original_cents'],
             'should_cents'       => $o['should_cents'],
             'actual_cents'       => $o['actual_cents'],
+            // tax 是 POS 头上直接给的，不是算出来的 —— 照实写，别丢
+            'tax_cents'          => $o['tax_cents'] ?? 0,
             'total_cents'        => $baseCents,
             'excluded_cents'     => 0,
             'portions_counted'   => 0,
             'portions_uncounted' => 0,
-        ]);
+        ], false);
     }
 
     /**

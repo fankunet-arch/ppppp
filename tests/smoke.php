@@ -520,6 +520,55 @@ $sync->incremental();
 eq($before, (int)$db->value('SELECT COUNT(*) FROM pos_order WHERE store_code=?', [SMOKE_STORE]),
     '重复执行不产生重复订单（幂等）');
 
+/**
+ * ★★★ 幂等不只是「行数不变」—— 行的【内容】也不能被改坏。
+ *
+ *   这里原来只断言了行数。而真正的问题在内容上：
+ *   补抓阶段读不到明细，对 total / excluded / portions / is_redeemed
+ *   只有占位值（total 按「无排除项」估，其余一律 0）。
+ *   原来那份 ON DUPLICATE KEY UPDATE 把占位值一并写进了已存在的行，
+ *   于是每 20 分钟一轮的 Cron 会把 Pad 刚算好的真值冲掉：
+ *
+ *       locate 之后   total=71.70  excl=18.30  份数=3  is_redeemed=1
+ *       cron  之后    total=90.00  excl=0.00   份数=0  is_redeemed=0
+ *
+ *   ★ 当年这条没被发现，正是因为夹具订单恰好【没有排除项】：
+ *     total 前后都是 71.70，差别不显现。所以下面特意造一张
+ *     带 BOX（earns_points=0）与核销行的单来测。
+ */
+$cbSer = '9505550001';
+$pos->addHead([
+    'serial_id' => $cbSer, 'order_head_id' => 950001, 'check_id' => 1,
+    'table_name' => 'CLOB', 'eat_type' => 0, 'customer_num' => 3,
+    'original_amount' => '90.00', 'should_amount' => '90.00', 'actual_amount' => '90.00',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($pos->now()) - 300),
+]);
+$pos->addDetail(950001, 1, [
+    FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '71.70', 3),
+    FakePosSource::line(1017, 'BOX 17', '18.30', '18.30', 1),      // earns_points=0
+]);
+$app->points()->locate('CLOB', 600);
+$cbBefore = $db->one('SELECT total_amount, excluded_amount, tax_amount, portions_counted,
+                             portions_uncounted, is_redeemed, redeem_amount
+                        FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $cbSer]);
+ok((float)$cbBefore['excluded_amount'] > 0,
+   sprintf('造一张带排除项的单：total=%s 排除=%s 份数=%s —— 没有排除项的单测不出这个问题',
+           $cbBefore['total_amount'], $cbBefore['excluded_amount'], $cbBefore['portions_counted']));
+
+// 把水位线倒回这一单之前，让下一轮 Cron 一定会重新抓到它
+$db->exec('UPDATE sync_cursor SET watermark=? WHERE store_code=? AND cursor_name=?',
+          [date('Y-m-d H:i:s', strtotime($pos->now()) - 3600), SMOKE_STORE, 'incremental']);
+$sync->incremental();
+$cbAfter = $db->one('SELECT total_amount, excluded_amount, tax_amount, portions_counted,
+                            portions_uncounted, is_redeemed, redeem_amount
+                       FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $cbSer]);
+foreach (['total_amount', 'excluded_amount', 'portions_counted', 'portions_uncounted',
+          'is_redeemed', 'redeem_amount'] as $cbCol) {
+    eq((string)$cbBefore[$cbCol], (string)$cbAfter[$cbCol],
+       "★★★ Cron 跑过之后 {$cbCol} 没被改坏（{$cbBefore[$cbCol]}）");
+}
+$db->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $cbSer]);
+
 step('⑩ 值比对冲正 —— 金额缩水');
 
 // 当前订单 A 已 AA 分给 3 人各 23.90，合计 71.70
@@ -2400,6 +2449,92 @@ $binDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id IN (?,?,
 $binDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id IN (?,?,?)', [SMOKE_STORE, $binA, $binB, $binC]);
 $binDb->exec('DELETE FROM member WHERE store_code=? AND id IN (?,?,?)', [SMOKE_STORE, $binA, $binB, $binC]);
 $binDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id IN (?,?,?,?)', [SMOKE_STORE, '9606660001', '9606660002', '9606660003', '9606660004']);
+
+step('㉖ 达标发券：并发下也只发该发的那几张');
+
+/**
+ * ★ 这一段【必须真并发】才有意义。
+ *
+ *   checkAndGrant() 原来是「读 → 算 pending → 发券 → 加计数」四步裸奔，
+ *   没有事务也没有行锁。它的注释说「幂等靠 rewards_issued」——
+ *   那个结论只在串行下成立：两个请求同时读到 rewards_issued = 0，
+ *   各自算出 pending = 1，各发一张。
+ *
+ *   实测（修复前，4 个进程对齐调用）：发出 4 张免费餐券，应发 1 张。
+ *   券是真金白银的一顿饭，而 void() 不回退 rewards_issued，
+ *   发多了只能人工逐张作废。
+ *
+ *   ★ 单进程顺序调用测不出来 —— 第二次进来 pending 已经是 0，永远绿。
+ *     所以这里 fork 出真进程（tests/reward_worker.php），
+ *     用一个统一的起跑时刻把它们对齐。
+ */
+$cgApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$cgDb  = $cgApp->localDb();
+$cgApp->cfg()->set('reward_enabled', '1');
+$cgApp->cfg()->set('reward_mode', 'visits');
+$cgApp->cfg()->set('reward_threshold_visits', '10');
+$cgApp->cfg()->set('reward_auto_grant', '1');
+
+$cgMid = (int)$cgApp->members()->create('TK-00096601-CGA', null, null, null)['id'];
+$cgDb->exec('UPDATE member SET visit_count = 10, rewards_issued = 0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $cgMid]);
+
+$WORKERS = 5;
+$startAt = microtime(true) + 2.0;
+$envPass = [
+    'SMOKE_STORE'   => SMOKE_STORE,
+    'SMOKE_DB_HOST' => (string)($dbCfg['host'] ?? '127.0.0.1'),
+    'SMOKE_DB_PORT' => (string)($dbCfg['port'] ?? 3306),
+    'SMOKE_DB_NAME' => (string)($dbCfg['database'] ?? ''),
+    'SMOKE_DB_USER' => (string)($dbCfg['user'] ?? ''),
+    'SMOKE_DB_PASS' => (string)($dbCfg['password'] ?? ''),
+];
+$envPrefix = '';
+foreach ($envPass as $k => $v) {
+    $envPrefix .= $k . '=' . escapeshellarg($v) . ' ';
+}
+$procs = [];
+for ($i = 0; $i < $WORKERS; $i++) {
+    $cmd = $envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+         . escapeshellarg(__DIR__ . '/reward_worker.php') . ' '
+         . $cgMid . ' ' . sprintf('%.4f', $startAt) . ' 2>/dev/null';
+    $procs[] = popen($cmd, 'r');
+}
+$granted = 0;
+foreach ($procs as $ph) {
+    if ($ph === false) { continue; }
+    $granted += (int)trim((string)stream_get_contents($ph));
+    pclose($ph);
+}
+
+$cgCoupons = (int)$cgDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=?',
+                               [SMOKE_STORE, $cgMid]);
+$cgIssued  = (int)$cgDb->value('SELECT rewards_issued FROM member WHERE store_code=? AND id=?',
+                               [SMOKE_STORE, $cgMid]);
+$expect    = intdiv(10, 10);   // floor(progress / threshold)
+
+ok($granted === $expect,
+   sprintf('★★★ %d 个进程同时抢发券，合计只发出 %d 张（应为 %d 张）', $WORKERS, $granted, $expect));
+eq($expect, $cgCoupons, '  └ coupon 表里确实只有 ' . $expect . ' 张 —— 券是真金白银的一顿饭');
+eq($expect, $cgIssued, '  └ rewards_issued 与实发张数一致（不一致的话下次记账会再发一遍）');
+
+/**
+ * ★ 顺带钉住「发券与加计数必须在同一事务」。
+ *
+ *   这一条不需要并发也会咬人：原来是【全部发完才加计数】，
+ *   中间任何一次进程终止（PHP 超时、平板断网重试打断 FPM）
+ *   都会留下「券已发出、计数没加」，下一次记账再发一遍。
+ *   包进事务之后，中断只会把两者一起回滚。
+ */
+$rsSrc = (string)file_get_contents(__DIR__ . '/../app/lib/Service/RewardService.php');
+$cgFn  = strstr($rsSrc, 'public function checkAndGrant');
+$cgFn  = $cgFn === false ? '' : substr($cgFn, 0, 4000);
+ok(str_contains($cgFn, 'transaction('), '★★ checkAndGrant() 整段包在事务里');
+ok(str_contains($cgFn, 'lockById('), '★★ 并且第一步就锁住会员那一行（不锁的话事务也挡不住同时读）');
+
+$cgDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id=?', [SMOKE_STORE, $cgMid]);
+$cgDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $cgMid]);
+$cgDb->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $cgMid]);
 
 step('⑬ 不变量总校验');
 

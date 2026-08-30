@@ -131,10 +131,35 @@ final class ReconcileService
             return false;
         }
 
-        // 金额变了 —— 重算可积分总额。此时才读明细（罕见路径，开销可接受）
+        /**
+         * 金额变了 —— 重算可积分总额。此时才读明细（罕见路径，开销可接受）。
+         *
+         * ── 🔴 必须和记账路径用【同一套】算法 ─────────────
+         *
+         * 原来这里少传了两个东西，与 PointsService::buildContext() 分叉：
+         *
+         * ① redeemPatterns 没传 → 退回硬编码的 ['TARJETA 10+1','10+1']。
+         *    而 PointsEngine::REDEEM_PATTERNS 的注释承诺「名称会变……
+         *    改后台 sys_config 即可，无需改代码」——
+         *    店家真改了 POS 里的名称：Pad 认得出，夜间校准认不出。
+         *
+         * ② taxCents 没传 → 恒按含税算。points_include_tax = 0 时
+         *    落库的 total_amount 是【不含税】的，这里重算出来是【含税】的，
+         *    两数天然不等且 newTotal 恒 ≥ oldTotal → 每一单都走
+         *    「金额变大，不自动补分」分支，推一条 amount_changed 告警。
+         *    本该自动冲正的单被挂成人工待办，同时污染告警队列。
+         *
+         * 两项当前恰好都没发作（含税开关是 1、核销名称等于硬编码默认值），
+         * 但那是配置碰巧对上了，不是代码对。
+         */
         $detail   = $this->pos->fetchDetailForChecks($headId, $checkIds);
-        $analysis = PE::analyzeDetail($detail, $this->rules);
-        $newTotal = PE::pointsBaseCents($nowShould, $nowActual, $nowOriginal, $analysis['excluded_cents']);
+        $analysis = PE::analyzeDetail($detail, $this->rules,
+            PE::redeemPatternsFrom($this->cfg->get('redeem_line_patterns', '')));
+        $taxCents = $this->cfg->get('points_include_tax', '1') === '1'
+            ? 0
+            : (int)($o['tax_amount'] !== null ? Money::toCents((string)$o['tax_amount']) : 0);
+        $newTotal = PE::pointsBaseCents($nowShould, $nowActual, $nowOriginal,
+                                        $analysis['excluded_cents'], $taxCents);
         $oldTotal = Money::toCents((string)$o['total_amount']);
 
         if ($newTotal >= $oldTotal) {

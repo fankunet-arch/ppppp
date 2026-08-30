@@ -895,7 +895,19 @@ function recomputePicks() {
 }
 
 function addPerson() {
-  S.people.push({ member: null, amountCents: 0, portions: 0 });
+  /**
+   * ★ 新加的一位也要带上份数。
+   *
+   *   份数框在 once_per_period 下是锁死的，如果这里还给 0，
+   *   加进来的人就永远拿不到次数，而且他【改不了】——
+   *   界面上看不出为什么别人有次数他没有。
+   */
+  const fixed = (S.order || {}).portions_per_person;
+  S.people.push({
+    member: null,
+    amountCents: 0,
+    portions: (fixed === null || fixed === undefined) ? 0 : Number(fixed) || 0,
+  });
   renderPeople();
   if (S.mode === 3) refreshPickSelects();
 }
@@ -1026,15 +1038,22 @@ function renderPeople(keepItems) {
   alreadyOnOrder().forEach(r => {
     const d = document.createElement('div');
     d.className = 'person locked';
-    const bits = [`€ ${escapeHtml(r.amount)}`];
-    if (r.portions > 0) { bits.push(T('assign.donePortions', { n: r.portions })); }
-    bits.push(r.visits > 0 ? T('assign.doneVisits', { n: r.visits }) : T('assign.doneNoVisit'));
+    /**
+     * ★ 与可编辑行用【同一个骨架】：卡号在左，金额与份数是两个灰掉的框。
+     *
+     *   原来这一行是「卡号 + 一串 <b> 包着的小字 + 一个圆角标签」，
+     *   在 .who 那一列里会折成好几行，看着像坏掉了，
+     *   而且和下面几行对不上列 —— 服务员要横着扫一眼才能比出差别。
+     *
+     *   现在两种行长得一模一样，唯一的差别就是【框是灰的、点不动】，
+     *   那正是要传达的信息：这个位子有人了。
+     */
     d.innerHTML = `
-      <div class="who">
-        <b>${escapeHtml(maskCard(r.card))}</b>
-        <small>${bits.join(' · ')}</small>
-      </div>
-      <div class="lockmark">${T('assign.lockedRow')}</div>`;
+      <div class="who"><b>${escapeHtml(maskCard(r.card))}</b></div>
+      <label class="amt">${T('assign.amount')}
+        <input type="text" value="${escapeHtml(r.amount)}" disabled></label>
+      <label class="prt">${T('assign.portions')}
+        <input type="text" value="${r.portions}" disabled></label>`;
     box.appendChild(d);
   });
 
@@ -1042,6 +1061,17 @@ function renderPeople(keepItems) {
   // 逐行去减「别人已占的」会让「从这行挪一份到那行」必须先减后加，
   // 柜台上多一步就是多一次出错
   const maxPort = Number((S.order || {}).remaining_portions) || 0;
+  /**
+   * ★ 每人固定几份 —— 由服务端的计次口径决定（见 buildContext 的
+   *   portions_per_person）。once_per_period 下是 1，且【输入框锁死】。
+   *
+   *   在那个口径下「份数」已经不是「吃了几份」，而是「这个人有没有吃
+   *   计次套餐」这个是非题：填 3 和填 1 最后都只记 1 次。
+   *   既然多填没有任何用处，那个框就只剩下填错的可能 ——
+   *   现场截图里就是一张只剩 1 份的单，框里填进了 4。
+   */
+  const fixedPort = (S.order || {}).portions_per_person;
+  const lockPort  = fixedPort !== null && fixedPort !== undefined;
   S.people.forEach((p, i) => {
     const d = document.createElement('div');
     d.className = 'person';
@@ -1053,7 +1083,7 @@ function renderPeople(keepItems) {
           : `<button class="link" data-pick="${i}">${T('assign.pickMember')}</button>`}
       </div>
       <label class="amt">${T('assign.amount')}<input type="text" inputmode="decimal" data-amt="${i}" value="${money(p.amountCents)}"${S.mode === 3 ? ' readonly' : ''}></label>
-      <label class="prt">${T('assign.portions')}<input type="number" inputmode="numeric" min="0" max="${maxPort}" data-prt="${i}" value="${p.portions}"${S.mode === 3 ? ' readonly' : ''}></label>
+      <label class="prt">${T('assign.portions')}<input type="number" inputmode="numeric" min="0" max="${maxPort}" data-prt="${i}" value="${p.portions}"${(lockPort || S.mode === 3) ? ' readonly' : ''}></label>
       ${S.people.length > 1 ? `<button class="rm" data-rm="${i}">${T('assign.remove')}</button>` : ''}`;
     box.appendChild(d);
   });

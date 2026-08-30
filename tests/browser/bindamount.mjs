@@ -103,7 +103,8 @@ const doSplitN = async (n) => {
 };
 
 const pickMember = async (i, card) => {
-  await page.locator('#assign-people .person').nth(i).locator('button').first().click();
+  // ★ 只数【可编辑】的行：已绑定那几行排在最前面，而且没有按钮
+  await page.locator('#assign-people .person:not(.locked)').nth(i).locator('button').first().click();
   await page.waitForSelector('#member-modal:not([hidden])', { timeout: 5000 });
   await page.fill('#member-input', card);
   await page.click('#btn-member-search');
@@ -161,29 +162,32 @@ console.log('\n【③ 反面：有钱却没份数 —— 提醒，但不拦】')
  * ★ 这一面的代价是【客人吃亏】：积分照样进卡、小票照样打，
  *   只是这一次没盖章，而且事后没有任何地方会报出来。
  *   所以只提醒不拦 —— 它常常是对的（只点酒水的客人）。
+ *
+ * ★ AA 模式下份数框已经锁死（每人固定 1 份），这个形状在这一屏
+ *   点不出来了 —— 但它仍然会从【点选菜品】模式来：
+ *   只认领了酒水的客人，份数天然是 0。
+ *   所以这里直接把那个状态摆出来，测的是「提醒会不会挂出来」，
+ *   而不是「怎么走到那个状态」。
  */
 await page.click('[data-back="step-mode"]');
 await page.waitForSelector('#step-mode.active', { timeout: 5000 });
 await page.click('.mode[data-mode="2"]');
 await page.waitForSelector('#step-assign.active', { timeout: 5000 });
-await page.fill('#aa-people', '2');
-await page.click('#btn-aa');
-await page.waitForTimeout(800);
+await doSplitN(2);
 
-const hintHidden = await page.locator('#assign-noportion').isHidden();
-ok(hintHidden, 'AA 刚拆好时不提醒 —— 两位都分到了份数');
+ok(await page.locator('#assign-noportion').isHidden(), 'AA 刚拆好时不提醒 —— 两位都分到了份数');
 
-await page.fill('[data-prt="1"]', '0');
+await page.evaluate(() => { S.people[1].portions = 0; updateTotals(); });
 await page.waitForTimeout(250);
 const hint = (await page.locator('#assign-noportion').textContent() || '').trim();
 ok(hint.length > 0 && !(await page.locator('#assign-noportion').isHidden()),
-   `★★★ 把第二位的份数清成 0 → 当场挂出提醒：「${hint.slice(0, 46)}…」`);
+   `★★★ 出现「有金额但 0 份」的人 → 当场挂出提醒：「${hint.slice(0, 46)}…」`);
 ok(!(await page.evaluate(() => document.querySelector('#btn-submit').disabled)),
    '  └ 但提交按钮照样能点 —— 这一条是提醒，不是拦截（只点酒水的客人本来就是这样）');
 ok(await page.locator('#assign-noportion.hint-warn').count() === 1,
    '  └ 用的是橙色提醒样式，不是红色报错 —— 两者混成一档，几天后两种都没人看');
 
-await page.fill('[data-prt="1"]', '1');
+await page.evaluate(() => { S.people[1].portions = 1; updateTotals(); });
 await page.waitForTimeout(250);
 ok(await page.locator('#assign-noportion').isHidden(), '  └ 份数补回去，提醒就消失');
 

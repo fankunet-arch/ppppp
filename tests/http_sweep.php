@@ -377,6 +377,41 @@ $dm2 = $j['data'] ?? $j;
 ok(($dm2['reason'] ?? '') === 'not_found',
    '★★ 经理能分清「不存在」和「超时效」（' . ($dm2['reason'] ?? '-') . '）');
 
+// ── 7c. 找单时间窗不能由客户端说了算 ─────────────────────
+group('⑩ 按桌号找单：时间窗由服务端封顶');
+
+/**
+ * ★ 原来客户端传多少就是多少。实测一个【普通收银员】账号传
+ *   window_minutes = 5256000（十年），一次捞回 19 张跨三周的历史单，
+ *   带金额、份数、菜品明细、已经记给了谁。
+ *
+ *   两件事同时坏掉：后台那两项窗口配置形同虚设；
+ *   以及对 docs/README 里写明「性能极度受限」的 POS 主机开了一个
+ *   无上限的扫描入口（SQL 有 LIMIT 20，但扫描范围没有上限）。
+ *
+ *   这条断言打的是接口本身 —— 前端改文案是没用的，
+ *   Pad 是柜台上一台安卓平板，请求谁都能自己构造。
+ */
+[$st, $raw, $j] = req($BASE . '/api.php/order/locate', 'POST',
+    ['table_name' => '15'], $clerkPad);
+$w0 = ($j['data']['window'] ?? null);
+ok(is_int($w0) && $w0 > 0, '不带 window_minutes 时走后台配置（window=' . var_export($w0, true) . '）',
+   brief($st, $raw, $j));
+
+[$st, $raw, $j] = req($BASE . '/api.php/order/locate', 'POST',
+    ['table_name' => '15', 'window_minutes' => 5256000], $clerkPad);
+$wBig = ($j['data']['window'] ?? null);
+ok(is_int($wBig) && $wBig <= max($w0, 60),
+   sprintf('★★★ 传十年（5256000 分钟）被夹到 %s 分钟 —— 后台配置说了算', var_export($wBig, true)),
+   brief($st, $raw, $j));
+ok($wBig !== 5256000, '★★★ 服务端没有原样采纳客户端给的窗口');
+
+[$st, $raw, $j] = req($BASE . '/api.php/order/locate', 'POST',
+    ['table_name' => '15', 'window_minutes' => 45], $clerkPad);
+ok(($j['data']['window'] ?? null) === 45,
+   '  └ 上限以内的值照常生效（45 分钟）—— 封的是上限，不是「一律不许传」',
+   brief($st, $raw, $j));
+
 // ── 8. 清理 ──────────────────────────────────────────────
 foreach ([$padJar, $cpJar, $clerkJar, $clerkPad] as $f) { @unlink($f); }
 

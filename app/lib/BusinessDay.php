@@ -52,9 +52,44 @@ final class BusinessDay
      * 营业日 → [起始时刻, 结束时刻)，用于按营业日查询。
      * @return array{0:string,1:string} 'Y-m-d H:i:s'
      */
+    /**
+     * 一个营业日的 [起, 止) 区间。
+     *
+     * ── 🔴 夏令时前跳那天，切点本身可能【不存在】 ─────────
+     *
+     * Europe/Madrid 在春季前跳的那天，本地时间 02:00 这一刻是不存在的
+     * （02:00 直接跳到 03:00）。`new DateTimeImmutable('2026-03-29 02:00:00')`
+     * 会被 PHP 归一化成 03:00，于是：
+     *
+     *     2026-03-29 -> [03-29 03:00, 03-30 03:00)
+     *     2026-03-30 -> [03-30 02:00, 03-31 02:00)
+     *                          ↑ 与上一行重叠了 1 小时
+     *
+     * 后果：riskWatch() 直接拿 earnedInRange() 的结果统计「今天记了几次」，
+     * 一年里有一天会把前一天最后一小时的流水也算进来。
+     * 影响极小（计次判定后面还有 sameSitting() 兜底），但结果确实是错的。
+     *
+     * ★ 修法：把「+1 天」放在【UTC 时间轴】上做，再转回本地。
+     *   营业日的长度是 24 小时这件事，不该被时区规则改写 ——
+     *   前跳那天本地只有 23 小时，区间照样应该是首尾相接、不重不漏。
+     */
     public function range(string $businessDate): array
     {
-        $d = new \DateTimeImmutable($businessDate . ' ' . $this->cutoff . ':00');
-        return [$d->format('Y-m-d H:i:s'), $d->modify('+1 day')->format('Y-m-d H:i:s')];
+        $tz = new \DateTimeZone(date_default_timezone_get());
+        $at = fn(string $date): \DateTimeImmutable
+            => new \DateTimeImmutable($date . ' ' . $this->cutoff . ':00', $tz);
+
+        /**
+         * ★ 止点 = 【下一个营业日的起点】，而不是「起点 + 1 天」。
+         *
+         *   这样相邻两天【按构造就是首尾相接】的，不管那天有没有
+         *   23 小时或 25 小时。用 +1 天（无论按日历还是按 86400 秒）
+         *   都会在切换日错开一小时：起点被归一化到 03:00，
+         *   止点却还落在 02:00，或者反过来。
+         *
+         *   前跳那天这一天只有 23 小时 —— 那是对的，本地时钟真的少了一小时。
+         */
+        $next = (new \DateTimeImmutable($businessDate, $tz))->modify('+1 day')->format('Y-m-d');
+        return [$at($businessDate)->format('Y-m-d H:i:s'), $at($next)->format('Y-m-d H:i:s')];
     }
 }

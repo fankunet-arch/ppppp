@@ -51,11 +51,45 @@ final class CardNumber
 
     private string $prefix;
 
+    /**
+     * @param string $prefix 卡号前缀，1~4 位字母。
+     *
+     * ── 🔴 前缀里不能有 I / L / O / U ────────────────────
+     *
+     * normalize() 会把印刷体下容易读错的字符映射回去
+     * （O→0、I→1、L→1、U→V），而它作用于【整个输入串，包括前缀】。
+     * 前缀如果含这几个字母，归一化之后就跟自己对不上了：
+     *
+     *     prefix=VIP   make()=VIP00000123Q7X   normalize()=V1P00000123Q7X  ❌
+     *     prefix=GOLD  make()=GOLD00000123Q7X  normalize()=G01D00000123Q7X ❌
+     *     prefix=CLUB  make()=CLUB00000123Q7X  normalize()=C1VB00000123Q7X ❌
+     *
+     * isWellFormed() 里的 str_starts_with($n, $this->prefix) 于是恒为假 ——
+     * **自己生成的卡号被自己判为非法**。后果是 /card/lookup、/card/status、
+     * /member/create 全部返回 card_malformed，而 CardRepo::findByCardNo()
+     * 拿归一化后的串去查、generateBatch() 存的是未归一化的串，永远查不到。
+     *
+     * ★ 直接拒绝，而不是「把前缀也归一化一遍」。
+     *   归一化的话 VIP 会变成 V1P 印在卡面上，客人看到的是一个
+     *   莫名其妙的串；而 O/0、I/1 本来就是人眼分不清的字符 ——
+     *   前缀是要被口头念、被手输的，本来就不该用它们。
+     *
+     * ★ 而且要在【配置阶段】就拒绝。按 docs/10 的上线步骤，
+     *   发卡是最后一步 —— 不拦的话，卡已经印出来了才会发现。
+     *   VIP 恰恰是这套系统最可能被填的前缀（前端桥接文件就叫 sushivip-bridge.js）。
+     */
     public function __construct(string $prefix)
     {
         $prefix = strtoupper(trim($prefix));
         if (!preg_match('/^[A-Z]{1,4}$/', $prefix)) {
             throw new \InvalidArgumentException('卡号前缀必须是 1~4 位字母');
+        }
+        if ($prefix !== self::normalize($prefix)) {
+            throw new \InvalidArgumentException(sprintf(
+                '卡号前缀不能含 I / L / O / U（这几个字母在卡面上与 1 / 0 / V 分不清，'
+                . '扫码纠错会把 %s 读成 %s）。请改用别的字母，例如 TK',
+                $prefix, self::normalize($prefix)
+            ));
         }
         $this->prefix = $prefix;
     }

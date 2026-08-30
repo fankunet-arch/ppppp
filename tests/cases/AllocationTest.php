@@ -128,6 +128,45 @@ foreach ([[3, 4, 3], [10, 4, 4], [2, 5, 2], [0, 3, 0], [1, 1, 1]] as [$prt, $n, 
     T::eq($expect, $withPort, "★★ {$prt} 份 {$n} 人 → {$expect} 位拿到份数（= min(份数, 人数)）");
 }
 
+T::group('splitEvenly —— 没分到钱的人不给份数');
+
+/**
+ * ★ 金额余数给第一位、份数余数摊开 —— 两条规则不一样，就带出一个组合：
+ *   当 intdiv(金额, 人数) == 0 时，排在后面的人会拿到「0 元 + 1 份」。
+ *
+ *       splitEvenly(2 分, 3 份, 5 人) → 2/1  0/1  0/1  0/0  0/0
+ *
+ *   这正是 validateAllocations 硬拒的 portions_without_amount ——
+ *   这个纯函数会造出一组【交回去会被自己拒掉】的分配。
+ *   （而它自己的注释当时还写着「不会造出这种分配」。）
+ *
+ *   现实里要求「剩余金额的分数 < 人数」，几乎不可能发生，
+ *   所以不是金额风险；但自相矛盾的纯函数迟早会被别处拿去用。
+ */
+foreach ([[2, 3, 5], [3, 3, 5], [1, 4, 4], [0, 3, 3], [7, 9, 10]] as [$amt, $prt, $n]) {
+    $sh  = PE::splitEvenly($amt, $prt, $n);
+    $bad = array_filter($sh, static fn(array $x): bool => $x['amount_cents'] === 0 && $x['portions'] > 0);
+    T::true($bad === [],
+        "★★★ splitEvenly({$amt}分, {$prt}份, {$n}人) 里没有「0 元却带份数」的人");
+    // 并且这一组交回校验必须能过（空分配除外）
+    $allocs = [];
+    foreach ($sh as $i => $x) {
+        if ($x['amount_cents'] > 0 || $x['portions'] > 0) {
+            $allocs[] = ['member_id' => $i + 1] + $x;
+        }
+    }
+    if ($allocs !== []) {
+        $chk = PE::validateAllocations($allocs, max(1, $amt), 0, $prt, 0);
+        T::true($chk['ok'], "  └ 交回 validateAllocations 能过（{$amt}分/{$prt}份/{$n}人）");
+    }
+}
+
+// 金额守恒不受影响
+foreach ([[2, 3, 5], [999, 7, 3], [12345, 13, 7]] as [$amt, $prt, $n]) {
+    $sh = PE::splitEvenly($amt, $prt, $n);
+    T::eq($amt, array_sum(array_column($sh, 'amount_cents')), "金额守恒：{$amt} 分给 {$n} 人");
+}
+
 T::group('validateAllocations —— 部分登记（AA 中只有部分人有卡）');
 
 // 4 人 AA 但只有 3 人有卡：允许只分配 3 份，剩余留空

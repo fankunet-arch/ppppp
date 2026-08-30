@@ -115,3 +115,62 @@ T::true($threw, '后缀位数不对时拒绝');
 
 T::eq(null, $cn->serialOf('TK'), '结构不合法时取不到顺序号');
 T::eq(null, $cn->suffixOf('TK'), '结构不合法时取不到后缀');
+
+T::group('实体卡号 · 前缀不能含 I / L / O / U');
+
+/**
+ * ★ 这一条来自一次实测：换个前缀，整套实体卡功能当场全废。
+ *
+ *   normalize() 会把印刷体下容易读错的字符映射回去（O→0、I→1、L→1、U→V），
+ *   而它作用于【整个输入串，包括前缀】。前缀含这几个字母时：
+ *
+ *       prefix=VIP   make()=VIP00000123Q7X   normalize()=V1P00000123Q7X  ❌
+ *       prefix=GOLD  make()=GOLD00000123Q7X  normalize()=G01D00000123Q7X ❌
+ *       prefix=CLUB  make()=CLUB00000123Q7X  normalize()=C1VB00000123Q7X ❌
+ *       prefix=OK    make()=OK00000123Q7X    normalize()=0K00000123Q7X   ❌
+ *
+ *   isWellFormed() 里的 str_starts_with($n, $this->prefix) 恒为假 ——
+ *   【自己生成的卡号被自己判为非法】。/card/lookup、/card/status、
+ *   /member/create 全部返回 card_malformed；CardRepo::findByCardNo() 拿
+ *   归一化后的串去查、generateBatch() 存的是未归一化的串，永远查不到。
+ *
+ *   ★ 原来这个文件只测了 new CardNumber('TK') —— 恰好是安全字符，
+ *     所以一直是绿的。而 VIP 恰恰是这套系统最可能被填的前缀
+ *     （前端桥接文件就叫 sushivip-bridge.js）。
+ *
+ *   ★ 按 docs/10 的上线步骤，发卡是最后一步 ——
+ *     不在配置阶段拦住的话，卡已经印出来了才会发现。
+ */
+foreach (['VIP', 'GOLD', 'CLUB', 'OK', 'ILO', 'U'] as $bad) {
+    $threw = false;
+    try {
+        new CardNumber($bad);
+    } catch (\InvalidArgumentException $e) {
+        $threw = str_contains($e->getMessage(), 'I / L / O / U');
+    }
+    T::true($threw, "★★★ 前缀 {$bad} 在构造时就被拒（不是等到发卡那天）");
+}
+
+// 安全字符照常可用，而且【自己生成的卡号自己认得】
+foreach (['TK', 'SV', 'MK', 'ABCD'] as $good) {
+    $g = new CardNumber($good);
+    $no = $g->make(123, '4Q7');
+    T::true($g->isWellFormed($no), "前缀 {$good} 可用，且 make() 的结果过得了 isWellFormed()");
+    T::eq($no, CardNumber::normalize($no), "  └ 归一化之后一个字符都不变（{$no}）");
+}
+
+/**
+ * ★ 反过来钉住 normalize() 那张映射表没被悄悄改动 ——
+ *   它是「收银员照着卡面手输也能查到」的全部依据。
+ */
+T::eq('V1101', CardNumber::normalize('UIL-O1'),
+    'normalize 仍然是 U→V、I→1、L→1、O→0，并去掉连字符（UIL-O1 → V1101）');
+
+/**
+ * ★ diag.php 里抄了一份同样的规则（它不加载 autoloader —— 那正是它的价值：
+ *   什么都坏了它还能跑）。抄了就会漂，所以在这里对一眼。
+ */
+$diagSrc = (string)file_get_contents(dirname(__DIR__, 2) . '/bin/diag.php');
+T::true(str_contains($diagSrc, 'ILOU'),
+    '★★ bin/diag.php 也查 card_prefix 里的 I/L/O/U —— 上线前就该发现，而不是发卡那天');
+T::true(str_contains($diagSrc, 'card_prefix'), '  └ 并且是对着 config.card_prefix 查的');

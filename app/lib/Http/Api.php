@@ -88,6 +88,7 @@ final class Api
         'reversal_window_expired'=> '超出自由撤销时限，需经理授权',
         'manual_entry_disabled'  => '手工录入功能已关闭',
         'exceeds_manual_limit'   => '超过手工录入单笔限额，需经理授权',
+        'exceeds_manual_hard_limit' => '超过手工录入的绝对上限，经理也不能放行 —— 请核对金额是不是多打了零',
         'invalid_amount'         => '金额不合法',
         'db_unavailable'         => '本地数据库暂时不可用，请联系管理员',
 
@@ -177,6 +178,7 @@ final class Api
         'reversal_window_expired'=> 'Fuera del plazo para anular por su cuenta, hace falta un encargado',
         'manual_entry_disabled'  => 'La entrada manual está desactivada',
         'exceeds_manual_limit'   => 'Supera el límite por entrada manual, hace falta un encargado',
+        'exceeds_manual_hard_limit' => 'Supera el límite absoluto de entrada manual; ni el encargado puede autorizarlo. Compruebe si sobran ceros',
         'invalid_amount'         => 'Importe no válido',
         'db_unavailable'         => 'La base de datos local no responde, avise al administrador',
 
@@ -320,6 +322,18 @@ final class Api
         // POS 侧：PosUnavailable 继承 RuntimeException，必须先判
         if ($e instanceof \Vip\PosUnavailable) {
             return 'E201';   // 连不上 / 查询超时
+        }
+        /**
+         * ★ InvalidArgumentException 要先于 LogicException 判。
+         *
+         *   它继承 LogicException，原来会一并归成 E203 ——
+         *   而 docs/06 的错误代码表里 E203 = 「PosDb 护栏拦截」。
+         *   实测：管理员建号时填了 4 位 PIN（服务层下限是 6），
+         *   界面回「错误代码 E203」，照着表查过去指向 POS 主库，
+         *   而问题在建号表单里。方向指反了比不给码更糟。
+         */
+        if ($e instanceof \InvalidArgumentException) {
+            return 'E302';   // 参数值不合法（业务层校验没过）—— 纯代码/调用问题
         }
         if ($e instanceof \LogicException) {
             return 'E203';   // PosDb 护栏：非 SELECT / 带分号 / 没有 LIMIT

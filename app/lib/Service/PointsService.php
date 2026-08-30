@@ -160,12 +160,9 @@ final class PointsService
      */
     private function redeemPatterns(): array
     {
-        $raw = trim($this->cfg->get('redeem_line_patterns', ''));
-        if ($raw === '') {
-            return PE::REDEEM_PATTERNS;
-        }
-        $out = array_values(array_filter(array_map('trim', explode(',', $raw)), fn($s) => $s !== ''));
-        return $out ?: PE::REDEEM_PATTERNS;
+        // ★ 解析逻辑放在 PointsEngine 里 —— 值比对路径要用同一份，
+        //   见 PointsEngine::redeemPatternsFrom() 的说明
+        return PE::redeemPatternsFrom($this->cfg->get('redeem_line_patterns', ''));
     }
 
     /**
@@ -313,6 +310,20 @@ final class PointsService
             'remaining_cents'    => max(0, $baseCents - $allocated),
             'remaining'          => Money::toStr(max(0, $baseCents - $allocated)),
             'portions_counted'   => $netPortions,
+            /**
+             * ★ 一位客人固定算几份 —— null = 不固定，可手填。
+             *
+             *   once_per_period 口径下，「份数」已经不是「吃了几份」，
+             *   而是「这个人有没有吃计次套餐」这个是非题：
+             *   给他 3 份和给他 1 份，最后都只记 1 次。
+             *   既然多填没有任何用处，那个输入框就不该是可填的 ——
+             *   它只剩下填错的可能（现场截图：只剩 1 份的单里填进了 4）。
+             *
+             *   by_portion / by_order 是旧口径，份数在那里是真的有意义，
+             *   所以留 null，前端照常可填。
+             */
+            'portions_per_person' => $this->cfg->get('visit_count_mode', 'once_per_period')
+                                     === 'once_per_period' ? 1 : null,
             'allocated_portions' => $allocPort,
             'remaining_portions' => max(0, $netPortions - $allocPort),
             // 排查用：明细里的原始份数，以及券抵掉了几份
@@ -803,7 +814,23 @@ final class PointsService
             foreach ($serialIds as $sid) {
                 $o = $this->orders->findBySerial($sid);
                 if ($o === null) { continue; }
-                $age = (time() - strtotime((string)$o['order_end_time'])) / 60;
+                /**
+                 * ★ 时间基准取【主库】的 now()，不是应用服务器的 time()。
+                 *
+                 *   order_end_time 来自 POS 主库，拿本地时钟去减它，
+                 *   两台机器的时钟差多少，这个 age 就错多少。
+                 *   POS 是一台老 Windows 机器，漂移是常态：
+                 *     POS 快 2 小时 → age 为负 → 补记时限【永不触发】
+                 *     POS 慢 2 小时 → 每一单都超时限，每次记账都要叫经理
+                 *   两个方向都难查，界面上只会说「这一单超出普通记账范围」。
+                 *
+                 *   locateByInvoice() 的回溯天数判断本来就用的是 pos->now()，
+                 *   全仓库原本只有这一处用本地时间，是漏改。
+                 *
+                 *   POS 不可达时 posNow() 回落到本地时间 —— 那时候本来也
+                 *   走不到记账这一步，回落只是不让风控自己炸掉。
+                 */
+                $age = (strtotime($this->posNow()) - strtotime((string)$o['order_end_time'])) / 60;
                 if ($oldest === null || $age > $oldest) { $oldest = $age; }
             }
             if ($oldest !== null && $oldest > $lateMin) {
@@ -954,6 +981,23 @@ final class PointsService
      *   所以这里绝不返回错误、绝不影响记账结果，异常也吞掉：
      *   风控的副作用不该把已经算好的积分弄回滚。
      */
+    /**
+     * 主库时间 —— 拿不到就回落到本地时间。
+     *
+     * ★ 所有「这一单过了多久」的判断都必须用它，不能用 time()：
+     *   order_end_time 是 POS 给的，两边时钟不一致时差多少就错多少。
+     *   POS 不可达时回落，只是为了不让风控自己炸掉 ——
+     *   那种时候本来也走不到记账。
+     */
+    private function posNow(): string
+    {
+        try {
+            return $this->pos->now();
+        } catch (\Throwable) {
+            return date('Y-m-d H:i:s');
+        }
+    }
+
     /**
      * 「有人在枚举小票号」的观察者。
      *
@@ -1206,7 +1250,33 @@ final class PointsService
         if ($amountCents <= 0) {
             return ['ok' => false, 'error' => 'invalid_amount'];
         }
+        /**
+         * 两道上限，管的事情不一样：
+         *
+         * ① manual_entry_limit（软）—— 超过要经理放行。经理身份即视为已批
+         *    （路由里 approved_by = 经理 id），这是 docs/03 §10 的设计。
+         *
+         * ② manual_entry_hard_limit（硬）—— ★ 谁都过不去，经理也不行。
+         *
+         * ── 为什么要有第二道 ────────────────────────────
+         * 「经理可以破例」和「经理可以一次记 100 万欧」是两件事。
+         * 实测：后台 manual_entry_limit = 200.00，经理提交 999999.99
+         * 直接成功，会员余额当场变成 999999 分 —— 软上限对经理
+         * 【完全不生效，且没有任何替代上限】。
+         *
+         * docs/03 §12.4 的取舍（对内部人只能留痕、不能事前拦截）仍然成立，
+         * 这一道不是用来防内部作案的，是防【手滑多打几个零】——
+         * 而那个错误一旦发生，积分已经进了卡，撤销要人工翻账。
+         *
+         * 默认 5000.00：远高于任何一张真实小票，又拦得住多打两个零。
+         * 填 0 = 不设硬上限（不建议）。
+         */
         $limit = Money::toCents($this->cfg->get('manual_entry_limit', '200.00'));
+        $hard  = Money::toCents($this->cfg->get('manual_entry_hard_limit', '5000.00'));
+        if ($hard > 0 && $amountCents > $hard) {
+            return ['ok' => false, 'error' => 'exceeds_manual_hard_limit',
+                    'detail' => ['limit' => Money::toStr($hard)]];
+        }
         if ($amountCents > $limit && empty($operator['approved_by'])) {
             return ['ok' => false, 'error' => 'exceeds_manual_limit',
                     'detail' => ['limit' => Money::toStr($limit)]];

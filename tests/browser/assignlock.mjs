@@ -39,6 +39,23 @@ if (!ORD) {
   process.exit(1);
 }
 
+/**
+ * ★ 先清场。跑崩过的上一次会在这张单上留下已分配额与残留会员，
+ *   下一次跑就只剩零头，断言会以一种和产品毫无关系的方式挂掉
+ *   （见 tests/browser/README 第 10 条）。
+ */
+php(`
+  require "app/bootstrap.php"; $c = require "app/config/config.php";
+  $a = new Vip\\App($c); $db = $a->localDb(); $sc = $c['store_code'];
+  foreach ($db->all("SELECT m.id FROM member m JOIN card c ON c.member_id = m.id
+                      WHERE c.store_code=? AND c.batch_no LIKE 'AL%'", [$sc]) as $m) {
+    foreach (['point_ledger','coupon'] as $t) { $db->exec("DELETE FROM {$t} WHERE member_id=?", [(int)$m['id']]); }
+    $db->exec("DELETE FROM member WHERE id=?", [(int)$m['id']]);
+  }
+  $db->exec("DELETE FROM card WHERE store_code=? AND batch_no LIKE 'AL%'", [$sc]);
+  $db->exec("UPDATE pos_order SET allocated_amount = 0, allocated_portions = 0 WHERE store_code = ?", [$sc]);
+`);
+
 const TAG = 'AL' + Math.floor(Math.random() * 9000 + 1000);
 const F = JSON.parse(php(`
   require "app/bootstrap.php";
@@ -74,7 +91,8 @@ await page.click('#btn-login');
 await page.waitForSelector('#view-main.active', { timeout: 8000 });
 
 const pickMember = async (i, card) => {
-  await page.locator('#assign-people .person').nth(i).locator('button').first().click();
+  // ★ 只数【可编辑】的行：已绑定那几行排在最前面，而且没有按钮
+  await page.locator('#assign-people .person:not(.locked)').nth(i).locator('button').first().click();
   await page.waitForSelector('#member-modal:not([hidden])', { timeout: 5000 });
   await page.fill('#member-input', card);
   await page.click('#btn-member-search');
@@ -122,9 +140,10 @@ ok(before.port >= 2 && before.shares[0].prt > 0,
 ok(before.port === (await page.evaluate(() => Number(S.order.portions_total) || 0)),
    '  └ 这张单是干净的（没有上一次跑崩留下的已分配额）');
 await pickMember(0, F.cardA);
-// 第二位清空 —— 他没有卡，这一半留着不分
+// 第二位清空 —— 他没有卡，这一半留着不分。
+// ★ 份数框现在是只读的（每人固定 1 份），只能从状态里改
 await page.fill('[data-amt="1"]', '0.00');
-await page.fill('[data-prt="1"]', '0');
+await page.evaluate(() => { S.people[1].portions = 0; updateTotals(); });
 await page.waitForTimeout(250);
 await page.click('#btn-submit');
 await page.waitForSelector('#step-done.active', { timeout: 10000 });
@@ -162,14 +181,25 @@ ok(await locked.count() === 1, `★★★ 名单最上面有 1 行是【已绑�
 const lockText = (await locked.first().textContent() || '').replace(/\s+/g, ' ').trim();
 ok(lockText.includes(maskA), `★★★ 那一行直接写着绑的是哪张卡：${maskA}`);
 ok(!lockText.includes(F.cardA), '  └ 依然是打码的卡号');
-ok(new RegExp(`套餐\\s*${before.shares[0].prt}\\s*份`).test(lockText),
-   `  └ 连份数一起写在行里（套餐 ${before.shares[0].prt} 份）`);
+/**
+ * ★ 已绑定那一行与可编辑行用【同一个骨架】：卡号在左，
+ *   金额与份数是两个灰掉的框。唯一的差别就是框点不动。
+ *
+ *   原来这一行是「卡号 + 一串小字 + 一个圆角标签」，在窄列里会折成好几行，
+ *   看着像坏掉了，而且和下面几行对不上列 —— 服务员得横着扫一眼才比得出差别。
+ */
+const lockAmt = locked.first().locator('.amt input');
+const lockPrt = locked.first().locator('.prt input');
+ok(await lockAmt.count() === 1 && await lockPrt.count() === 1,
+   '★★★ 这一行也有金额框与份数框 —— 与可编辑行同一个骨架，列对得上');
+ok(await lockAmt.isDisabled() && await lockPrt.isDisabled(),
+   '★★★ 但两个框都是灰的、点不动 —— 那正是「这个位子有人了」要表达的');
+ok(await lockPrt.inputValue() === String(before.shares[0].prt),
+   `  └ 份数框里写着 ${before.shares[0].prt}（不是一串折行的小字）`);
 ok(await locked.first().locator('[data-pick]').count() === 0,
    '★★★ 这一行【没有「选择会员」按钮】—— 点不了，也就不会点错');
-ok(await locked.first().locator('input').count() === 0,
-   '  └ 金额和份数也不给输入框 —— 已经记掉的账不在这一屏改（要改回上一步撤销）');
-ok((await locked.first().locator('.lockmark').textContent() || '').includes('已记入'),
-   '  └ 并且挂一个「已记入 · 不可更改」的标记，不用猜为什么点不动');
+ok(await locked.first().locator('.rm').count() === 0,
+   '  └ 也没有「移除」—— 已经记掉的账不在这一屏改（要改回上一步撤销）');
 
 ok(await page.locator('#assign-people .person:not(.locked)').count() === 0,
    '★★ 而且这一切在【按分摊之前】就看得见 —— 原来名单要先分摊一次才有东西');
@@ -188,18 +218,32 @@ ok(await pickable.first().locator('[data-pick]').count() === 1,
    '★★★ 可选的那行有「+ 选择会员」，已绑定的那行没有 —— 服务员不用数，看一眼就知道点哪个');
 ok(await locked.count() === 1, '  └ 已绑定那行还在，没被分摊冲掉');
 
-console.log('\n【⑥ 份数输入框：打不进超额的数字】');
+console.log('\n【⑥ 份数输入框：根本填不进去】');
+/**
+ * ★ 这一条从「封顶」改成了「锁死」。
+ *
+ *   once_per_period 口径下，「份数」已经不是「吃了几份」，而是
+ *   「这个人有没有吃计次套餐」这个是非题 —— 填 3 和填 1 最后都只记 1 次。
+ *   既然多填没有任何用处，那个框就只剩下填错的可能：
+ *   现场截图里就是一张只剩 1 份的单，框里被填进了 4。
+ *
+ *   所以现在服务端直接给出「每人几份」（buildContext 的 portions_per_person），
+ *   前端照着渲染成只读框。封顶那一层留着兜底（口径切回 by_portion 时框会解锁）。
+ */
 const left = await page.evaluate(() => Number(S.order.remaining_portions));
-const maxAttr = await page.locator('[data-prt="0"]').getAttribute('max');
-ok(String(left) === maxAttr, `★★ 输入框的 max 就是这张单剩余份数（${maxAttr}）`);
+ok(await page.evaluate(() => Number(S.order.portions_per_person)) === 1,
+   '★★ 服务端说了每人固定 1 份（portions_per_person=1）');
+const prt0 = page.locator('[data-prt="0"]');
+ok(await prt0.getAttribute('readonly') !== null,
+   '★★★ 份数框是只读的 —— 填不进去，也就不可能填错');
+ok(await prt0.inputValue() === '1', '  └ 框里就是 1');
 
-await page.fill('[data-prt="0"]', '9');
-await page.waitForTimeout(300);
-const after9 = await page.evaluate(() => S.people[0].portions);
-ok(after9 === left,
-   `★★★ 只剩 ${left} 份时打进 9 → 当场被改回 ${after9} —— 现场截图里就是这个（只剩 1 份却填了 4）`);
-const tst = (await page.locator('#toast').textContent() || '').trim();
-ok(/只剩/.test(tst), `  └ 并且说清为什么改的：「${tst}」`);
+let typed = false;
+try { await prt0.fill('9', { timeout: 1500 }); typed = true; } catch (e) { /* 预期填不进去 */ }
+ok(!typed, '★★★ 试着往里打 9 → 打不进去（Playwright 判定为 not editable）');
+ok(await page.evaluate(() => S.people[0].portions) === 1, '  └ 状态里还是 1');
+ok(String(await page.locator('[data-prt="0"]').getAttribute('max')) === String(left),
+   `  └ max 仍然钉在剩余份数（${left}）—— 口径切回 by_portion 解锁后这层还在`);
 
 console.log('\n【⑦ 金额输入框：失焦时封顶（按键时不封，否则小数敲不出来）】');
 await page.fill('[data-amt="0"]', '13.9');

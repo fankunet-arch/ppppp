@@ -447,11 +447,25 @@ final class PointsEngine
         int $taxCents = 0
     ): int {
         $base = min($shouldCents, $actualCents);
-        // 按不含税价积分时先把税额扣掉（points_include_tax=0）。
-        // 用 POS 给的真实 tax_amount，不硬编码税率 ——
-        // 实测该字段与实物小票的 SubTotal 完全吻合（docs/01 §2.11）。
+        /**
+         * 按不含税价积分时先把税额扣掉（points_include_tax=0）。
+         * 用 POS 给的真实 tax_amount，不硬编码税率 ——
+         * 实测该字段与实物小票的 SubTotal 完全吻合（docs/01 §2.11）。
+         *
+         * ★ 这里原来写的是
+         *     $base - Money::scale($taxCents, $base, min($should, $actual))
+         *   而此刻 $base 恰好【就等于】那个分母，所以 scale() 是恒等的 ——
+         *   读起来像「按比例折算税额」，实际等价于直接减。
+         *   一个永远不生效的比例换算比没有更糟：它会让人以为这里
+         *   已经处理过某种比例问题了。
+         *
+         * ★ 顺带说明它没处理的那个边界：actual < should 时（docs/01 §2.2
+         *   实测全表仅 1 行），基数取较小的 actual，而 tax 是整单的，
+         *   于是「整单的税从半单里扣」。金额小、出现率近乎为零，
+         *   真要处理得先弄清 POS 在这种单上把税算给了谁 —— 不猜。
+         */
         if ($taxCents > 0 && $base > 0) {
-            $base = max(0, $base - Money::scale($taxCents, $base, max(1, min($shouldCents, $actualCents))));
+            $base = max(0, $base - $taxCents);
         }
         if ($base <= 0) {
             return 0;
@@ -524,6 +538,30 @@ final class PointsEngine
     }
 
     /**
+     * 后台配的核销行名称 → 模式数组。留空回落到内置默认。
+     *
+     * ★ 放在这里而不是某个 Service 里，是因为【两条路径都要用】：
+     *   记账（PointsService::buildContext）与值比对（ReconcileService::verifyOne）。
+     *   原来只有记账那边有，值比对那边直接用了硬编码默认值 ——
+     *   于是店家改了 POS 里的核销行名称之后，Pad 认得出、夜间校准认不出。
+     *   抽成一个共用的纯函数，就没有「改了一处忘了另一处」这回事。
+     *
+     * @return array<int,string>
+     */
+    public static function redeemPatternsFrom(string $raw): array
+    {
+        $raw = trim($raw);
+        if ($raw === '') {
+            return self::REDEEM_PATTERNS;
+        }
+        $out = array_values(array_filter(
+            array_map('trim', explode(',', $raw)),
+            static fn(string $s): bool => $s !== ''
+        ));
+        return $out ?: self::REDEEM_PATTERNS;
+    }
+
+    /**
      * 分配校验 —— 金额守恒的判定逻辑，抽成纯函数便于测试。
      *
      * 恒定成立：SUM(已分配 + 本次) ≤ total_amount
@@ -589,8 +627,8 @@ final class PointsEngine
              *   反过来【有钱没份】是允许的，那是正常生意 ——
              *   只点酒水没点套餐，该积分不该计次。绑定只有这一个方向。
              *
-             *   splitEvenly 不会造出这种分配（余数给第一位，
-             *   基数份额是同增同减的），所以 AA 正常拆分不受影响。
+             *   splitEvenly 也守着同一条规则（份数只摊给分到钱的人），
+             *   所以 AA 正常拆分不会撞上这一条 —— 见该方法的说明。
              */
             if ($prt > 0 && $amt === 0) {
                 return $fail('portions_without_amount');
@@ -635,19 +673,48 @@ final class PointsEngine
      * ★ 所以这里【不能】跟金额那条「余数给第一位」的规则保持一致。
      *   改这一段前先读 docs/03 §3.2 与 §13。
      *
+     * ── 🔴 份数只摊给【分到钱的人】 ─────────────────────
+     *
+     * 两条余数规则不一样，就带出了一个组合：当
+     * `intdiv(金额, 人数) == 0` 时，排在后面的人会拿到「0 元 + 1 份」。
+     *
+     *     splitEvenly(2 分, 3 份, 5 人) → 2/1  0/1  0/1  0/0  0/0
+     *
+     * 这正是 validateAllocations 硬拒的 portions_without_amount ——
+     * 也就是说这个函数会造出一组【交回去会被自己拒掉】的分配。
+     * （早先这里的注释还写着「splitEvenly 不会造出这种分配」，是错的。）
+     *
+     * 现实中要求「剩余金额的分数 < 人数」（如剩 0.03 € 分给 5 人），
+     * 几乎不可能发生，所以这不是金额风险；但一个自相矛盾的纯函数
+     * 迟早会被别处拿去用。所以在这里就把它掐掉：
+     * 没分到钱的人不给份数，份数只在【有钱的人】之间摊。
+     *
      * @return array<int,array{amount_cents:int,portions:int}>
      */
     public static function splitEvenly(int $amountCents, int $portions, int $n): array
     {
         $amts = Money::splitEvenly($amountCents, $n);
-        $base = intdiv($portions, $n);
-        $rem  = $portions - $base * $n;
-        $out  = [];
+
+        // 只有分到钱的人才参与份数分摊 —— 没钱就没次，与 validateAllocations 同一条规则
+        $paying = [];
         for ($i = 0; $i < $n; $i++) {
-            $out[] = [
-                'amount_cents' => $amts[$i],
-                'portions'     => $base + ($i < $rem ? 1 : 0),
-            ];
+            if ($amts[$i] > 0) {
+                $paying[] = $i;
+            }
+        }
+        $give = array_fill(0, $n, 0);
+        $k = count($paying);
+        if ($k > 0 && $portions > 0) {
+            $base = intdiv($portions, $k);
+            $rem  = $portions - $base * $k;
+            foreach ($paying as $j => $idx) {
+                $give[$idx] = $base + ($j < $rem ? 1 : 0);
+            }
+        }
+
+        $out = [];
+        for ($i = 0; $i < $n; $i++) {
+            $out[] = ['amount_cents' => $amts[$i], 'portions' => $give[$i]];
         }
         return $out;
     }
