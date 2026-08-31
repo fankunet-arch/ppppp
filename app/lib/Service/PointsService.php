@@ -808,6 +808,61 @@ final class PointsService
         return $this->countedThisSitting($memberId, $orderEndTime) ? 0 : 1;
     }
 
+    /**
+     * 【记账之前】先问一句：这一单给这位客人，到底会不会计次？
+     *
+     * ── 为什么必须有这个 ──────────────────────────────
+     *
+     * `once_per_period` 下同一张卡一个餐期最多 1 次。于是同餐期的第二单
+     * 照样记得上（金额、积分都进账），但【计次是 0】。
+     * 原来这件事只有在提交完、结果页那行橙字上才说出来 ——
+     * 那时账已经记了，服务员没法再回头问客人一句。
+     *
+     * 现实场景：一桌客人吃完结了账，又加点了甜点酒水另开一单。
+     * 服务员照常拿卡去记，客人以为又攒了一次，回头发现没有 —— 投诉就是这么来的。
+     *
+     * 所以在【选完会员】和【提交】两处提前告知：
+     *   · 选完会员 → 那一行上挂一条常驻提示，服务员当场就能告诉客人
+     *   · 提交     → 弹一次页内确认（不是系统弹框），让服务员明确「知道了，继续」
+     *
+     * ── 一定要走同一条代码路径 ────────────────────────
+     *
+     * 这里复用 visitsFor() / countedThisSitting()，不另写一份判断。
+     * 预览和实际入账用两套规则的话，迟早会出现「预览说会计次、结果没计」——
+     * 那比不提示还糟：服务员照着预览跟客人打了包票。
+     *
+     * @return array{counts_visit:bool, reason:?string}|null
+     *         null = 订单不存在。reason: already_counted | free_meal | null
+     */
+    public function visitPreview(int $memberId, string $serialId): ?array
+    {
+        $order = $this->orders->findBySerial($serialId);
+        if ($order === null) {
+            return null;
+        }
+
+        // 免费餐 / 整单核销：兑换来的那一餐本来就不计次（与 grantOne 同一条判断）
+        $fullyRedeemed = (int)($order['is_redeemed'] ?? 0) === 1
+                      && (int)($order['portions_counted'] ?? 0) === 0;
+        if ((int)($order['is_free_meal'] ?? 0) === 1 || $fullyRedeemed) {
+            return ['counts_visit' => false, 'reason' => 'free_meal'];
+        }
+
+        /**
+         * ★ 只有 once_per_period 能在这个时点给出确定答案。
+         *   by_portion 的次数 = 份数、by_order 恒为 1，都要等分配填完才知道，
+         *   而预览发生在填之前。那两种口径下一律不提示 ——
+         *   宁可不说，也不能说一句还没算数的话。
+         */
+        if ($this->cfg->get('visit_count_mode', 'once_per_period') !== 'once_per_period') {
+            return ['counts_visit' => true, 'reason' => null];
+        }
+
+        return $this->countedThisSitting($memberId, (string)$order['order_end_time'])
+            ? ['counts_visit' => false, 'reason' => 'already_counted']
+            : ['counts_visit' => true, 'reason' => null];
+    }
+
     /** 这张卡在这一顿（同一营业日 + 同一餐期）里是不是已经记过次数了 */
     private function countedThisSitting(int $memberId, string $refEndTime): bool
     {

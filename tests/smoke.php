@@ -3178,6 +3178,112 @@ eq('error', $wHit['level'] ?? '', '  └ 级别是 error，不是可以忽略的
 ok(str_contains($wHit['text'] ?? '', '一份积几分'),
    '  └ 说清了后果：「来一次积几分」实际变成了「一份积几分」');
 
+step('㉝ 记账前先问一句：这一单会不会计次（visitPreview）');
+
+/**
+ * ★ 同餐期第二单照样记得上，但计次是 0。
+ *   原来这件事只在【结果页】说 —— 那时账已经记完，服务员没法再回头
+ *   问客人一句「这一单不攒次数，还记吗」。一桌吃完又加点甜点另开一单，
+ *   是天天发生的事，客人以为又攒了一次，回头发现没有 —— 投诉就是这么来的。
+ *
+ *   所以选会员时就把答案带回给 Pad。这一段守的是那个答案【算得对】。
+ *
+ * ★ 必须与真正记账走同一条代码路径（visitsFor / countedThisSitting）。
+ *   预览和入账两套规则的话，迟早出现「预览说会计次、结果没计」——
+ *   那比不提示还糟：服务员照着预览跟客人打了包票。
+ */
+$vpApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$vpDb  = $vpApp->localDb();
+$vpApp->cfg()->set('late_grant_minutes', '0');
+$vpApp->cfg()->set('max_grants_per_period', '0');
+$vpApp->cfg()->set('visit_count_mode', 'once_per_period');
+$vpApp->cfg()->set('points_mode', 'by_amount');
+
+$vpPos = new FakePosSource();
+$vpPos->now = date('Y-m-d H:i:s');
+$vpMk = function (string $ser, int $ohid, string $table, int $ago) use ($vpPos) {
+    $vpPos->addHead([
+        'serial_id' => $ser, 'order_head_id' => $ohid, 'check_id' => 1,
+        'table_name' => $table, 'eat_type' => 0, 'customer_num' => 2,
+        'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+        'order_end_time' => date('Y-m-d H:i:s', strtotime($vpPos->now) - $ago),
+    ]);
+    $vpPos->addDetail($ohid, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+};
+$vpMk('9404440001', 940001, 'VP1', 600);
+$vpMk('9404440002', 940002, 'VP2', 300);      // 同一餐期的第二单
+$vpApp->setPosSource($vpPos);
+foreach (['VP1', 'VP2'] as $t) { $vpApp->points()->locate($t, 900); }
+
+$vpOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true];
+$vpM  = (int)$vpApp->members()->create('TK-00094401-VPA', null, null, null)['id'];
+
+// ── ① 还没记过 → 会计次，不提示 ──
+$p1 = $vpApp->points()->visitPreview($vpM, '9404440001');
+eq(true, $p1['counts_visit'], '① 第一单：会计次');
+eq(null, $p1['reason'],       '  └ 没有理由要说（正常单一次都不打扰）');
+
+$vpApp->points()->grant('9404440001',
+    [['member_id' => $vpM, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $vpOp);
+
+// ── ② 同餐期第二单 → 不计次，且说得出为什么 ──
+$p2 = $vpApp->points()->visitPreview($vpM, '9404440002');
+eq(false, $p2['counts_visit'],
+   '★★★ ② 同餐期第二单：【记账之前】就知道不会计次');
+eq('already_counted', $p2['reason'],
+   '  └ 理由是「本餐期已记过」，Pad 据此挑措辞（积分照常 / 也不加分）');
+
+/**
+ * ★ 预览必须和真正入账的结果一致 —— 这是这一段最要紧的一条。
+ *   两套规则的话，服务员照着预览跟客人打了包票，结果对不上。
+ */
+$rv = $vpApp->points()->grant('9404440002',
+    [['member_id' => $vpM, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $vpOp);
+eq(0, (int)$rv['entries'][0]['visits'],
+   '★★★ 实际入账果然是 0 次 —— 预览与结果一致（同一条代码路径）');
+
+// ── ③ 换一位没记过的客人，同一张单 → 照样会计次 ──
+$vpM2 = (int)$vpApp->members()->create('TK-00094402-VPB', null, null, null)['id'];
+eq(true, $vpApp->points()->visitPreview($vpM2, '9404440002')['counts_visit'],
+   '★★ ③ 同一张单换一位没记过的客人 → 会计次（判的是「这张卡」，不是「这张单」）');
+
+// ── ④ 兑换来的那一餐：不计次，理由不同 ──
+$vpDb->exec('UPDATE pos_order SET is_free_meal = 1 WHERE store_code = ? AND serial_id = ?',
+    [SMOKE_STORE, '9404440001']);
+$p4 = $vpApp->points()->visitPreview($vpM2, '9404440001');
+eq(false, $p4['counts_visit'], '④ 免费餐：不计次');
+eq('free_meal', $p4['reason'],
+   '  └ 理由是「兑换来的」而不是「已记过」—— 两句话不一样，说错了客人会更糊涂');
+$vpDb->exec('UPDATE pos_order SET is_free_meal = 0 WHERE store_code = ? AND serial_id = ?',
+    [SMOKE_STORE, '9404440001']);
+
+/**
+ * ── ⑤ 别的计次口径下【一律不提示】──
+ *
+ * by_portion 的次数 = 份数、by_order 恒为 1，都要等分配填完才知道，
+ * 而预览发生在填之前。宁可不说，也不能说一句还没算数的话 ——
+ * 说错的提示比没有提示更糟。
+ */
+$vpApp->cfg()->set('visit_count_mode', 'by_portion');
+eq(true, $vpApp->points()->visitPreview($vpM, '9404440002')['counts_visit'],
+   '★★ ⑤ by_portion 口径下不提示（次数取决于份数，这时还没填）');
+$vpApp->cfg()->set('visit_count_mode', 'by_order');
+eq(true, $vpApp->points()->visitPreview($vpM, '9404440002')['counts_visit'],
+   '  └ by_order 同理');
+$vpApp->cfg()->set('visit_count_mode', 'once_per_period');
+
+// ── ⑥ 订单不存在 → null，不能抛 ──
+eq(null, $vpApp->points()->visitPreview($vpM, '0000000000'),
+   '⑥ 订单不存在返回 null —— 查卡、发卡这些没有订单的场景照常用同一个接口');
+
+$vpIds = implode(',', [$vpM, $vpM2]);
+$vpDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$vpIds})", [SMOKE_STORE]);
+$vpDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$vpIds})", [SMOKE_STORE]);
+$vpDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$vpIds})", [SMOKE_STORE]);
+$vpDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '94044400%'", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

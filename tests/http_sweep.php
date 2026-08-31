@@ -276,6 +276,26 @@ ok($st === Api_NOT_FOUND, '/card/status 查不到的卡也回 422', brief($st, $
 [$st, $raw, $j] = req($BASE . '/api.php/card/status', 'POST', [], $padJar);
 ok(($j['error'] ?? '') === 'card_required', '/card/status 不给卡号时提示要先扫卡', brief($st, $raw, $j));
 
+/**
+ * ★ 「这一单会不会计次」的预览挂在查会员/查卡这条路上（visit_preview），
+ *   也就是说它【每次扫卡都会执行】。所以订单号无效时绝不能把查卡打挂 ——
+ *   一个只为提示服务的功能，不该有本事让收银台扫不了卡。
+ */
+[$st, $raw, $j] = req($BASE . '/api.php/card/lookup', 'POST',
+    ['card_no' => 'TK-99999999-ZZZ', 'serial_id' => '0000000000'], $padJar);
+ok($st === 422 && ($j['error'] ?? '') === 'card_unknown',
+   '★★ 带一个不存在的订单号去查卡：照旧 422 card_unknown，没被打成 500',
+   brief($st, $raw, $j));
+[$st, $raw, $j] = req($BASE . '/api.php/card/lookup', 'POST',
+    ['card_no' => 'TK-99999999-ZZZ', 'serial_id' => "1' OR '1'='1"], $padJar);
+ok($st === 422, '  └ 订单号里塞 SQL 也一样（参数化查询，不拼串）', brief($st, $raw, $j));
+ok(!preg_match('/SELECT|SQLSTATE|Stack trace|\.php/i', $raw),
+   '  └ 回给客户端的没有 SQL 也没有堆栈');
+
+[$st, $raw, $j] = req($BASE . '/api.php/member/search', 'POST',
+    ['type' => 'phone', 'value' => '600000000'], $padJar);
+ok(($j['ok'] ?? false) === true, '  └ 不带订单号查会员照常可用（visit_preview 为 null，不是报错）', brief($st, $raw, $j));
+
 // ── 6. 语言：服务端按请求头回话 ──────────────────────────
 group('⑦ 服务端按 X-Lang 回话');
 
