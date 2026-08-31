@@ -83,10 +83,31 @@ final class ConfigSchema
         ],
 
         // ── 积分规则 ────────────────────────────────────────
+        'points_mode' => [
+            'group' => 'points', 'type' => 'select',
+            'options' => [
+                'by_amount' => '按金额（花 1 欧元积 N 分）',
+                'by_visit'  => '按次数（来一次积 N 分）',
+            ],
+            'label' => '积分怎么算',
+            'desc'  => '★ 两种玩法，选一种：'
+                     . '【按金额】花得多攒得快，客人看到的是「87 分」这种跟消费额挂钩的数字；'
+                     . '【按次数】来得勤攒得快，客人看到的是「我来了 3 次」——'
+                     . '与十送一那张卡上的格子是同一件事，不用解释。'
+                     . '★ 选「按次数」之后，同一餐期第二单不计次、也就不积分（这是它的定义），'
+                     . 'Pad 上会把这句话说给收银员看',
+        ],
+        'points_per_visit' => [
+            'group' => 'points', 'type' => 'decimal', 'unit' => '分/次',
+            'label' => '来一次积几分',
+            'desc'  => '只在「按次数」口径下生效。填 1 就是「一次积一分」。',
+            'active_when' => ['key' => 'points_mode', 'value' => 'by_visit'],
+        ],
         'points_per_euro' => [
             'group' => 'points', 'type' => 'decimal', 'unit' => '分/€',
             'label' => '每欧元积几分',
             'desc'  => '消费 1 欧元得到多少积分',
+            'active_when' => ['key' => 'points_mode', 'value' => 'by_amount'],
         ],
         'points_multiplier' => [
             'group' => 'points', 'type' => 'decimal', 'unit' => '倍',

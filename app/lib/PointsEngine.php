@@ -497,6 +497,35 @@ final class PointsEngine
     }
 
     /**
+     * 按「来一次积几分」算积分（points_mode = by_visit）。
+     *
+     * ── 两种积分口径 ────────────────────────────────────
+     *
+     * | points_mode | 积分 = |
+     * |---|---|
+     * | `by_amount`（默认） | 金额 × 每欧元分数 × 倍率 —— 花得多攒得快 |
+     * | `by_visit`          | 计次数 × 每次分数 × 倍率 —— 来得勤攒得快 |
+     *
+     * 后者是店家可选的另一种玩法：客人看到的不再是「87 分」这种
+     * 跟消费额挂钩、需要换算的数字，而是「我来了 3 次」——
+     * 与十送一那张卡上的格子是同一件事，不用解释。
+     *
+     * ★ 没计上次就没有分。这是 by_visit 的定义（「一次积一分」），
+     *   不是漏算：同一餐期第二单不计次，那一单在这个口径下也不积分。
+     *   Pad 上必须把这句话说出来 —— 客人会问「我这单怎么一分没有」。
+     *
+     * ★ 倍率照旧叠加（全局 × 等级）。金卡 2 倍在这个口径下就是
+     *   「来一次积 2 分」，与 by_amount 下「同样金额拿双倍」是同一个心智模型。
+     */
+    public static function pointsForVisit(int $visits, float $perVisit, float $multiplier): int
+    {
+        if ($visits <= 0) {
+            return 0;
+        }
+        return (int)floor($visits * $perVisit * $multiplier);
+    }
+
+    /**
      * 订单是否可积分（硬性过滤，docs/03 §2.2）。
      *
      * @return array{ok:bool,reason:string}

@@ -261,8 +261,23 @@ final class ReconcileService
                     continue;
                 }
 
-                $pts     = (int)$e['points'];
-                $backPts = (int)ceil($pts * ($backAmt / max($amt, 1)));   // 向上取整
+                $pts = (int)$e['points'];
+                /**
+                 * ★ 退多少分，看积分口径。
+                 *
+                 *   by_amount：分是从金额来的，按退掉的金额比例退，向上取整（对商家有利）。
+                 *
+                 *   by_visit ：分是从【来过一次】来的，跟金额没有比例关系。
+                 *     照搬比例公式的话，`ceil(1 × 任意正比例)` 恒等于 1 ——
+                 *     哪怕只退了 5 分钱，那一次的分也整个没了，而客人确实来过。
+                 *     所以只在【整条被退干净】时才收回；部分缩水不动分。
+                 *
+                 *   两种口径下「计次」都不动（金额缩水不改变吃了几份套餐），
+                 *   见下面 counted_visit => 0。
+                 */
+                $backPts = $this->cfg->get('points_mode', 'by_amount') === 'by_visit'
+                    ? ($backAmt >= $amt ? $pts : 0)
+                    : (int)ceil($pts * ($backAmt / max($amt, 1)));   // 向上取整
 
                 $this->members->lockById((int)$e['member_id']);
                 $this->ledger->insert([

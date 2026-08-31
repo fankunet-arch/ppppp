@@ -375,10 +375,8 @@ final class PointsService
              *   收银员对着两个不一样的串，得自己判断是不是同一张。
              */
             'existing_ledger'    => array_map(function (array $l): array {
-                // cardNo 为 null = card_prefix 配错了，卡片功能整体停用。
-                // 那时原样输出 —— 记账不该因为少一个分组符就停摆（见构造函数说明）
-                if ($this->cardNo !== null && isset($l['card_no']) && $l['card_no'] !== null) {
-                    $l['card_no'] = $this->cardNo->format((string)$l['card_no']);
+                if (isset($l['card_no']) && $l['card_no'] !== null) {
+                    $l['card_no'] = $this->fmtCard((string)$l['card_no']);
                 }
                 return $l;
             }, $this->ledger->activeBySerial($o['serial_id'])),
@@ -646,6 +644,8 @@ final class PointsService
             $sumPortions = $v['sum_portions'];
 
             $perEuro    = $this->cfg->float('points_per_euro', 1.0);
+            $perVisit   = $this->cfg->float('points_per_visit', 1.0);
+            $pointsMode = $this->cfg->get('points_mode', 'by_amount');
             $multiplier = $this->cfg->float('points_multiplier', 1.0);
             $countMode  = $this->cfg->get('visit_count_mode', 'once_per_period');
 
@@ -661,14 +661,13 @@ final class PointsService
                 }
 
                 /**
-                 * 卡片等级的积分倍率，叠在全局倍率之上：
-                 *   积分 = 金额 × 每欧元分数 × 全局倍率 × 本等级倍率
+                 * 卡片等级的积分倍率，叠在全局倍率之上。
                  *
                  * 逐人查而不是提到循环外：同一单里不同的人可能拿着不同等级的卡
                  * （一桌四个人，两个金卡两个普卡是很常见的）。
                  */
-                $tier   = $this->tiers->forMember($memberId);
-                $points = PE::pointsFor($amt, $perEuro, $multiplier * $tier['multiplier']);
+                $tier = $this->tiers->forMember($memberId);
+
                 // by_portion：按 counts_visit=1 菜品的份数计次
                 // by_ledger ：每笔流水最多 1 次
                 // ★ 免费餐 / 核销单不计次：那一餐是兑换来的，
@@ -676,6 +675,21 @@ final class PointsService
                 //   金额可以照常积分（取决于 free_meal_extra_earns），但次数不给。
                 $visits = $freeish ? 0
                         : $this->visitsFor($countMode, $memberId, $prt, $amt, (string)$order['order_end_time']);
+
+                /**
+                 * ★ 积分口径（points_mode）—— 必须放在算完 $visits 之后。
+                 *
+                 *   by_amount（默认）：金额 × 每欧元分数 × 全局倍率 × 等级倍率
+                 *   by_visit        ：计次数 × 每次分数   × 全局倍率 × 等级倍率
+                 *
+                 *   后者「没计上次就没有分」是定义而不是漏算 ——
+                 *   同一餐期第二单不计次，那一单在这个口径下也不积分。
+                 *   Pad 上会把这句话说出来（done.noVisit 按口径换措辞），
+                 *   否则客人问「我这单怎么一分没有」时收银员答不上来。
+                 */
+                $points = $pointsMode === 'by_visit'
+                    ? PE::pointsForVisit($visits, $perVisit, $multiplier * $tier['multiplier'])
+                    : PE::pointsFor($amt, $perEuro, $multiplier * $tier['multiplier']);
 
                 $lid = $this->ledger->insert([
                     'member_id'          => $memberId,
@@ -706,7 +720,10 @@ final class PointsService
                 $entries[] = [
                     'ledger_id' => $lid,
                     'member_id' => $memberId,
-                    'card_no'   => $member['card_no'],
+                    // ★ 走 format：库里存的是去连字符的串，而 Pad 上别处显示的都是
+                    //   分组形态。同一张卡在两个屏幕上长得不一样，收银员得自己判断
+                    //   是不是同一张（docs/03 §3.1ter）。cardNo 为 null 时原样输出。
+                    'card_no'   => $this->fmtCard((string)$member['card_no']),
                     'amount'    => Money::toStr($amt),
                     'points'    => $points,
                     'visits'    => $visits,
@@ -998,18 +1015,17 @@ final class PointsService
     }
 
     /**
-     * 记账之后看一眼有没有值得留痕的形状 —— 【只告警，不拦】。
+     * 卡号 → 显示形态。cardNo 为 null（card_prefix 配错）时原样输出。
      *
-     * ★ 这是唯一能管住内部人的东西。
-     *
-     *   上面那两道闸门都建立在「收银员是诚实的」之上，可员工本人就是
-     *   收银员，他要么有经理 PIN，要么干脆就是经理。对内部作案，
-     *   事前拦截在结构上就是无效的 —— 能做的只有让它留下痕迹，
-     *   并且让这个痕迹每周有人看一眼。
-     *
-     *   所以这里绝不返回错误、绝不影响记账结果，异常也吞掉：
-     *   风控的副作用不该把已经算好的积分弄回滚。
+     * ★ 存在的理由：库里存的是归一化后的串（TK000002751A2），
+     *   而每一个出口都该发分组形态（TK-00000275-1A2）。
+     *   漏了一处的后果不是报错，是同一张卡在两个屏幕上长得不一样。
      */
+    private function fmtCard(string $cardNo): string
+    {
+        return $this->cardNo !== null ? $this->cardNo->format($cardNo) : $cardNo;
+    }
+
     /**
      * 主库时间 —— 拿不到就回落到本地时间。
      *
@@ -1115,6 +1131,19 @@ final class PointsService
         }
     }
 
+    /**
+     * 记账之后看一眼有没有值得留痕的形状 —— 【只告警，不拦】。
+     *
+     * ★ 这是唯一能管住内部人的东西。
+     *
+     *   上面那两道闸门都建立在「收银员是诚实的」之上，可员工本人就是
+     *   收银员，他要么有经理 PIN，要么干脆就是经理。对内部作案，
+     *   事前拦截在结构上就是无效的 —— 能做的只有让它留下痕迹，
+     *   并且让这个痕迹每周有人看一眼。
+     *
+     *   所以这里绝不返回错误、绝不影响记账结果，异常也吞掉：
+     *   风控的副作用不该把已经算好的积分弄回滚。
+     */
     private function riskWatch(array $memberIds, array $operator): void
     {
         try {
@@ -1352,12 +1381,25 @@ final class PointsService
 
             // 手工录入也套等级倍率 —— 否则同一位客人「系统查不到订单」时
             // 反而少拿分，这种不一致最难跟客人解释
-            $tier   = $this->tiers->forMember($memberId);
-            $points = PE::pointsFor(
-                $amountCents,
-                $this->cfg->float('points_per_euro', 1.0),
-                $this->cfg->float('points_multiplier', 1.0) * $tier['multiplier']
-            );
+            $tier = $this->tiers->forMember($memberId);
+            $mult = $this->cfg->float('points_multiplier', 1.0) * $tier['multiplier'];
+
+            /**
+             * ★ by_visit 口径下，手工录入按【一次】算分。
+             *
+             *   手工录入没有明细，判断不出套餐份数，所以 counted_visit 一直是 0
+             *   （见下面那一行的说明）。若照搬「没计次就没分」，
+             *   手工录入在这个口径下会永远得 0 分 ——
+             *   而它正是 POS 不可达时的降级路径（docs/03 §10），
+             *   给 0 分等于那条路废掉。
+             *
+             *   所以：算分按 1 次算，计次仍然是 0。
+             *   两者不一致是有意的 —— 分是「这顿饭该给的」，
+             *   次是「我们能证明的」，手工录入证明不了。
+             */
+            $points = $this->cfg->get('points_mode', 'by_amount') === 'by_visit'
+                ? PE::pointsForVisit(1, $this->cfg->float('points_per_visit', 1.0), $mult)
+                : PE::pointsFor($amountCents, $this->cfg->float('points_per_euro', 1.0), $mult);
 
             $lid = $this->ledger->insert([
                 'member_id'     => $memberId,

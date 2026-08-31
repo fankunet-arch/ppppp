@@ -493,7 +493,9 @@ CREATE TABLE `sys_config` (
 | key | 默认值 | 说明 |
 |---|---|---|
 | `order_lookup_window_min` | `30` | 订单查找时间窗（分钟） |
-| `points_per_euro` | `1` | 每 1 欧元积分数 |
+| `points_mode` | `by_amount` | 积分口径：`by_amount`=按金额／`by_visit`=一次积一分。见 `03` §2.4 |
+| `points_per_euro` | `1` | 每 1 欧元积分数（仅 `by_amount` 口径生效） |
+| `points_per_visit` | `1.0` | 来一次积几分（仅 `by_visit` 口径生效） |
 | `points_multiplier` | `1.0` | 积分倍率（1.0 = 不启用） |
 | `points_include_tax` | `1` | 积分按含税价（已确认为 1） |
 | `free_meal_extra_earns` | `0` | 免费餐当次的额外消费（饮料甜品）是否计金额积分 |

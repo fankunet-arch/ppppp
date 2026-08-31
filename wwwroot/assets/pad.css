@@ -236,8 +236,10 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
   display: block;
 }
 .card:focus-visible { outline: 2px solid var(--primary); }
-.card .amount { font-size: 24px; font-weight: 700; }
-.card .meta { color: var(--muted); font-size: 14px; margin-top: 4px; }
+.card .amount { font-size: 30px; font-weight: 700; }
+/* 0 次时大字不能长得像成功 —— 变灰，让下面那行橙字去解释为什么 */
+.card .amount.zero { color: var(--muted); font-weight: 600; }
+.card .meta { color: var(--muted); font-size: 14px; margin-top: 4px; font-variant-numeric: tabular-nums; }
 .card.disabled { opacity: .55; }
 
 .summary {

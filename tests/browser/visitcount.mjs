@@ -58,6 +58,13 @@ const F = JSON.parse(php(`
 `));
 
 setCfg('visit_count_mode', 'once_per_period');
+/**
+ * ★ 积分口径也要钉死。
+ *   下面 ③ 断言的是「不计次，但钱花了照样给分」—— 那是【按金额】口径特有的行为。
+ *   按次数口径下同一餐期第二单是【一分都没有】，两者结论正好相反。
+ *   不钉的话，这个文件的绿灯就取决于机器上恰好留着哪种口径。
+ */
+setCfg('points_mode', 'by_amount');
 setCfg('late_grant_minutes', 0);
 setCfg('max_grants_per_period', 0);
 /**
@@ -104,7 +111,7 @@ const grant = async (table, people, cards) => {
   await page.click('#btn-aa');
   await page.waitForTimeout(800);
   for (let i = 0; i < cards.length; i++) {
-    await page.locator('#assign-people .person').nth(i).locator('button').first().click();
+    await page.locator('#assign-people .person:not(.locked)').nth(i).locator('button').first().click();
     await page.waitForSelector('#member-modal:not([hidden])', { timeout: 5000 });
     await page.fill('#member-input', cards[i]);
     await page.click('#btn-member-search');
@@ -179,7 +186,7 @@ ok(visitsOf(F.midA) === 1, '★★★ 同一餐期第二单【不再计次】，
 const done = await page.locator('#done-body').textContent();
 ok(/本餐期已记过|只记积分不计次/.test(done),
    `★★★ 结果页明说了为什么：「${done.replace(/\s+/g, ' ').trim().slice(0, 70)}…」`);
-ok(/计次 \+0/.test(done), '  └ 计次那一栏写的是 +0，不是含糊带过');
+ok(/\+0 次/.test(done), '  └ 计次是大字那一行，明写 +0，不是含糊带过');
 
 const ptsA = parseInt(php(`
   require "app/bootstrap.php";

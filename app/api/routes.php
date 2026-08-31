@@ -113,6 +113,9 @@ $padSettings = static function () use ($app): array {
     $out = [
         // 关闭时 Pad 完全不显示手机号/邮箱/生日输入框，后端也拒收
         'collect_pii' => $app->cfg()->bool('member_collect_pii', false),
+        // ★ 结果页要按口径换措辞：by_visit 下「不计次」等于「一分没有」，
+        //   照着 by_amount 那句「只记积分不计次」念出来是错的
+        'points_mode' => $app->cfg()->get('points_mode', 'by_amount'),
         // 还没选过语言的账号用这个；已选过的以 operator.lang 为准
         'default_lang'       => \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK)),
         'langs'              => \Vip\Lang::ALL,

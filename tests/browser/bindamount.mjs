@@ -238,7 +238,25 @@ const after = JSON.parse(php(`
 ok(after.a === 1 && after.b === 1,
    `★★ 两位各记 1 次（A=${after.a}、B=${after.b}）—— 一人一份钱，一人一次`);
 
-console.log('\n【⑥ 绕开界面直接调接口，服务端照样拒】');
+console.log('\n【⑥ 结果页：大字是次数，积分退到小字】');
+/**
+ * ★ 十送一是这张卡的全部价值，客人真正在数的是「我来了几次」。
+ *   积分是一个要换算的数字（「87 分是多少？」）——
+ *   把它摆在最大号字上，客人和服务员的注意力都被引到了不重要的那个数上。
+ */
+const bigTxt = (await page.locator('#done-body .card .amount').first().textContent() || '').trim();
+const metaTxt = (await page.locator('#done-body .card .meta').first().textContent() || '').trim();
+ok(/^\+\d+\s*次$/.test(bigTxt), `★★★ 大字是次数：「${bigTxt}」`);
+ok(/\+\d+\s*分/.test(metaTxt), `★★★ 积分在小字那一行：「${metaTxt}」`);
+ok(!/分/.test(bigTxt), '  └ 大字里没有「分」—— 两个数不能抢同一个位置');
+const bigPx = await page.evaluate(() =>
+  parseFloat(getComputedStyle(document.querySelector('#done-body .card .amount')).fontSize));
+const metaPx = await page.evaluate(() =>
+  parseFloat(getComputedStyle(document.querySelector('#done-body .card .meta')).fontSize));
+ok(bigPx >= metaPx * 1.5,
+   `★★ 大字确实比小字大（${bigPx}px vs ${metaPx}px）—— 主次是靠字号分出来的，不是靠位置`);
+
+console.log('\n【⑦ 绕开界面直接调接口，服务端照样拒】');
 /**
  * ★ 前面拦的都是界面。界面拦得住手滑，拦不住有心人 ——
  *   Pad 是一台放在柜台上的安卓平板，浏览器地址栏、开发者工具都够得着。
