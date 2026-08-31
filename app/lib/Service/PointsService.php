@@ -42,7 +42,21 @@ final class PointsService
         private BusinessDay $bizDay,
         private \Vip\Repo\CardTierRepo $tiers,
         private \Vip\MealPeriod $periods,
-        private \Vip\CardNumber $cardNo,
+        /**
+         * ★ 可空。这里只拿它把 existing_ledger 的卡号格式化成显示形态
+         *   （docs/03 §3.1ter：同一张卡不能在两个屏幕上长得不一样）。
+         *
+         *   ★★ 记账路径【不能】因为卡号格式化而整条挂掉。
+         *   card_prefix 配错时 CardNumber 构造即抛，如果这里是必填的，
+         *   App::points() 就构造不出来 —— 实测那会让
+         *   /order/locate、/order/locate-invoice、/points/grant、/points/manual
+         *   全部 500：收银员登得进去，一单也记不了。
+         *   而 docs/03 §10 立的规矩是「不阻塞收银流程」。
+         *
+         *   为 null 时卡号原样输出（未格式化的串仍然是可读的，
+         *   只是少了连字符）—— 少一个分组符，远好过整个收银台停摆。
+         */
+        private ?\Vip\CardNumber $cardNo = null,
     ) {
     }
 
@@ -361,7 +375,9 @@ final class PointsService
              *   收银员对着两个不一样的串，得自己判断是不是同一张。
              */
             'existing_ledger'    => array_map(function (array $l): array {
-                if (isset($l['card_no']) && $l['card_no'] !== null) {
+                // cardNo 为 null = card_prefix 配错了，卡片功能整体停用。
+                // 那时原样输出 —— 记账不该因为少一个分组符就停摆（见构造函数说明）
+                if ($this->cardNo !== null && isset($l['card_no']) && $l['card_no'] !== null) {
                     $l['card_no'] = $this->cardNo->format((string)$l['card_no']);
                 }
                 return $l;

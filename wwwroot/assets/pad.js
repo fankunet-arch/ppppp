@@ -368,6 +368,24 @@ function applySettings() {
    */
   const mb = $('#btn-merge-start');
   if (mb) { mb.hidden = !(S.operator && S.operator.is_manager); }
+
+  /**
+   * ★ 卡片功能整体停用时，顶栏挂一条常驻红条。
+   *
+   *   card_prefix 配错时，查卡/建卡/激活/换卡都做不了（服务端 cards_ok=false）。
+   *   记账不受影响 —— 那是刻意的降级，不能让收银台整个停摆。
+   *   但【必须说出来】：不说的话现场看到的是「扫卡没反应」，
+   *   而那和「卡坏了」「扫码头脏了」长得一模一样，能查半天。
+   */
+  const cw = $('#cards-warn');
+  if (cw) {
+    const bad = S.settings.cards_ok === false;
+    cw.hidden = !bad;
+    if (bad) {
+      cw.textContent = T('warn.cardsOff', { why: S.settings.cards_error || '' });
+    }
+  }
+
   const box = $('#new-contact');
   if (!box) return;
   if (S.settings.collect_pii) return;      // 开启时保持原样

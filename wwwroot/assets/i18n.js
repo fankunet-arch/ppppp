@@ -103,6 +103,8 @@
      *   （服务端按角色砍字段，见 api/routes.php 的 locate-invoice）。
      *   留着它们是因为查错和对账要分得清，不是给收银台用的。
      */
+    'warn.cardsOff':      { zh: '⚠ 实体卡功能已停用（查卡 / 建卡 / 激活 / 换卡都做不了）——记积分不受影响。请让经理检查后台配置的卡号前缀。{why}',
+                            es: '⚠ Las tarjetas físicas están desactivadas (no se puede consultar, crear, activar ni sustituir). Los puntos sí se registran. Pida al encargado que revise el prefijo de tarjeta. {why}' },
     'lookup.invoiceUnavailable': { zh: '订单不存在或已超过时效，请联系经理处理',
                             es: 'El ticket no existe o está fuera de plazo; avise al encargado' },
     /**

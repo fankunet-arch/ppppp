@@ -73,6 +73,10 @@ $appVersion = vip_app_version([
     <button id="btn-logout" class="link" data-i18n="top.logout">退出</button>
   </header>
 
+  <!-- 卡片功能整体停用时的常驻红条（card_prefix 配错）。
+       记积分不受影响 —— 但「扫卡没反应」和「卡坏了」长得一样，必须说破 -->
+  <p id="cards-warn" class="err" hidden></p>
+
   <!-- 步骤 1：找订单。两条路并存：有小票就输票号（精确），没有就输桌号 -->
   <div id="step-table" class="step active">
     <h2 data-i18n="step1.title">① 找订单</h2>

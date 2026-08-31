@@ -1880,6 +1880,40 @@ $mkOrder = function (string $serial, int $ohid, string $table, string $amt, stri
     $rkPos->addDetail($ohid, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', $amt, 2)]);
 };
 $nowTs = time();
+
+/**
+ * ★★★ 把营业日切点挪到「一小时后的整点」，让这一段【不依赖跑测试的时刻】。
+ *
+ * ── 为什么要动它 ────────────────────────────────────
+ * 下面第四张单是 `now − 5 小时`（「捡小票」的形状），而 riskWatch() 统计的
+ * 窗口是【今天的营业日】（默认切点 02:00）。只要跑测试的本地时刻落在
+ * 02:00–07:00，这张单就归到昨天的营业日、被窗口排除，跨度从 5 小时缩成
+ * 5 分钟，grant_span_wide 不触发，断言就红。
+ *
+ * 实测同一份代码、同一台机器，只改时区（也就是只改「现在几点」）：
+ *     UTC            07:29  ✓
+ *     Europe/Madrid  09:29  ✓
+ *     Asia/Shanghai  15:30  ✓
+ *     America/NY     03:30  ✗   ← 就是这个窗口
+ *
+ * ★ 产品行为是对的 —— 02:00 之前结账的单本来就属于前一个营业日
+ *   （docs/01 §5.2）。错的是夹具拿「现在」当锚点。
+ *
+ * ── 为什么不是把单挪进营业日窗口 ──────────────────
+ * 挪不进去：现在若是 03:00，今天的营业日才开始一小时，
+ * 根本放不下一个 6 小时的跨度。这不是夹具能绕开的，
+ * 是「那个时刻本来就看不到宽跨度」。
+ *
+ * 所以改成让测试自己定切点：切点 = 一小时后的整点，
+ * 于是今天的营业日从【昨天的那个时刻】开始，
+ * 无论现在几点，`now − 5 小时` 都稳稳落在里面。
+ * 跑完在本段末尾还原。
+ */
+$rkCutoff0 = $rk->cfg()->get('business_day_cutoff', '02:00');
+$rk->cfg()->set('business_day_cutoff', date('H:00', $nowTs + 3600));
+// ★ 这时候 BusinessDay 还没被构造过（它是懒建的，第一次用在下面的 locate/grant），
+//   所以先改配置就够了，不用重建 App
+
 $mkOrder('9909990001', 990001, 'R1', '47.80', date('Y-m-d H:i:s', $nowTs - 120));
 $mkOrder('9909990002', 990002, 'R2', '47.80', date('Y-m-d H:i:s', $nowTs - 300));
 $mkOrder('9909990003', 990003, 'R3', '47.80', date('Y-m-d H:i:s', $nowTs - 420));
@@ -2037,6 +2071,7 @@ eq(4, (int)$rkDb->value(
     [SMOKE_STORE, $rkMid]), '★★ 告警不影响记账 —— 四笔都记上了，只是后台多了两条待处理');
 
 // 清理
+$rk->cfg()->set('business_day_cutoff', $rkCutoff0);   // 还原切点（上面为了不看钟点才改的）
 $rkDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type LIKE ?', [SMOKE_STORE, 'grant_%']);
 $rkDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $rkMid]);
 $rkDb->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $rkMid]);
@@ -2778,6 +2813,73 @@ $npDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id IN (?,?)', [SMO
 $npDb->exec('DELETE FROM member WHERE store_code=? AND id IN (?,?)', [SMOKE_STORE, $npM1, $npM2]);
 $npDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id IN (?,?,?)',
             [SMOKE_STORE, '9303331001', '9303331002', '9303331003']);
+
+step('㉙ 卡片功能坏掉，记账必须还能用');
+
+/**
+ * ★ card_prefix 配错（含 I/L/O/U）时 CardNumber 构造即抛 —— 那是对的。
+ *   但它一度把【整条收银流程】一起拖下水：
+ *
+ *     /auth/login          ❌ 500（CardService 在登录响应里构造）
+ *     /order/locate        ❌ 500（App::points() 的构造参数带着 cardNumber()）
+ *     /order/locate-invoice ❌ 500
+ *     /points/grant        ❌ 500
+ *     /points/manual       ❌ 500
+ *
+ *   收银员登得进去、一单也记不了 —— 从柜台的角度看，
+ *   与「登不进去」没有实质差别，只是把失败点往后挪了一步。
+ *   而 docs/03 §10 立的规矩是「不阻塞收银流程」。
+ *
+ *   现在 PointsService 对 CardNumber 是【可空】依赖（它只拿它把
+ *   existing_ledger 的卡号格式化成显示形态），为 null 时原样输出 ——
+ *   少一个分组符，远好过整个收银台停摆。
+ */
+$bpApp = new App([
+    'store_code'  => SMOKE_STORE,
+    'local_db'    => $dbCfg,
+    'pos_db'      => [],
+    'card_prefix' => 'VIP',          // ★ 含 I —— 非法
+]);
+$bpCaught = null;
+try { $bpApp->cardNumber(); } catch (\InvalidArgumentException $e) { $bpCaught = $e->getMessage(); }
+ok($bpCaught !== null, '① 非法前缀下 cardNumber() 确实会抛（卡片功能该停就停）');
+eq(null, $bpApp->cardNumberOrNull(), '  └ 而 cardNumberOrNull() 返回 null，不抛');
+
+$bpPos = new FakePosSource();
+$bpPos->now = date('Y-m-d H:i:s');
+$bpEnd = date('Y-m-d H:i:s', strtotime($bpPos->now) - 300);
+$bpPos->addHead([
+    'serial_id' => '9202220001', 'order_head_id' => 920001, 'check_id' => 1,
+    'table_name' => 'BADP', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => $bpEnd,
+]);
+$bpPos->addDetail(920001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$bpApp->setPosSource($bpPos);
+$bpApp->cfg()->set('late_grant_minutes', '0');
+$bpApp->cfg()->set('max_grants_per_period', '0');
+
+$bpLoc = $bpApp->points()->locate('BADP', 600);
+ok(($bpLoc['ok'] ?? false) && ($bpLoc['candidates'] !== []),
+   '★★★ ② 前缀非法时【找单照常】—— App::points() 构造得出来');
+
+$bpMid = (int)$bpApp->members()->create('TK-00092201-BDP', null, null, null)['id'];
+$bpG = $bpApp->points()->grant('9202220001',
+    [['member_id' => $bpMid, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT,
+    ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true]);
+ok($bpG['ok'] ?? false,
+   '★★★ ③ 记账也照常 —— 卡片功能停用不该让收银台整个停摆（docs/03 §10）');
+
+$bpLoc2 = $bpApp->points()->locate('BADP', 600);
+$bpLed  = $bpLoc2['candidates'][0]['existing_ledger'] ?? [];
+ok($bpLed !== [] && !str_contains((string)($bpLed[0]['card_no'] ?? ''), '-'),
+   '  └ 卡号原样输出（没有分组连字符）—— 少一个符号，好过整条路 500');
+
+$db->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $bpMid]);
+$db->exec('DELETE FROM coupon WHERE store_code=? AND member_id=?', [SMOKE_STORE, $bpMid]);
+$db->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $bpMid]);
+$db->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, '9202220001']);
 
 step('⑬ 不变量总校验');
 
