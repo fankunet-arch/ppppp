@@ -2881,6 +2881,112 @@ $db->exec('DELETE FROM coupon WHERE store_code=? AND member_id=?', [SMOKE_STORE,
 $db->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $bpMid]);
 $db->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, '9202220001']);
 
+step('㉚ 积分口径：按次数（points_mode = by_visit）');
+
+/**
+ * ★ 店家可选的第二种玩法：一次积一分。
+ *
+ *   客人看到的不再是「87 分」这种跟消费额挂钩、需要换算的数字，
+ *   而是「我来了 3 次」—— 与十送一那张卡上的格子是同一件事。
+ *
+ *   这一段要钉三件事：
+ *     ① 同样一单，两种口径给出的分数不同（口径真的生效了）
+ *     ② 没计上次就没有分（那是定义，不是漏算）
+ *     ③ 手工录入【例外】—— 它证明不了份数所以计次为 0，
+ *        但仍按一次给分，否则 POS 挂掉时的降级路径就废了
+ */
+$pvApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$pvDb  = $pvApp->localDb();
+$pvApp->cfg()->set('late_grant_minutes', '0');
+$pvApp->cfg()->set('max_grants_per_period', '0');
+$pvApp->cfg()->set('visit_count_mode', 'once_per_period');
+$pvApp->cfg()->set('points_multiplier', '1.0');
+$pvApp->cfg()->set('points_per_euro', '1.0');
+$pvApp->cfg()->set('points_per_visit', '1.0');
+
+$pvPos = new FakePosSource();
+$pvPos->now = date('Y-m-d H:i:s');
+$pvMk = function (string $ser, int $ohid, string $table, string $when) use ($pvPos) {
+    $pvPos->addHead([
+        'serial_id' => $ser, 'order_head_id' => $ohid, 'check_id' => 1,
+        'table_name' => $table, 'eat_type' => 0, 'customer_num' => 2,
+        'original_amount' => '71.70', 'should_amount' => '71.70', 'actual_amount' => '71.70',
+        'order_end_time' => $when,
+    ]);
+    $pvPos->addDetail($ohid, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '71.70', 3)]);
+};
+$pvNow = strtotime($pvPos->now);
+$pvMk('9101110001', 910001, 'PV1', date('Y-m-d H:i:s', $pvNow - 300));
+$pvMk('9101110002', 910002, 'PV2', date('Y-m-d H:i:s', $pvNow - 240));   // 同一餐期的第二单
+$pvApp->setPosSource($pvPos);
+foreach (['PV1', 'PV2'] as $t) { $pvApp->points()->locate($t, 600); }
+
+$pvOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true];
+
+// ── ① 同一单，两种口径分数不同 ──
+$pvApp->cfg()->set('points_mode', 'by_amount');
+$pvA = (int)$pvApp->members()->create('TK-00091101-PVA', null, null, null)['id'];
+$rA = $pvApp->points()->grant('9101110001',
+    [['member_id' => $pvA, 'amount_cents' => 7170, 'portions' => 3]],
+    Vip\PointsEngine::MODE_SPLIT, $pvOp);
+eq(71, (int)$rA['entries'][0]['points'], '① by_amount：€71.70 → 71 分');
+eq(1, (int)$rA['entries'][0]['visits'], '  └ 计次 1');
+
+$pvApp->cfg()->set('points_mode', 'by_visit');
+$pvB = (int)$pvApp->members()->create('TK-00091102-PVB', null, null, null)['id'];
+$rB = $pvApp->points()->grant('9101110002',
+    [['member_id' => $pvB, 'amount_cents' => 7170, 'portions' => 3]],
+    Vip\PointsEngine::MODE_SPLIT, $pvOp);
+eq(1, (int)$rB['entries'][0]['points'], '★★★ ② by_visit：同样一单 €71.70 → 只有 1 分（来了一次）');
+eq(1, (int)$rB['entries'][0]['visits'], '  └ 计次照旧 1');
+
+// ── ② 同一餐期第二单：不计次，也就不加分 ──
+$pvMk('9101110003', 910003, 'PV3', date('Y-m-d H:i:s', $pvNow - 180));
+$pvApp->points()->locate('PV3', 600);
+$rB2 = $pvApp->points()->grant('9101110003',
+    [['member_id' => $pvB, 'amount_cents' => 7170, 'portions' => 3]],
+    Vip\PointsEngine::MODE_SPLIT, $pvOp);
+ok($rB2['ok'], '同一餐期第二单照样记得上（不是拒绝）');
+eq(0, (int)$rB2['entries'][0]['visits'], '  └ 计次 0（一张卡一个餐期最多 1 次）');
+eq(0, (int)$rB2['entries'][0]['points'],
+   '★★★ ③ by_visit 下第二单【一分都没有】—— 这是「一次积一分」的定义，不是漏算');
+
+/**
+ * ★ 而 by_amount 下第二单是有分的。两种口径在这一点上行为相反，
+ *   所以 Pad 的提示语必须跟着换（done.noVisit / done.noVisitByVisit）。
+ */
+$pvApp->cfg()->set('points_mode', 'by_amount');
+$pvMk('9101110004', 910004, 'PV4', date('Y-m-d H:i:s', $pvNow - 120));
+$pvApp->points()->locate('PV4', 600);
+$rA2 = $pvApp->points()->grant('9101110004',
+    [['member_id' => $pvA, 'amount_cents' => 7170, 'portions' => 3]],
+    Vip\PointsEngine::MODE_SPLIT, $pvOp);
+eq(0, (int)$rA2['entries'][0]['visits'], '对照：by_amount 下第二单也不计次');
+eq(71, (int)$rA2['entries'][0]['points'],
+   '★★ 但 by_amount 下【照样给 71 分】—— 两种口径在这里行为相反，界面措辞必须跟着换');
+
+// ── ③ 手工录入：by_visit 下按一次给分，但仍不计次 ──
+$pvApp->cfg()->set('points_mode', 'by_visit');
+$pvApp->cfg()->set('points_per_visit', '5.0');
+$pvC = (int)$pvApp->members()->create('TK-00091103-PVC', null, null, null)['id'];
+$rM = $pvApp->points()->manualGrant($pvC, 5000, 'system_not_found',
+    ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'approved_by' => 1]);
+ok($rM['ok'] ?? false, '手工录入成功');
+eq(5, (int)($rM['points'] ?? 0),
+   '★★★ ④ by_visit 下手工录入按【一次】给分（5 分/次）—— 否则 POS 挂掉时降级路径就废了');
+eq(0, (int)$pvDb->value('SELECT counted_visit FROM point_ledger WHERE store_code=? AND id=?',
+                        [SMOKE_STORE, (int)$rM['ledger_id']]),
+   '  └ 但计次仍然是 0 —— 手工录入证明不了吃了几份套餐');
+
+// 复原并清理
+$pvApp->cfg()->set('points_mode', 'by_amount');
+$pvApp->cfg()->set('points_per_visit', '1.0');
+$pvIds = implode(',', [$pvA, $pvB, $pvC]);
+$pvDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$pvIds})", [SMOKE_STORE]);
+$pvDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$pvIds})", [SMOKE_STORE]);
+$pvDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pvIds})", [SMOKE_STORE]);
+$pvDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '91011100%'", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

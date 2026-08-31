@@ -417,3 +417,25 @@ T::false(PE::isRedeemLine('MENÚ INFINITY NOCHE'), '带多字节字符不误判�
 // 业务路径上的其它 mb_* 也要有回落
 T::true(str_contains((string)file_get_contents(__DIR__ . '/../../app/lib/Repo/AlertRepo.php'), "function_exists('mb_substr')"),
     'AlertRepo 的截断有 mb_substr 缺失回落（告警写入在业务路径上）');
+
+T::group('积分口径 · 按次数（points_mode = by_visit）');
+
+/**
+ * 店家可选的第二种玩法：客人看到的不是「87 分」这种要换算的数字，
+ * 而是「我来了 3 次」—— 与十送一那张卡上的格子是同一件事，不用解释。
+ */
+T::eq(1, PE::pointsForVisit(1, 1.0, 1.0), '一次积一分');
+T::eq(3, PE::pointsForVisit(3, 1.0, 1.0), 'by_portion 口径下一单 3 次 → 3 分');
+T::eq(2, PE::pointsForVisit(1, 1.0, 2.0), '★ 金卡 2 倍 → 来一次积 2 分（倍率照旧叠加）');
+T::eq(5, PE::pointsForVisit(1, 5.0, 1.0), '每次 5 分也行（points_per_visit 可配）');
+T::eq(7, PE::pointsForVisit(1, 2.5, 3.0), '向下取整：1 × 2.5 × 3 = 7.5 → 7');
+
+/**
+ * ★ 没计上次就没有分 —— 这是 by_visit 的定义，不是漏算。
+ *   同一餐期第二单不计次，那一单在这个口径下也不积分。
+ */
+T::eq(0, PE::pointsForVisit(0, 1.0, 1.0), '★★★ 0 次 → 0 分（「一次积一分」的另一半）');
+T::eq(0, PE::pointsForVisit(-1, 1.0, 1.0), '负数（撤销流水的形状）也返回 0，不倒扣');
+
+// 两种口径互不影响
+T::eq(71, PE::pointsFor(7170, 1.0, 1.0), '按金额那条路没被动过：€71.70 → 71 分');

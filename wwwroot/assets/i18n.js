@@ -153,6 +153,14 @@
                             es: '<b>Una tarjeta suma 1 visita por servicio.</b> Si en una mesa de 4 hay 4 tarjetas, se apuntan las 4 (1 visita cada una); si solo hay 2, solo esas 2 — las visitas restantes no se pasan a las tarjetas presentes.' },
     'done.noVisit':       { zh: '本餐期已记过 1 次，这一单只记积分不计次',
                             es: 'Ya tenía su visita en este servicio: este apunte suma puntos pero no visita' },
+    /**
+     * ★ 「按次数」口径下这句话必须换。
+     *   那个口径下积分就是从次数来的 —— 不计次就是一分都没有。
+     *   还照着说「只记积分不计次」的话，客人问「那我的分呢」，
+     *   收银员照着屏幕念出来的就是错的。
+     */
+    'done.noVisitByVisit':{ zh: '本餐期已记过 1 次 —— 按次数积分，所以这一单不计次也不加分',
+                            es: 'Ya tenía su visita en este servicio. Con los puntos por visita, este apunte no suma ni visita ni puntos' },
     'mode3.desc':         { zh: '每位客人认领自己点的菜',
                             es: 'Cada cliente elige los platos que pidió' },
     'order.avail':        { zh: '可分配',      es: 'a repartir' },
@@ -257,9 +265,10 @@
     /* ── 步骤 5：完成 ─────────────────────────────────── */
     'done.title':         { zh: '✓ 记账完成',  es: '✓ Listo' },
     'done.next':          { zh: '下一单',      es: 'Siguiente ticket' },
-    'done.points':        { zh: '+{points} 分', es: '+{points} pts' },
-    'done.meta':          { zh: '{card} · € {amount} · 计次 +{visits}',
-                            es: '{card} · € {amount} · +{visits} visitas' },
+    'done.visits':        { zh: '+{n} 次', es: '+{n} visita(s)' },
+    // ★ 积分退到小字里 —— 大字留给次数（十送一是这张卡的全部价值）
+    'done.meta':          { zh: '{card} · € {amount} · +{points} 分',
+                            es: '{card} · € {amount} · +{points} pts' },
     'done.granted':       { zh: '🎁 +{n} 张免费券', es: '🎁 +{n} vales gratis' },
     'done.grantedMeta':   { zh: '{card} 已达标，请告知客人下次可用',
                             es: '{card} ha llegado al objetivo, avísele para la próxima vez' },

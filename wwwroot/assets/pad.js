@@ -1390,10 +1390,21 @@ $('#btn-submit').onclick = async () => {
  * 各写一份的话，改一处忘一处，现场表现是「合并记账不显示发券提示」。
  */
 function renderDone(d) {
+  /**
+   * ★ 大字是【次数】，积分退到小字。
+   *
+   *   十送一是这张卡的全部价值，客人真正在数的是「我来了几次」。
+   *   而积分是一个要换算的数字（「87 分是多少？」），
+   *   把它摆在最大号字上，客人和服务员的注意力都被引到了不重要的那个数上。
+   *
+   *   0 次的时候大字不能长得像成功：加 .zero 变灰，
+   *   下面那行橙字解释为什么（同一餐期第二单）。
+   */
+  const byVisit = (S.settings || {}).points_mode === 'by_visit';
   $('#done-body').innerHTML = (d.entries || []).map(e => `
-    <div class="card"><div class="amount">${T('done.points', { points: e.points })}</div>
-           <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, visits: e.visits })}</div>
-           ${e.visits === 0 ? `<div class="meta warn-line">${T('done.noVisit')}</div>` : ''}</div>`).join('')
+    <div class="card"><div class="amount${e.visits === 0 ? ' zero' : ''}">${T('done.visits', { n: e.visits })}</div>
+           <div class="meta">${T('done.meta', { card: escapeHtml(e.card_no), amount: e.amount, points: e.points })}</div>
+           ${e.visits === 0 ? `<div class="meta warn-line">${T(byVisit ? 'done.noVisitByVisit' : 'done.noVisit')}</div>` : ''}</div>`).join('')
     // 本次达标发了新券就大字提示 —— 服务员要当场告诉客人
     + (d.rewards || []).map(r => r.granted > 0
       ? `<div class="card reward-card">

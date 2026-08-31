@@ -17,6 +17,11 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 首次查不到时的放宽窗口（降级路径，docs/03 §10.2）
 
 -- ── 积分规则 ──────────────────────────────────────────────
+(@store,'points_mode','by_amount',@now),
+  -- 积分怎么算：by_amount = 金额 × 每欧元分数；by_visit = 计次数 × 每次分数。
+  -- by_visit 下同一餐期第二单不计次、也就不积分（那是它的定义）。
+(@store,'points_per_visit','1.0',@now),
+  -- 「按次数」口径下来一次积几分。填 1 就是「一次积一分」。
 (@store,'points_per_euro','1',@now),
 (@store,'points_multiplier','1.0',@now),
   -- 1.0 = 不启用倍率
