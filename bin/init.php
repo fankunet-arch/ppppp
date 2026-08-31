@@ -492,10 +492,10 @@ function doRepair(App $app, array $config): void
         bad("config.card_prefix = {$prefix} —— 不能含 I / L / O / U");
         echo "     这几个字母在卡面上与 1 / 0 / V 分不清，扫码纠错会把它们换掉，
 ";
-        echo "     卡号跟自己对不上：实体卡的查卡/建卡/激活全部停用。
-";
-        echo "     （积分照常记 —— Pad 不会因此登不进去，但卡片功能是关着的）
-";
+        echo "     卡号跟自己对不上：实体卡的【查卡 / 建卡 / 激活 / 换卡】全部停用。\n";
+        echo "     记积分不受影响（找单、记账、手工录入照常），但客人手里那张卡\n";
+        echo "     查不了也激活不了 —— 等于会员体系只剩下已经绑好的那些人能用。\n";
+        echo "     上线前改掉，别等卡印出来。\n";
         $problems[] = "改 app/config/config.php 的 card_prefix：{$prefix} → 换成不含 I/L/O/U 的（TK、SV、MK…）";
     } else {
         ok("config.card_prefix = {$prefix}（不含 I/L/O/U）");

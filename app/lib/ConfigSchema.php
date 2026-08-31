@@ -207,7 +207,7 @@ final class ConfigSchema
         ],
 
         'pos_clock_offset_sec' => [
-            'group' => 'lookup', 'type' => 'int', 'unit' => '秒', 'readonly' => true,
+            'group' => 'lookup', 'type' => 'int_signed', 'unit' => '秒', 'readonly' => true,
             'label' => 'POS 时钟与本机的偏差（自动维护，不用手填）',
             'desc'  => '★ 由每 20 分钟一轮的增量补抓自动记录。记账时判「这一单过了多久」'
                      . '要用主库时间为准，而 grant() 不允许打 POS（主库抖一下就会卡住收银台）——'
@@ -435,6 +435,9 @@ final class ConfigSchema
         return match ($meta['type']) {
             'bool'    => in_array($value, ['0', '1'], true) ? null : '只能是 0 或 1',
             'int'     => ctype_digit($value) ? null : '只能填非负整数',
+            // ★ 可正可负的整数。时钟偏差就是这一类 —— POS 比本机慢时它天然是负的，
+            //   用 'int' 会变成「能改坏、改不回来」（负值填不进去）
+            'int_signed' => preg_match('/^-?\d+$/', $value) ? null : '只能填整数（可以是负数）',
             'decimal' => preg_match('/^\d+(\.\d{1,2})?$/', $value) ? null : '只能填数字，最多两位小数',
             'time'    => preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $value) ? null : '格式应为 HH:MM',
             'select'  => isset($meta['options'][$value]) ? null

@@ -345,7 +345,18 @@ async function loadConfig() {
  */
 function cfgRow(it, ro) {
   const off = it.active === false;
-  const dis = (ro || off) ? ' disabled' : '';
+  /**
+   * ★ it.readonly = 这一项【由系统自动维护】，人不该改。
+   *
+   *   原来这个标记纯粹是装饰性的：schema 里标了，后台照样渲染成
+   *   可编辑输入框，服务端也不看它。实测「POS 时钟偏差」这一项
+   *   能被改成 99999，而且【改不回去】—— 它是整数类型而正确的值
+   *   常常是负的（POS 比本机慢时）。能改坏、改不回来。
+   *
+   *   现在两头都堵：这里不给编辑，/config/save 也直接拒。
+   */
+  const auto = !!it.readonly;
+  const dis = (ro || off || auto) ? ' disabled' : '';
   let ctrl;
   if (it.type === 'bool') {
     ctrl = `<label class="switch-wrap">
@@ -357,13 +368,14 @@ function cfgRow(it, ro) {
         `<option value="${esc(v)}"${v === it.value ? ' selected' : ''}>${esc(t)}</option>`).join('')
     }</select>`;
   } else {
-    const mode = (it.type === 'int' || it.type === 'decimal') ? ' inputmode="decimal"' : '';
+    const mode = (it.type === 'int' || it.type === 'int_signed' || it.type === 'decimal')
+      ? ' inputmode="decimal"' : '';
     ctrl = `<span class="cfg-input">
       <input data-ck="${esc(it.key)}" value="${esc(it.value)}"${mode}${dis}>
       ${it.unit ? `<em>${esc(it.unit)}</em>` : ''}
-      ${(ro || off) ? '' : `<button class="tiny primary" data-cs="${esc(it.key)}">保存</button>`}</span>`;
+      ${(ro || off || auto) ? '' : `<button class="tiny primary" data-cs="${esc(it.key)}">保存</button>`}</span>`;
   }
-  return `<div class="cfg-item${off ? ' cfg-off' : ''}">
+  return `<div class="cfg-item${off ? ' cfg-off' : ''}${auto ? ' cfg-auto' : ''}">
     <div class="cfg-label">${esc(it.label)}<code>${esc(it.key)}</code></div>
     <div class="cfg-ctrl">${ctrl}</div>
     <div class="cfg-desc muted small">${esc(it.desc)}${

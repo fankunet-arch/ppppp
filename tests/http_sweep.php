@@ -436,6 +436,31 @@ ok(array_key_exists('cards_error', $se), '  └ 以及坏在哪（cards_error）
 ok(($se['cards_ok'] ?? null) === true, '  └ 本机配置正常，cards_ok = true');
 ok(($se['expiring_soon_days'] ?? null) !== null, '  └ 卡片阈值照常带回来');
 
+// ── 7e. 自动维护的配置项不能手工改 ───────────────────────
+group('⑫ readonly 的配置项：两头都要堵');
+
+/**
+ * ★ pos_clock_offset_sec 是机器自己记的（Cron 每 20 分钟一轮）。
+ *   schema 里标了 readonly，但那个标记一度是【装饰性的】：
+ *   后台照样渲染成可编辑输入框，/config/save 也不看它。
+ *
+ *   实测能被改成 99999，而且【改不回去】—— 它当时是 int 类型，
+ *   ctype_digit() 拒绝负数，而 POS 比本机慢时这个值天然是负的。
+ *   也就是「能改坏、改不回来」，只能等下一轮 Cron 自愈；
+ *   在那 ≤20 分钟里，补记时限那道闸门的基准被挪走了。
+ */
+[$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
+    ['key' => 'pos_clock_offset_sec', 'value' => '99999'], $cpJar);
+ok(($j['ok'] ?? true) === false,
+   '★★★ 管理员也改不了自动维护的项（pos_clock_offset_sec）', brief($st, $raw, $j));
+ok(str_contains((string)($j['detail']['hint'] ?? ''), '自动维护'),
+   '  └ 并且说清为什么改不了：' . ($j['detail']['hint'] ?? '-'));
+
+// 未登记的键照旧拒
+[$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
+    ['key' => 'totally_made_up_key', 'value' => '1'], $cpJar);
+ok(($j['ok'] ?? true) === false, '  └ 没登记过的键也拒（sys_config 不该长出没人认识的行）');
+
 // ── 8. 清理 ──────────────────────────────────────────────
 foreach ([$padJar, $cpJar, $clerkJar, $clerkPad] as $f) { @unlink($f); }
 

@@ -121,6 +121,22 @@ final class App
      * 实体卡号的生成与结构校验。前缀来自配置，留空则回落到 'TK'。
      * 真伪判定不在这里 —— 那是 cards()（card 表）的事。
      */
+    /**
+     * 卡号工具，前缀配错时返回 null 而不是抛。
+     *
+     * ★ 给「卡片功能坏了也得能干活」的那些地方用（目前是记账路径）。
+     *   真正需要卡号的地方（发卡、查卡、激活）照旧用 cardNumber()，
+     *   让它抛 —— 那些功能没有卡号本来就做不了。
+     */
+    public function cardNumberOrNull(): ?CardNumber
+    {
+        try {
+            return $this->cardNumber();
+        } catch (\InvalidArgumentException) {
+            return null;
+        }
+    }
+
     public function cardNumber(): CardNumber
     {
         return $this->once('cardNumber', fn() => new CardNumber(
@@ -260,7 +276,10 @@ final class App
             $this->businessDay(),
             $this->cardTiers(),
             $this->mealPeriods(),
-            $this->cardNumber(),
+            // ★ 可空：card_prefix 配错时卡片功能停用，但【记账必须还能用】。
+            //   传 cardNumber() 会让 App::points() 直接构造失败，
+            //   于是找单/记账/手工录入全部 500 —— 与 docs/03 §10 相反。
+            $this->cardNumberOrNull(),
         ));
     }
 }

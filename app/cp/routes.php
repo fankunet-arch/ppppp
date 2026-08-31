@@ -365,6 +365,19 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $w
         Api::fail('bad_request', 400, ['hint' => '没有这一项配置：' . $key
             . '（新加配置项要先在 ConfigSchema 里登记）']);
     }
+    /**
+     * ★ readonly 的项是【机器自己维护的】，人改了只会添乱。
+     *
+     *   原来这个标记纯粹是装饰性的：schema 里标了、后台照样渲染成可编辑输入框、
+     *   /config/save 也不看它。实测 pos_clock_offset_sec（自动记录的时钟偏差）
+     *   能被改成 99999，而且【改不回去】—— 它是 int 类型，
+     *   ctype_digit() 拒绝负数，而 POS 比本机慢时这个值天然是负的。
+     *   也就是「能改坏、改不回来」，只能等下一轮 Cron 自愈。
+     */
+    if (!empty(\Vip\ConfigSchema::ITEMS[$key]['readonly'])) {
+        Api::fail('bad_request', 400, ['hint' => '这一项由系统自动维护，不能手工修改：'
+            . (\Vip\ConfigSchema::ITEMS[$key]['label'] ?? $key)]);
+    }
     // 按 schema 校验，别让「几次送一次」被填成负数或文字
     $err = \Vip\ConfigSchema::validate($key, $val);
     if ($err !== null) {
