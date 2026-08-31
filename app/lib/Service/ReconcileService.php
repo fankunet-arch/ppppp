@@ -102,7 +102,7 @@ final class ReconcileService
         $checkIds = array_filter(array_map('intval', explode(',', (string)$o['check_ids'])));
 
         // 逐张 check 回读并汇总
-        $nowOriginal = 0; $nowShould = 0; $nowActual = 0; $found = false;
+        $nowOriginal = 0; $nowShould = 0; $nowActual = 0; $nowTax = 0; $found = false;
         foreach ($checkIds as $cid) {
             $r = $this->pos->reloadAmounts($headId, $cid);
             if ($r === null) {
@@ -112,6 +112,10 @@ final class ReconcileService
             $nowOriginal += Money::toCents((string)$r['original_amount']);
             $nowShould   += Money::toCents((string)$r['should_amount']);
             $nowActual   += Money::toCents((string)$r['actual_amount']);
+            // ★ 税额也要回读。拿本地镜像里那个【旧】税额去算新总额是错的：
+            //   金额都改了，税额不可能没改（实测 100.00/税 9.09 退成 75.00/税 6.82，
+            //   用旧税算出来是 65.91，正确是 68.18 —— 反过来多退了 3 分）
+            $nowTax      += Money::toCents((string)($r['tax_amount'] ?? '0'));
         }
 
         if (!$found) {
@@ -155,9 +159,22 @@ final class ReconcileService
         $detail   = $this->pos->fetchDetailForChecks($headId, $checkIds);
         $analysis = PE::analyzeDetail($detail, $this->rules,
             PE::redeemPatternsFrom($this->cfg->get('redeem_line_patterns', '')));
-        $taxCents = $this->cfg->get('points_include_tax', '1') === '1'
-            ? 0
-            : (int)($o['tax_amount'] !== null ? Money::toCents((string)$o['tax_amount']) : 0);
+        /**
+         * ★ 用【回读到的】税额，不是本地镜像里那一份。
+         *
+         *   这里连着栽过两次：
+         *   ① 一开始压根没传 taxCents —— points_include_tax=0 时
+         *      newTotal 恒 ≥ oldTotal，每张改过金额的单都挂成人工待办。
+         *   ② 补上之后读的是 $o['tax_amount']，而 pendingVerify() 的 SELECT
+         *      根本没取那一列 —— PHP 静默求值成 null → 0，修了等于没修，
+         *      冲正比应退的少一个税额（实测多留 6 分）。
+         *   ③ 把列补进 SELECT 之后，读到的是【下单时】的旧税额 ——
+         *      金额都改了税额不可能没改，于是又反过来多退了 3 分。
+         *
+         *   三次都是同一个毛病：算钱时拿了一个「看起来对」的近似值。
+         *   现在只认 reloadAmounts() 当下回读的那一份。
+         */
+        $taxCents = $this->cfg->get('points_include_tax', '1') === '1' ? 0 : $nowTax;
         $newTotal = PE::pointsBaseCents($nowShould, $nowActual, $nowOriginal,
                                         $analysis['excluded_cents'], $taxCents);
         $oldTotal = Money::toCents((string)$o['total_amount']);

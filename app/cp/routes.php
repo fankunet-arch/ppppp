@@ -111,25 +111,35 @@ $api->on('GET', '/dashboard', static function () use ($app, $requireManager): vo
         'business_date' => $today,
         'orders_today'  => $row('SELECT COUNT(*) FROM pos_order WHERE store_code=? AND business_date=?', [$store, $today]),
         /**
-         * ★ 三个「今天」必须是【同一个今天】。
+         * ★ 三个数各自的【轴】必须说得清，而且横着能对上。
          *
-         *   orders_today 走 business_date（02:00 切点），而这两个原来走
-         *   date('Y-m-d 00:00:00')（自然日）。00:00–02:00 之间
-         *   （晚市餐期还没结束）：订单数还算昨天的，笔数和分数已经跳到今天，
-         *   夜班收银员看到的首页三个数互相对不上。
+         *   ── 栽过两次 ──────────────────────────────────
+         *   ① 一开始 orders_today 走营业日、另两个走自然日
+         *      （date('Y-m-d 00:00:00')）。00:00–02:00 之间晚市还没结束：
+         *      订单数还算昨天的，笔数和分数已经跳到今天。
+         *   ② 改的时候把 granted_today 挪到了「【订单的】营业日」这个轴上，
+         *      而 points_today 留在「【流水的】写入时刻」——
+         *      客人拿三天前的小票来补记（invoice_lookup_max_days 默认 7 天，
+         *      是系统明确允许的路径），首页就会显示
+         *      「今天记账 0 笔、发出 40 分」。而笔数和分数恰恰是
+         *      经理最容易横着对一眼的两个数。
          *
-         * ★ points_today 是【净额】：包含撤销与冲正的负分，故意不筛 entry_type
-         *   —— 首页要回答的是「今天实际发出去多少分」。
-         *   granted_today 只数 entry_type=1，回答的是「记了几笔」。
-         *   两者口径不同是有意的，标签里已经写清楚。
+         *   ── 现在的口径 ────────────────────────────────
+         *   · orders_today  ：订单维度 → 按【订单的营业日】。
+         *     它回答的是「今天做了几桌生意」。
+         *   · granted_today ：操作维度 → 按【流水写入时刻】落在今天的营业日窗口内。
+         *   · points_today  ：同上，同一个轴。
+         *     它回答的是「今天实际发出去多少分」，所以是净额，
+         *     故意不筛 entry_type（含撤销与冲正的负分）。
+         *
+         *   后两个同轴，所以「几笔」和「多少分」永远对得上；
+         *   而 orders_today 与它们不同轴是【有意的】—— 补记三天前的小票时，
+         *   那一桌生意不属于今天，但这笔操作属于今天。
+         *   界面上的标签要把这层意思写出来。
          */
-        'granted_today' => $row('SELECT COUNT(*) FROM point_ledger l JOIN pos_order o
-                                    ON o.store_code=l.store_code AND o.serial_id=l.serial_id
-                                  WHERE l.store_code=? AND l.entry_type=1 AND l.status=1
-                                    AND o.business_date=?', [$store, $today])
-                         + $row('SELECT COUNT(*) FROM point_ledger
+        'granted_today' => $row('SELECT COUNT(*) FROM point_ledger
                                   WHERE store_code=? AND entry_type=1 AND status=1
-                                    AND serial_id IS NULL AND created_at>=? AND created_at<?',
+                                    AND created_at>=? AND created_at<?',
                                 array_merge([$store], $app->businessDay()->range($today))),
         'points_today'  => $row('SELECT COALESCE(SUM(points),0) FROM point_ledger
                                   WHERE store_code=? AND created_at>=? AND created_at<?',

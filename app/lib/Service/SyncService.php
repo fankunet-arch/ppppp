@@ -69,6 +69,42 @@ final class SyncService
             return ['ok' => false, 'reason' => 'pos_unavailable', 'batches' => 0, 'rows' => 0];
         }
 
+        /**
+         * ★ 顺手记下【POS 时钟与本机的偏差】。
+         *
+         *   记账那条路要判「这一单过了多久」，基准必须是主库时间
+         *   （order_end_time 是 POS 给的，两边时钟差多少就错多少）。
+         *   但 grant() 的类注释立着「不碰 POS」——
+         *   在事务里现打一次 POS 的代价实测是：POS「连得上但不应答」时
+         *   单桌卡 5 秒、多桌合并按单数翻倍。
+         *
+         *   Cron 每 20 分钟本来就要问一次 POS 的时间，白问不如记下来：
+         *   grant() 用「本机时间 + 这个偏差」，一次 POS 都不打。
+         *   偏差本身变化极慢（两台机器的晶振差），20 分钟的新鲜度绰绰有余。
+         *
+         *   只在偏差真的变了才写，免得每 20 分钟给 sys_config 添一次无谓的写。
+         */
+        $offset = strtotime($posNow) - time();
+        if (abs($offset - $this->cfg->int('pos_clock_offset_sec', 0)) >= 30) {
+            $this->cfg->set('pos_clock_offset_sec', (string)$offset);
+            $log(sprintf('POS 时钟偏差更新为 %+d 秒', $offset));
+        }
+        /**
+         * ★ 差得离谱要告警，不能只是悄悄记下来。
+         *
+         *   两台机器的时钟差、哪怕时区填错，最多十几个小时。
+         *   超过一天只有两种可能：POS 的时钟坏了，或者哪台机器的日期设错了。
+         *   这种情况下 posNow() 会把偏差当作不存在（退回本机时间），
+         *   于是补记时限那道闸门的基准是错的 —— 得有人去看一眼。
+         */
+        if (abs($offset) > 86400) {
+            $this->alerts->raiseOnce('pos_clock_skew', 'cursor', self::CURSOR_INCREMENTAL,
+                sprintf('POS 主库时间与本机差了 %+.1f 小时（主库 %s，本机 %s）——'
+                      . '补记时限那道闸门的基准会不准，请核对两台机器的时钟与时区',
+                        $offset / 3600, $posNow, date('Y-m-d H:i:s')),
+                ['severity' => 2, 'detail' => ['offset_sec' => $offset]]);
+        }
+
         // 首次运行没有水位线时，从一个窗口前开始，不做全量
         $watermark = $this->cursors->get(self::CURSOR_INCREMENTAL,
             date('Y-m-d H:i:s', strtotime($posNow) - $windowH * 3600));

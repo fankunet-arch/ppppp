@@ -114,7 +114,11 @@ final class PosReader implements PosSource
      */
     public function reloadAmounts(int $orderHeadId, int $checkId): ?array
     {
-        $sql = "SELECT serial_id, original_amount, should_amount, actual_amount, edit_time
+        // ★ tax_amount 必须一起取回：points_include_tax=0 时值比对要用【当下的】税额
+        //   重算不含税总额。用本地镜像里那个旧税额算出来的是错的 ——
+        //   金额都改了，税额不可能没改。多一列不多一次往返（type=ref, rows=1）。
+        $sql = "SELECT serial_id, original_amount, should_amount, actual_amount,
+                       tax_amount, edit_time
                 FROM history_order_head
                 WHERE order_head_id = ? AND check_id = ?
                 LIMIT 1";

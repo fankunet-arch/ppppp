@@ -412,6 +412,30 @@ ok(($j['data']['window'] ?? null) === 45,
    '  └ 上限以内的值照常生效（45 分钟）—— 封的是上限，不是「一律不许传」',
    brief($st, $raw, $j));
 
+// ── 7d. 实体卡坏掉不能把登录一起拖下水 ───────────────────
+group('⑪ 卡片功能的开关随登录一起带回来');
+
+/**
+ * ★ card_prefix 含 I/L/O/U 时 CardNumber 构造即抛（那是对的）。
+ *   但 CardService 是在 /auth/login 的响应里被构造的 ——
+ *   曾经因此变成：首页 200、/health 说一切正常、收银员就是登不进去，
+ *   屏幕上只有一句「系统内部错误（E302-xxxx）」。
+ *   一个【局部故障】（发卡/查卡用不了）被升级成了【全店停摆】。
+ *
+ *   这里只能验「正常配置下这两个字段确实回来了」——
+ *   真正的降级路径要改 config.php 才测得到，那属于部署期检查
+ *   （bin/init.php repair / bin/diag.php 各有一条）。
+ *   这条断言守的是【字段本身别被删掉】：删了的话降级分支就再也没人看得见。
+ */
+[$st, $raw, $j] = req($BASE . '/api.php/auth/login', 'POST',
+    ['login_name' => 'cashier1', 'pin' => $PIN, 'device' => 'SWEEP2'], $clerkPad);
+$se = $j['data']['settings'] ?? [];
+ok(array_key_exists('cards_ok', $se),
+   '★★ 登录响应里带 cards_ok —— 实体卡这一块能不能用，Pad 要知道', brief($st, $raw, $j));
+ok(array_key_exists('cards_error', $se), '  └ 以及坏在哪（cards_error）');
+ok(($se['cards_ok'] ?? null) === true, '  └ 本机配置正常，cards_ok = true');
+ok(($se['expiring_soon_days'] ?? null) !== null, '  └ 卡片阈值照常带回来');
+
 // ── 8. 清理 ──────────────────────────────────────────────
 foreach ([$padJar, $cpJar, $clerkJar, $clerkPad] as $f) { @unlink($f); }
 

@@ -389,9 +389,13 @@ final class PointsService
             return ['ok' => false, 'error' => 'empty_allocation'];
         }
 
-        return $this->db->transaction(function () use ($serialId, $allocations, $allocMode, $operator, $override) {
+        // ★★★ 主库时刻在【进事务之前】取，而且一次请求只取一次。
+        //     理由见 posNow() 的说明 —— 一句话：事务里不许碰 POS。
+        $nowAtPos = $this->posNow();
+
+        return $this->db->transaction(function () use ($serialId, $allocations, $allocMode, $operator, $override, $nowAtPos) {
             $memberIds = array_map(static fn(array $a): int => (int)($a['member_id'] ?? 0), $allocations);
-            $gate = $this->checkGates([$serialId], $memberIds, $operator, $override);
+            $gate = $this->checkGates([$serialId], $memberIds, $operator, $override, $nowAtPos);
             if (!$gate['ok']) {
                 return $gate;
             }
@@ -441,12 +445,14 @@ final class PointsService
         // ★ 固定加锁顺序，防止并发合并时死锁
         sort($serials);
 
-        return $this->db->transaction(function () use ($serials, $memberId, $operator, $override) {
+        $nowAtPos = $this->posNow();      // 同上：进事务之前，一次
+
+        return $this->db->transaction(function () use ($serials, $memberId, $operator, $override, $nowAtPos) {
             $span = $this->checkMergeSpan($serials);
             if (!$span['ok']) {
                 return $span;
             }
-            $gate = $this->checkGates($serials, [$memberId], $operator, $override);
+            $gate = $this->checkGates($serials, [$memberId], $operator, $override, $nowAtPos);
             if (!$gate['ok']) {
                 return $gate;
             }
@@ -803,7 +809,14 @@ final class PointsService
      * @param int[]    $memberIds
      * @return array{ok:bool,error?:string,detail?:array,forced:bool,hit:array}
      */
-    private function checkGates(array $serialIds, array $memberIds, array $operator, ?array $override): array
+    /**
+     * @param string $nowAtPos 主库当下时刻，由调用方在【进事务之前】取好。
+     *
+     * ★ 不在这里调 posNow()。原因见 grant() 上方那段说明 ——
+     *   一句话：这个方法跑在本地库事务里，而 POS 是一台会抖的老机器。
+     */
+    private function checkGates(array $serialIds, array $memberIds, array $operator,
+                                ?array $override, string $nowAtPos): array
     {
         $hit = [];
 
@@ -827,10 +840,10 @@ final class PointsService
                  *   locateByInvoice() 的回溯天数判断本来就用的是 pos->now()，
                  *   全仓库原本只有这一处用本地时间，是漏改。
                  *
-                 *   POS 不可达时 posNow() 回落到本地时间 —— 那时候本来也
-                 *   走不到记账这一步，回落只是不让风控自己炸掉。
+                 * ★ 但这个时刻是【调用方在进事务之前取好一次】传进来的，
+                 *   不在这个循环里现取 —— 见 posNow() 的说明。
                  */
-                $age = (strtotime($this->posNow()) - strtotime((string)$o['order_end_time'])) / 60;
+                $age = (strtotime($nowAtPos) - strtotime((string)$o['order_end_time'])) / 60;
                 if ($oldest === null || $age > $oldest) { $oldest = $age; }
             }
             if ($oldest !== null && $oldest > $lateMin) {
@@ -986,16 +999,49 @@ final class PointsService
      *
      * ★ 所有「这一单过了多久」的判断都必须用它，不能用 time()：
      *   order_end_time 是 POS 给的，两边时钟不一致时差多少就错多少。
-     *   POS 不可达时回落，只是为了不让风控自己炸掉 ——
-     *   那种时候本来也走不到记账。
+     *
+     * ── 🔴 这里【一次 POS 都不打】────────────────────────
+     *
+     * grant() / grantMerged() 的类注释立着一条：
+     *
+     *     grant() 【不碰 POS】，只在本地库事务内完成分配，
+     *     因此主库抖动不会阻塞收银流程。
+     *
+     * 曾经为了拿主库时间，在 checkGates() 的逐单循环里现打 POS，
+     * 那句话就不再成立了。实测：
+     *   · POS 正常时：单桌 1 次往返、两桌合并 2 次 ——
+     *     一个在单次请求内恒定的值被查了 N 次；
+     *   · POS「连得上但不应答」时（现场最常见的抖动形态，read_timeout=5）：
+     *     单桌 grant() 卡 5.0 秒、两桌合并 10.0 秒，
+     *     merge_max_orders 默认 8 → 最坏约 40 秒，
+     *     而且全程占着一个已经开着的本地库事务。
+     *
+     * 现在换成【本机时间 + 时钟偏差】：偏差由 Cron 每 20 分钟顺手记一次
+     * （SyncService::incremental —— 它本来就要问一次 POS 的时间，白问不如记下来）。
+     * 偏差变化极慢（两台机器的晶振差），20 分钟的新鲜度绰绰有余。
+     *
+     * ★ 没记过偏差时（新装、Cron 还没跑过）回落到 0 —— 也就是本机时间。
+     *   那与修复之前的行为一致，不会更糟；而 Cron 一跑就自动对上。
+     *
+     * ★★ 偏差超过一天就【当它不存在】。
+     *
+     *   两台机器的时钟差、甚至时区填错，最多也就十几个小时；
+     *   差到一天以上只有两种可能：存进去的值早就过期了，或者 POS 的
+     *   时钟本身是坏的。这两种情况下用它，后果是【闸门被静默关掉】——
+     *   age 算成负数，补记时限永远不触发，而界面上什么都看不出来。
+     *
+     *   宁可退回本机时间：那只是「基准可能差几分钟」，
+     *   而不是「这道闸门实际上没在工作」。
      */
+    private const CLOCK_OFFSET_MAX_SEC = 86400;
+
     private function posNow(): string
     {
-        try {
-            return $this->pos->now();
-        } catch (\Throwable) {
-            return date('Y-m-d H:i:s');
+        $off = $this->cfg->int('pos_clock_offset_sec', 0);
+        if (abs($off) > self::CLOCK_OFFSET_MAX_SEC) {
+            $off = 0;
         }
+        return date('Y-m-d H:i:s', time() + $off);
     }
 
     /**
