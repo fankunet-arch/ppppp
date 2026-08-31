@@ -266,33 +266,71 @@ final class ReconcileService
                  * ★ 退多少分，看积分口径。
                  *
                  *   by_amount：分是从金额来的，按退掉的金额比例退，向上取整（对商家有利）。
+                 *     ★ 整数取整除，不走浮点：`ceil($pts * ($backAmt / $amt))` 里
+                 *       那个除法一旦落在整数上方一点点（如 5 → 5.000000000000001），
+                 *       ceil 就多扣一分，而这个方向是【对客人不利】的。
+                 *       与 PointsEngine::fixedFloor 同一类问题，同一种解法。
                  *
                  *   by_visit ：分是从【来过一次】来的，跟金额没有比例关系。
                  *     照搬比例公式的话，`ceil(1 × 任意正比例)` 恒等于 1 ——
                  *     哪怕只退了 5 分钱，那一次的分也整个没了，而客人确实来过。
                  *     所以只在【整条被退干净】时才收回；部分缩水不动分。
-                 *
-                 *   两种口径下「计次」都不动（金额缩水不改变吃了几份套餐），
-                 *   见下面 counted_visit => 0。
                  */
                 $backPts = $this->cfg->get('points_mode', 'by_amount') === 'by_visit'
                     ? ($backAmt >= $amt ? $pts : 0)
-                    : (int)ceil($pts * ($backAmt / max($amt, 1)));   // 向上取整
+                    : intdiv($pts * $backAmt + $amt - 1, max($amt, 1));   // 向上取整
+
+                /**
+                 * ★ 计次：只在【整单归零】时收回，部分缩水一律不动。
+                 *
+                 *   部分缩水不动是对的 —— 退掉一杯酒不改变「吃了几份套餐」。
+                 *
+                 *   但整单归零不一样：那顿饭在 POS 上已经不存在了，
+                 *   而计次直接换免费餐（docs/03 §5）。原来这里恒为 0，于是
+                 *   一张归零的单，分退了、【十送一那个格子还留着】——
+                 *   免费餐才是真正花钱的东西，等于漏在外面。
+                 *   手工撤销 /points/reverse 一直是分和次都退干净的，
+                 *   两条路对同一件事给出不同结果，本身也说不通。
+                 *
+                 *   只认「整单归零」这一个信号：某一位的份额恰好被退光
+                 *   （多人单里退掉一人的量）不算 —— 那顿饭还是发生了，
+                 *   他也确实在场，判不出该不该收回，就不收。
+                 */
+                $backVisits = $newTotal === 0 ? (int)$e['counted_visit'] : 0;
 
                 $this->members->lockById((int)$e['member_id']);
-                $this->ledger->insert([
+                $refundId = $this->ledger->insert([
                     'member_id'     => (int)$e['member_id'],
                     'serial_id'     => $serial,
                     'entry_type'    => LedgerRepo::T_REFUND,
                     'amount_cents'  => -$backAmt,
                     'points'        => -$backPts,
-                    'counted_visit' => 0,      // 金额缩水不改变「吃了几份套餐」
+                    'counted_visit' => -$backVisits,
                     'reverses_id'   => (int)$e['id'],
                     'reason'        => sprintf('值比对发现订单金额由 %s 变为 %s',
                         Money::toStr($oldTotal), Money::toStr($newTotal)),
                 ]);
-                $this->members->applyDelta((int)$e['member_id'], -$backPts, 0, -$backAmt);
+                $this->members->applyDelta((int)$e['member_id'], -$backPts, -$backVisits, -$backAmt);
                 $totalBack += $backAmt;
+
+                /**
+                 * ★ 整单归零时，原始流水要标记成【已冲正】，不能留在有效流水里。
+                 *
+                 *   否则会漏一个洞：countedThisSitting() 判「这张卡本餐期记过没有」
+                 *   走的是 earnedInRange()，那个查询只看 entry_type=消费 且 status=有效 ——
+                 *   作废单的原始流水还挂在那里，就一直占着「已经记过了」这个位置。
+                 *
+                 *   于是收银员打错单、作废、同一餐期重打一张的时候：
+                 *     作废把那一次退了 → 重打的这一单又因为「本餐期已记过」不计次
+                 *     → 客人真吃了一顿，最后一次都没有。
+                 *
+                 *   标记成已冲正之后这一条就退出风控视野，重打的那一单正常计次。
+                 *   ★ 只在整单归零时做。部分缩水的原始流水必须留着 ——
+                 *     那顿饭确实发生了，它得继续占着这一餐期的位置。
+                 */
+                if ($newTotal === 0) {
+                    $this->ledger->markReversed((int)$e['id'], $refundId);
+                }
             }
 
             $this->orders->applyAllocation($serial, -$totalBack, 0);

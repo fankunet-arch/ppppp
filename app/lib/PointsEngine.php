@@ -485,15 +485,70 @@ final class PointsEngine
     }
 
     /**
+     * 「分/€」「分/次」的小数位数 —— sys_config 校验为 `^\d+(\.\d{1,2})?$`，最多两位。
+     */
+    private const RATE_SCALE = 100;
+
+    /**
+     * 倍率的小数位数。倍率 = 全局 × 卡片等级，两者各自最多两位
+     * （sys_config 同上；`card_tier.points_multiplier` 是 DECIMAL(4,2)），
+     * 相乘最多四位。取六位是留余量：以后再叠一层两位小数的倍率也还是精确的。
+     */
+    private const MULT_SCALE = 1000000;
+
+    /**
+     * 定点乘除：floor($units × $rate × $mult ÷ $unitDiv)，全程走整数。
+     *
+     * ── 🔴 为什么不能直接 floor(a × b × c) ──────────────
+     *
+     * 三个 IEEE754 双精度相乘，当精确结果本该是整数时，浮点表示会给出
+     * 比它略小的值，floor 就少一分。**丢的不是小数部分，是整数本身**：
+     *
+     *     100.00 € × 0.29 × 1.00   精确值 29，(int)floor(...) 给 28
+     *     12 次   × 0.70 × 2.50    精确值 21，(int)floor(...) 给 20
+     *
+     * 「向下取整而非四舍五入，宁可少给」是一条关于**小数部分**的策略，
+     * 那条策略是对的；这里修的是表示误差，两回事。
+     * `points_per_euro = 0.29`（想设「3.45 € 换 1 分」时算出来就是它）
+     * 配上出厂倍率 1.00 就会命中 —— 不需要任何刁钻配置。
+     *
+     * 方向始终对商家有利、每次只差一分，客人发现不了 —— 所以只能靠代码堵。
+     * `Money` 开头那句「金额一律以整数分在内部流转，避免浮点误差」，
+     * 这两个函数曾经是仓库里仅剩的两处例外。
+     */
+    private static function fixedFloor(int $units, int $unitDiv, float $rate, float $mult): int
+    {
+        if ($units <= 0) {
+            return 0;
+        }
+        // round 而非 (int) 强转：0.29 * 100 在双精度里是 28.999999999999996
+        $r = (int)round($rate * self::RATE_SCALE);
+        $m = (int)round($mult * self::MULT_SCALE);
+        if ($r <= 0 || $m <= 0) {
+            return 0;
+        }
+
+        /**
+         * 溢出兜底。正常配置下永远走不到 ——
+         * 一单几百欧（$units ≤ 1e5 分）配上个位数的倍率，乘积在 1e13 量级，
+         * 距 PHP_INT_MAX（约 9.2e18）还有五个数量级。
+         * 真要有人把「每欧元积几分」填到几百万，那时少一分也已经无所谓了，
+         * 回落到浮点，好过静默溢出成负数。
+         */
+        if ((float)$units * $r * $m > (float)PHP_INT_MAX) {
+            return (int)floor($units / $unitDiv * $rate * $mult);
+        }
+
+        return intdiv($units * $r * $m, $unitDiv * self::RATE_SCALE * self::MULT_SCALE);
+    }
+
+    /**
      * 积分数 = 基数(欧元) × 每欧元积分 × 倍率，向下取整。
      * 向下取整而非四舍五入：宁可少给，避免累积超发。
      */
     public static function pointsFor(int $baseCents, float $perEuro, float $multiplier): int
     {
-        if ($baseCents <= 0) {
-            return 0;
-        }
-        return (int)floor(($baseCents / 100.0) * $perEuro * $multiplier);
+        return self::fixedFloor($baseCents, 100, $perEuro, $multiplier);
     }
 
     /**
@@ -519,10 +574,8 @@ final class PointsEngine
      */
     public static function pointsForVisit(int $visits, float $perVisit, float $multiplier): int
     {
-        if ($visits <= 0) {
-            return 0;
-        }
-        return (int)floor($visits * $perVisit * $multiplier);
+        // $unitDiv = 1：次数本身就是整数，不像金额那样要先从「分」还原成「欧元」
+        return self::fixedFloor($visits, 1, $perVisit, $multiplier);
     }
 
     /**
