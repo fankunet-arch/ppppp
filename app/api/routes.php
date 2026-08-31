@@ -110,16 +110,46 @@ $api->on('GET', '/health', static function () use ($app): void {
  * 两边都做才站得住。
  */
 $padSettings = static function () use ($app): array {
-    return [
+    $out = [
         // 关闭时 Pad 完全不显示手机号/邮箱/生日输入框，后端也拒收
         'collect_pii' => $app->cfg()->bool('member_collect_pii', false),
-        // 有效期相关的两个阈值，Pad 拿它决定什么时候提醒换卡
-        'expiring_soon_days' => $app->cardService()->expiringSoonDays(),
-        'grace_months'       => $app->cardService()->graceMonths(),
         // 还没选过语言的账号用这个；已选过的以 operator.lang 为准
         'default_lang'       => \Vip\Lang::normalize($app->cfg()->get('default_lang', \Vip\Lang::FALLBACK)),
         'langs'              => \Vip\Lang::ALL,
+        'cards_ok'           => true,
+        'cards_error'        => null,
     ];
+
+    /**
+     * ★★★ 实体卡这一块坏掉，不能把【登录】一起拖下水。
+     *
+     *   card_prefix 含 I/L/O/U 时 CardNumber 构造即抛（那是对的，见该类说明）。
+     *   但 CardService 是在这里被构造的，于是异常从 /auth/login 抛出去 ——
+     *   实测：首页 200、/health 说一切正常，收银员就是登不进，
+     *   屏幕上只有一句「系统内部错误（E302-xxxx）」。
+     *
+     *   这把一个【局部故障】（发卡/查卡用不了）升级成了【全店停摆】。
+     *   与 docs/03 §10 一贯的取舍相反 —— 那一条说的是「不阻塞收银流程」。
+     *
+     *   所以这里降级：卡相关的两个阈值置空、挂一个明确的错误串带回 Pad，
+     *   积分照记。真正该在部署前拦住它的是 bin/init.php repair 与 bin/diag.php。
+     */
+    try {
+        $out['expiring_soon_days'] = $app->cardService()->expiringSoonDays();
+        $out['grace_months']       = $app->cardService()->graceMonths();
+    } catch (\InvalidArgumentException $e) {
+        $out['expiring_soon_days'] = null;
+        $out['grace_months']       = null;
+        $out['cards_ok']           = false;
+        $out['cards_error']        = $e->getMessage();
+        try {
+            $app->alerts()->raiseOnce('card_prefix_invalid', 'config', 'card_prefix',
+                '配置项 card_prefix 不可用，实体卡的查卡/建卡/激活全部停用（积分照常）：'
+                . $e->getMessage(),
+                ['severity' => 3]);
+        } catch (\Throwable) { /* 告警本身坏了也不能挡住登录 */ }
+    }
+    return $out;
 };
 
 /**

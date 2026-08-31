@@ -111,7 +111,13 @@ $$('.tab').forEach(t => t.onclick = () => {
 async function loadDashboard() {
   const d = await api('/dashboard', undefined, 'GET');
   const cards = [
-    ['今日订单', d.orders_today], ['今日记账笔数', d.granted_today],
+    // ★ 前两个不在同一个轴上，标签必须说破：
+    //   「今日订单」按订单的营业日算（今天做了几桌生意），
+    //   后两个按记账动作发生的时刻算（今天这台机器上记了什么）。
+    //   客人拿三天前的小票来补记时，那一桌不属于今天、这笔操作属于今天 ——
+    //   两个数对不上是【对的】，但不写清楚就会被当成 bug。
+    ['今日订单（按营业日）', d.orders_today],
+    ['今日记账笔数', d.granted_today],
     ['今日积分', d.points_today], ['会员总数', d.members_total],
     ['待确认会员', d.members_pending, d.members_pending > 0 ? 'warn' : ''],
     ['待复核', d.reviews_pending, d.reviews_pending > 0 ? 'warn' : ''],

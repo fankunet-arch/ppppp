@@ -203,6 +203,9 @@ final class OrderRepo
         $limit  = max(1, min($limit, 100));
         $since  = date('Y-m-d H:i:s', strtotime("-{$protectDays} days"));
         return $this->db->all(
+            // ★ 这里【故意不取 tax_amount】：值比对要的是「当下的」税额，
+            //   由 reloadAmounts() 从主库回读（见 ReconcileService::verifyOne）。
+            //   镜像里那一份是下单时的旧值，金额改过之后它一定是错的。
             'SELECT serial_id, order_head_id, check_ids, original_amount, should_amount,
                     actual_amount, total_amount, allocated_amount
                FROM pos_order

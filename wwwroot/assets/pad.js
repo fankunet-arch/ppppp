@@ -891,23 +891,48 @@ function recomputePicks() {
     S.people[pi].amountCents += it.line_cents;
     if (it.counts_visit) S.people[pi].portions += (it.quantity || 1);
   });
+  /**
+   * ★ 每人最多 1 份 —— 与均摊 AA 那一屏保持同一个口径。
+   *
+   *   once_per_period 下，一个人点了 2 份套餐照样只记 1 次。
+   *   不封的话，同一位客人在「点选菜品」里显示 2 份、在 AA 里显示 1 份，
+   *   收银员会以为两边算法不一样。
+   */
+  const fixed = (S.order || {}).portions_per_person;
+  if (fixed !== null && fixed !== undefined) {
+    const cap = Number(fixed) || 0;
+    S.people.forEach(p => { if (p.portions > cap) p.portions = cap; });
+  }
   renderPeople(true);
 }
 
 function addPerson() {
   /**
-   * ★ 新加的一位也要带上份数。
+   * ★ 新加的一位要不要预置份数，【看模式】。
    *
-   *   份数框在 once_per_period 下是锁死的，如果这里还给 0，
-   *   加进来的人就永远拿不到次数，而且他【改不了】——
-   *   界面上看不出为什么别人有次数他没有。
+   *   均摊 AA：要。份数框在 once_per_period 下是锁死的，
+   *     不预置的话加进来的人永远拿不到次数，而且他改不了 ——
+   *     界面上看不出为什么别人有次数他没有。
+   *
+   *   点选菜品：★ 不能预置。那个模式下一个人的金额来自他认领的菜，
+   *     刚加进来必然是 0 元；再预置 1 份就成了「0 元 + 1 份」——
+   *     正是服务端硬拒的 portions_without_amount，而且按
+   *     validateAllocations 的规则是【整笔拒绝】：只要服务员先把人加好、
+   *     还没给他点菜就提交，连已经点好菜的那几位也一起记不上。
+   *     份数框在这个模式下也是只读的，收银员改不掉。
+   *
+   *     实测（真浏览器）：点选菜品模式下「添加会员」是收银员的
+   *     【第一个动作】（S.people 一开始是空的，不加人就没法认领），
+   *     所以这不是边角情况。
+   *
+   *     这个模式下份数本来就由 recomputePicks() 从认领的菜算出来，
+   *     给 0 是对的。
    */
   const fixed = (S.order || {}).portions_per_person;
-  S.people.push({
-    member: null,
-    amountCents: 0,
-    portions: (fixed === null || fixed === undefined) ? 0 : Number(fixed) || 0,
-  });
+  const preset = (S.mode === 3 || fixed === null || fixed === undefined)
+    ? 0
+    : Number(fixed) || 0;
+  S.people.push({ member: null, amountCents: 0, portions: preset });
   renderPeople();
   if (S.mode === 3) refreshPickSelects();
 }

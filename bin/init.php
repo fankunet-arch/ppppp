@@ -471,6 +471,36 @@ function doRepair(App $app, array $config): void
         $problems[] = '建管理员：php bin/init.php admin admin 系统管理员';
     }
 
+    /**
+     * ── 配置项 card_prefix ──────────────────────────────
+     *
+     * ★ 这一项必须在 repair 里查，因为 README 指的第一条排查命令就是 repair。
+     *
+     *   前缀含 I / L / O / U 时，扫码纠错（CardNumber::normalize）会把它们
+     *   换成 1 / 1 / 0 / V，卡号于是跟自己对不上 —— 而且 CardService 是在
+     *   /auth/login 的响应里被构造的，于是【收银员整个登不进去】，
+     *   屏幕上只有一句「系统内部错误」。
+     *
+     *   实测过一次「repair 说全部就绪，而店里登不进」——
+     *   那种组合比直接报错难查得多。
+     */
+    $prefix = strtoupper(trim((string)($config['card_prefix'] ?? 'TK')));
+    if (!preg_match('/^[A-Z]{1,4}$/', $prefix)) {
+        bad("config.card_prefix = {$prefix} —— 必须是 1~4 位字母");
+        $problems[] = '改 app/config/config.php 的 card_prefix（1~4 位字母）';
+    } elseif (strpbrk($prefix, 'ILOU') !== false) {
+        bad("config.card_prefix = {$prefix} —— 不能含 I / L / O / U");
+        echo "     这几个字母在卡面上与 1 / 0 / V 分不清，扫码纠错会把它们换掉，
+";
+        echo "     卡号跟自己对不上：实体卡的查卡/建卡/激活全部停用。
+";
+        echo "     （积分照常记 —— Pad 不会因此登不进去，但卡片功能是关着的）
+";
+        $problems[] = "改 app/config/config.php 的 card_prefix：{$prefix} → 换成不含 I/L/O/U 的（TK、SV、MK…）";
+    } else {
+        ok("config.card_prefix = {$prefix}（不含 I/L/O/U）");
+    }
+
     // ── 汇总 ─────────────────────────────────────────────
     head('结论');
     if (!$problems) {

@@ -206,6 +206,14 @@ final class ConfigSchema
             'desc'  => '一个班次里零星输错几次是正常的，短时间内连着错十几次才是信号。',
         ],
 
+        'pos_clock_offset_sec' => [
+            'group' => 'lookup', 'type' => 'int', 'unit' => '秒', 'readonly' => true,
+            'label' => 'POS 时钟与本机的偏差（自动维护，不用手填）',
+            'desc'  => '★ 由每 20 分钟一轮的增量补抓自动记录。记账时判「这一单过了多久」'
+                     . '要用主库时间为准，而 grant() 不允许打 POS（主库抖一下就会卡住收银台）——'
+                     . '于是改成「本机时间 + 这个偏差」。'
+                     . '数值明显不为 0 时，说明 POS 主机与本机的时钟/时区对不上，值得查一下',
+        ],
         'drink_major_group' => [
             'group' => 'lookup', 'type' => 'int',
             'label' => '酒水所在的 major_group 编号',

@@ -81,6 +81,7 @@ use Vip\CardNumber;
 use Vip\Repo\CardRepo;
 use Vip\PointsEngine as PE;
 use Vip\Test\FakePosSource;
+use Vip\Test\ExplodingPos;
 
 $opts   = $argv ?? [];
 $fresh  = in_array('--fresh', $opts, true);
@@ -417,6 +418,53 @@ eq('71.70', $mA1['total_spent'], '会员累计消费 71.70');
 $oA1 = $app->orders()->findBySerial('2608130080');
 eq('71.70', $oA1['allocated_amount'], '订单已分配 71.70');
 eq(2, (int)$oA1['alloc_status'], '订单状态 = 已全额分配');
+
+/**
+ * ★★★ 中间那一档（部分分配）也要钉住。
+ *
+ *   applyAllocation() 里 alloc_status 的 CASE 依赖一条【方言级】行为：
+ *   MySQL / MariaDB 的 UPDATE 赋值从左到右求值，后面的表达式看到的是
+ *   前面已经更新过的值（与标准 SQL 不同）。
+ *
+ *   原来那句写成 `WHEN allocated_amount + ? >= total_amount`，
+ *   等于判「旧值 + 2×本次 >= 总额」—— 100.00 的单分到 75.00 就被标成
+ *   「已全额分配」，四人 AA 的第二个人一提交整单就算记完了。
+ *
+ *   而 smoke 原来只断言了两端（全额 / 撤销回 0），中间这一档没有任何断言 ——
+ *   也就是说【那个 bug 本身没被任何东西守着】。谁把 SET 子句换个顺序
+ *   （把 alloc_status 挪到 allocated_amount 前面），它会一字不差地回来，
+ *   而测试全绿。
+ */
+$asSer = '9404440001';
+$db->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $asSer]);
+$db->exec(
+    'INSERT INTO pos_order (store_code, serial_id, order_head_id, check_ids, table_name, eat_type,
+       customer_num, order_end_time, business_date, original_amount, should_amount, actual_amount,
+       tax_amount, total_amount, excluded_amount, portions_counted, portions_uncounted,
+       is_redeemed, redeem_amount, allocated_amount, allocated_portions, alloc_status,
+       created_at, updated_at)
+     VALUES (?,?,?,?,?,0,4,?,?,?,?,?,?,?,?,?,?,0,?,?,?,0,?,?)',
+    [SMOKE_STORE, $asSer, 940001, '1', 'ALLOC', date('Y-m-d H:i:s'), date('Y-m-d'),
+     '100.00', '100.00', '100.00', '0.00', '100.00', '0.00', 4, 0, '0.00', '0.00', '0.00',
+     date('Y-m-d H:i:s'), date('Y-m-d H:i:s')]
+);
+$asStat = static function () use ($db, $asSer): array {
+    $r = $db->one('SELECT allocated_amount, alloc_status FROM pos_order
+                    WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $asSer]);
+    return [(string)$r['allocated_amount'], (int)$r['alloc_status']];
+};
+eq(['0.00', 0], $asStat(), '  ⑴ 未分配 → alloc_status = 0');
+$app->orders()->applyAllocation($asSer, 2500, 1);
+eq(['25.00', 1], $asStat(), '  ⑵ 分了 25.00 / 共 100.00 → 1（部分分配）');
+$app->orders()->applyAllocation($asSer, 2500, 1);
+eq(['50.00', 1], $asStat(), '  ⑶ 分到 50.00 → 仍是 1');
+$app->orders()->applyAllocation($asSer, 2500, 1);
+eq(['75.00', 1], $asStat(), '★★★ ⑷ 分到 75.00 → 【仍是 1】（还剩 25.00，原来这里会错标成 2）');
+$app->orders()->applyAllocation($asSer, 2500, 1);
+eq(['100.00', 2], $asStat(), '  ⑸ 分满 100.00 → 2（已全额分配）');
+$app->orders()->applyAllocation($asSer, -10000, -4);
+eq(['0.00', 0], $asStat(), '  ⑹ 全部退回 → 回到 0');
+$db->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $asSer]);
 
 step('⑤ 超额分配必须被拒绝');
 
@@ -2535,6 +2583,201 @@ ok(str_contains($cgFn, 'lockById('), '★★ 并且第一步就锁住会员那�
 $cgDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id=?', [SMOKE_STORE, $cgMid]);
 $cgDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $cgMid]);
 $cgDb->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $cgMid]);
+
+step('㉗ 值比对：points_include_tax = 0 时税额要按【当下的】算');
+
+/**
+ * ★ 这一条连着栽过三次，每次都是「算钱时拿了一个看起来对的近似值」：
+ *
+ *   ① 值比对压根没传 taxCents → newTotal 恒 ≥ oldTotal，
+ *      每张改过金额的单都挂成人工待办，还污染告警队列。
+ *   ② 补上之后读 $o['tax_amount']，而 pendingVerify() 的 SELECT 没取那一列
+ *      → PHP 静默求值成 null → 0，修了等于没修（实测多留 6 分）。
+ *   ③ 把列补进 SELECT 之后，读到的是【下单时】的旧税额 ——
+ *      金额都改了税额不可能没改，于是又反过来多退了 3 分。
+ *
+ *   ★ 三次都躲过了测试，因为 smoke 的值比对场景一直跑在
+ *     points_include_tax = 1（默认）下 —— 那时 taxCents 本来就该是 0，
+ *     走哪条路结果都一样。所以这一段【必须把开关拨到 0】。
+ */
+$txApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$txDb  = $txApp->localDb();
+$txApp->cfg()->set('points_include_tax', '0');       // ★ 按不含税价积分
+$txApp->cfg()->set('late_grant_minutes', '0');
+$txApp->cfg()->set('max_grants_per_period', '0');
+$txApp->cfg()->set('verify_protect_days', '7');
+
+$txSer = '9303330001';
+$txPos = new FakePosSource();
+$txPos->now = date('Y-m-d H:i:s');
+$txEnd = date('Y-m-d H:i:s', strtotime($txPos->now) - 600);
+$txPos->addHead([
+    'serial_id' => $txSer, 'order_head_id' => 930001, 'check_id' => 1,
+    'table_name' => 'TAX', 'eat_type' => 0, 'customer_num' => 4,
+    'original_amount' => '100.00', 'should_amount' => '100.00', 'actual_amount' => '100.00',
+    'tax_amount' => '9.09', 'order_end_time' => $txEnd,
+]);
+$txPos->addDetail(930001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '25.00', '100.00', 4)]);
+$txApp->setPosSource($txPos);
+
+$txCand = $txApp->points()->locate('TAX', 600)['candidates'][0];
+eq('90.91', $txCand['total'], '① 小票 100.00、税 9.09 → 可积分总额 90.91（不含税）');
+
+$txMid = (int)$txApp->members()->create('TK-00093301-TAX', null, null, null)['id'];
+$txOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true];
+$txG = $txApp->points()->grant($txSer,
+    [['member_id' => $txMid, 'amount_cents' => $txCand['remaining_cents'],
+      'portions' => $txCand['remaining_portions']]],
+    Vip\PointsEngine::MODE_SPLIT, $txOp);
+ok($txG['ok'], '② 整单记账（积分 ' . ($txG['entries'][0]['points'] ?? '-') . '）');
+
+// ③ POS 侧退掉一份：100.00 / 税 9.09 → 75.00 / 税 6.82
+$txPos2 = new FakePosSource();
+$txPos2->now = date('Y-m-d H:i:s');
+$txPos2->addHead([
+    'serial_id' => $txSer, 'order_head_id' => 930001, 'check_id' => 1,
+    'table_name' => 'TAX', 'eat_type' => 0, 'customer_num' => 4,
+    'original_amount' => '100.00', 'should_amount' => '75.00', 'actual_amount' => '75.00',
+    'tax_amount' => '6.82', 'order_end_time' => $txEnd,
+]);
+$txPos2->addDetail(930001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '25.00', '75.00', 3)]);
+$txApp->setPosSource($txPos2);
+$txDb->exec('UPDATE pos_order SET verify_status = 0 WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $txSer]);
+$txApp->reconcile()->verifyAmounts();
+
+$txAfter = $txDb->one('SELECT total_amount FROM pos_order WHERE store_code=? AND serial_id=?',
+                      [SMOKE_STORE, $txSer]);
+eq('68.18', (string)$txAfter['total_amount'],
+   '★★★ ③ 冲正后的可积分总额 = 75.00 − 6.82 = 68.18（用【当下的】税额，不是下单时那个 9.09）');
+
+/**
+ * ★ 顺带钉住税额的来源：必须是 reloadAmounts() 回读的那一份。
+ *   写成从本地镜像取，上面那条断言会变成 65.91（用旧税 9.09 算的）。
+ */
+$rcSrc = (string)file_get_contents(__DIR__ . '/../app/lib/Service/ReconcileService.php');
+ok(str_contains($rcSrc, '$nowTax'),
+   '  └ 税额来自主库回读的 $nowTax（不是本地镜像里那个下单时的旧值）');
+$prSrc = (string)file_get_contents(__DIR__ . '/../app/lib/PosReader.php');
+ok(preg_match('/reloadAmounts.*?tax_amount/s', $prSrc) === 1,
+   '  └ reloadAmounts() 的 SELECT 里确实取了 tax_amount');
+
+$txDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $txMid]);
+$txDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id=?', [SMOKE_STORE, $txMid]);
+$txDb->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $txMid]);
+$txDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $txSer]);
+$txApp->cfg()->set('points_include_tax', '1');
+
+step('㉘ 记账不许碰 POS —— 主库抖动不能卡住收银台');
+
+/**
+ * ★ PointsService 的类注释立着一条：
+ *
+ *     grant() 【不碰 POS】，只在本地库事务内完成分配，
+ *     因此主库抖动不会阻塞收银流程。
+ *
+ *   为了拿主库时间判「补记时限」，这句话一度被破坏 ——
+ *   posNow() 被放进 checkGates() 的逐单循环里。实测：
+ *     POS 正常     单桌 1 次往返、两桌合并 2 次
+ *     POS 不应答   单桌卡 5.0 秒、两桌合并 10.0 秒（merge_max_orders 默认 8 → 最坏 40 秒）
+ *   而且全程占着一个已经开着的本地库事务。
+ *
+ *   现在改成「本机时间 + 时钟偏差」，偏差由 Cron 顺手记。
+ *   这一段用一个【一碰就抛】的假 POS 钉住「真的一次都没碰」。
+ */
+$npApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$npDb  = $npApp->localDb();
+$npApp->cfg()->set('late_grant_minutes', '60');   // 闸门开着才会走到时间判断
+$npApp->cfg()->set('max_grants_per_period', '0');
+$npApp->cfg()->set('merge_span_minutes', '120');
+
+$npSetup = new FakePosSource();
+$npSetup->now = date('Y-m-d H:i:s');
+$npEnd = date('Y-m-d H:i:s', strtotime($npSetup->now) - 300);
+foreach ([1, 2, 3] as $i) {
+    $npSetup->addHead([
+        'serial_id' => "930333100{$i}", 'order_head_id' => 930100 + $i, 'check_id' => 1,
+        'table_name' => "NP{$i}", 'eat_type' => 0, 'customer_num' => 2,
+        'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+        'order_end_time' => $npEnd,
+    ]);
+    $npSetup->addDetail(930100 + $i, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+}
+$npApp->setPosSource($npSetup);
+foreach ([1, 2, 3] as $i) { $npApp->points()->locate("NP{$i}", 600); }
+
+$npM1 = (int)$npApp->members()->create('TK-00093311-NPS', null, null, null)['id'];
+$npM2 = (int)$npApp->members()->create('TK-00093312-NPS', null, null, null)['id'];
+$npOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true];
+
+// ★ 换上一个「一碰就抛」的 POS —— 记账路径上但凡摸它一下就会失败
+$npApp->setPosSource(new ExplodingPos());
+
+$npR1 = $npApp->points()->grant('9303331001',
+    [['member_id' => $npM1, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $npOp);
+ok($npR1['ok'] ?? false,
+   '★★★ POS 一碰就炸的情况下，单桌 grant() 照样成功 —— 说明它真的一次都没碰');
+
+$npR2 = $npApp->points()->grantMerged(['9303331002', '9303331003'], $npM2, $npOp);
+ok($npR2['ok'] ?? false, '★★★ grantMerged() 同样（合并路径是按单数放大的那一条）'
+   . (($npR2['ok'] ?? false) ? '' : ' —— 实际：' . json_encode($npR2, JSON_UNESCAPED_UNICODE)));
+
+/**
+ * ★ 偏差大到不合理时必须【当它不存在】。
+ *
+ *   两台机器的时钟差、哪怕时区填错，最多十几个小时；差到一天以上
+ *   只有两种可能：存的值早过期了，或者 POS 的时钟本身坏了。
+ *   这种时候若照用，后果是【闸门被静默关掉】——
+ *   age 算成负数，补记时限永远不触发，界面上什么都看不出来。
+ *   宁可退回本机时间：那只是基准差几分钟，而不是这道闸门没在工作。
+ *
+ *   （这一条是被测试逼出来的：smoke 的 POS 夹具把时钟钉在
+ *     2026-08-13，于是 Cron 记下的偏差是「-18 天」，
+ *     后面用真实时刻造的单一算就变成「未来的单」，闸门全体失效。）
+ */
+$npApp->cfg()->set('pos_clock_offset_sec', (string)(-30 * 86400));   // 荒谬的偏差
+$npLate = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$npLate->cfg()->set('late_grant_minutes', '60');
+$npLate->cfg()->set('max_grants_per_period', '0');
+$npLatePos = new FakePosSource();
+$npLatePos->now = date('Y-m-d H:i:s');
+$npLatePos->addHead([
+    'serial_id' => '9303331009', 'order_head_id' => 930109, 'check_id' => 1,
+    'table_name' => 'SKEW', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', time() - 5 * 3600),      // 5 小时前
+]);
+$npLatePos->addDetail(930109, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$npLate->setPosSource($npLatePos);
+$npLate->points()->locate('SKEW', 600);
+$npSkewMid = (int)$npLate->members()->create('TK-00093319-SKW', null, null, null)['id'];
+$npSkew = $npLate->points()->grant('9303331009',
+    [['member_id' => $npSkewMid, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT,
+    ['id' => 9, 'name' => '收银员', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => false]);
+ok(($npSkew['ok'] ?? true) === false && ($npSkew['error'] ?? '') === 'manager_required',
+   '★★★ 偏差荒谬（-30 天）时退回本机时间，5 小时前的单照样撞上补记时限'
+   . ' —— 而不是被静默放行（实际：' . ($npSkew['error'] ?? '竟然通过了') . '）');
+$npDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $npSkewMid]);
+$npDb->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $npSkewMid]);
+$npDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id=?', [SMOKE_STORE, '9303331009']);
+
+// 时钟偏差这条路本身也要通
+$npApp->cfg()->set('pos_clock_offset_sec', '0');
+$psSrc = (string)file_get_contents(__DIR__ . '/../app/lib/Service/PointsService.php');
+$psFn  = strstr($psSrc, 'private function posNow');
+$psFn  = $psFn === false ? '' : substr($psFn, 0, 400);
+ok(!str_contains($psFn, '$this->pos->'),
+   '  └ posNow() 里没有任何 $this->pos-> 调用（改成本机时间 + 偏差）');
+$ssSrc = (string)file_get_contents(__DIR__ . '/../app/lib/Service/SyncService.php');
+ok(str_contains($ssSrc, 'pos_clock_offset_sec'),
+   '  └ 偏差由 Cron（SyncService::incremental）顺手记 —— 它本来就要问一次 POS 的时间');
+
+$npDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id IN (?,?)', [SMOKE_STORE, $npM1, $npM2]);
+$npDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id IN (?,?)', [SMOKE_STORE, $npM1, $npM2]);
+$npDb->exec('DELETE FROM member WHERE store_code=? AND id IN (?,?)', [SMOKE_STORE, $npM1, $npM2]);
+$npDb->exec('DELETE FROM pos_order WHERE store_code=? AND serial_id IN (?,?,?)',
+            [SMOKE_STORE, '9303331001', '9303331002', '9303331003']);
 
 step('⑬ 不变量总校验');
 

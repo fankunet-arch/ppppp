@@ -93,6 +93,9 @@ final class FakePosSource implements PosSource
                     'original_amount' => $h['original_amount'],
                     'should_amount'   => $h['should_amount'],
                     'actual_amount'   => $h['actual_amount'],
+                    // ★ 真实 PosReader 会一起回读税额（值比对要用当下的那一份），
+                    //   假 POS 也得给，否则测出来的是「税额恒为 0」那条假路径
+                    'tax_amount'      => $h['tax_amount'] ?? '0.00',
                     'edit_time'       => $h['edit_time'] ?? null,
                 ];
             }
