@@ -54,7 +54,9 @@ $warnings = static function () use ($app): array {
         $app->cfg()->bool('member_collect_pii', false),
         $app->messaging()->readyChannels(),
         $app->cfg()->get('visit_count_mode', 'once_per_period') === 'once_per_period',
-        count($app->mealPeriods()->all())
+        count($app->mealPeriods()->all()),
+        $app->cfg()->get('points_mode', 'by_amount'),
+        $app->cfg()->get('visit_count_mode', 'once_per_period')
     );
 };
 

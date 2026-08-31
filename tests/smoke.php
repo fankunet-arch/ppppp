@@ -717,7 +717,12 @@ $g180 = (new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' =>
     ->rewards()->checkAndGrant($rwId, ['id' => 1, 'name' => 'smoke']);
 eq(1, $g180['granted'], '满 10 次发 1 张券');
 $cid180 = (int)$g180['coupons'][0]['id'];
-$exp180 = date('Y-m-d', strtotime($db->now()) + 180 * 86400);
+/**
+ * ★ 期望值必须按【日历天】算，不能跟着被测代码一起用 N × 86400。
+ *   两边用同一个错公式的话，跨夏令时时会一起错、正好抵消 ——
+ *   测试永远绿，而客人手里的券少一天。
+ */
+$exp180 = (new DateTimeImmutable($db->now()))->modify('+180 days')->format('Y-m-d');
 eq($exp180, (string)$db->value('SELECT valid_to FROM coupon WHERE id = ?', [$cid180]),
     '按当时规则 180 天定下到期日');
 
@@ -727,7 +732,7 @@ $db->exec('UPDATE member SET visit_count = 20 WHERE id = ?', [$rwId]);
 $g90 = (new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))
     ->rewards()->checkAndGrant($rwId, ['id' => 1, 'name' => 'smoke']);
 $cid90 = (int)$g90['coupons'][0]['id'];
-eq(date('Y-m-d', strtotime($db->now()) + 90 * 86400),
+eq((new DateTimeImmutable($db->now()))->modify('+90 days')->format('Y-m-d'),
    (string)$db->value('SELECT valid_to FROM coupon WHERE id = ?', [$cid90]),
    '新券按新规则 90 天');
 eq($exp180, (string)$db->value('SELECT valid_to FROM coupon WHERE id = ?', [$cid180]),
@@ -2987,6 +2992,192 @@ $pvDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$pvI
 $pvDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pvIds})", [SMOKE_STORE]);
 $pvDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '91011100%'", [SMOKE_STORE]);
 
+step('㉛ 值比对：整单归零要连计次一起收回');
+
+/**
+ * ★ 原来这里 counted_visit 恒为 0，理由是「金额缩水不改变吃了几份套餐」。
+ *
+ *   部分缩水确实如此 —— 退掉一杯酒，那顿饭还是吃了。
+ *   但【整单归零】不一样：那顿饭在 POS 上已经不存在了，
+ *   而计次是直接换免费餐的（docs/03 §5）。原来的行为是
+ *   分退了、十送一那个格子还留着 —— 免费餐才是真花钱的东西。
+ *
+ *   手工撤销 /points/reverse 一直是分和次都退干净的；
+ *   两条路对同一件事给出不同结果，本身就说不通。
+ *
+ *   ⑩ 那一段测的是【部分缩水不动计次】，与这一段是一对，两边都要绿。
+ */
+$zvApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$zvDb  = $zvApp->localDb();
+$zvApp->cfg()->set('late_grant_minutes', '0');
+$zvApp->cfg()->set('max_grants_per_period', '0');
+$zvApp->cfg()->set('visit_count_mode', 'once_per_period');
+$zvApp->cfg()->set('points_mode', 'by_amount');
+$zvApp->cfg()->set('points_per_euro', '1.0');
+$zvApp->cfg()->set('points_multiplier', '1.0');
+
+$zvPos = new FakePosSource();
+$zvPos->now = date('Y-m-d H:i:s');
+$zvPos->addHead([
+    'serial_id' => '9202220001', 'order_head_id' => 920001, 'check_id' => 1,
+    'table_name' => 'ZV1', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($zvPos->now) - 300),
+]);
+$zvPos->addDetail(920001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$zvApp->setPosSource($zvPos);
+$zvApp->points()->locate('ZV1', 600);
+
+$zvOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true];
+$zvM  = (int)$zvApp->members()->create('TK-00092201-ZVA', null, null, null)['id'];
+$zvG  = $zvApp->points()->grant('9202220001',
+    [['member_id' => $zvM, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $zvOp);
+ok($zvG['ok'], '记账成功');
+eq(47, (int)$zvG['entries'][0]['points'], '  └ 47 分');
+eq(1,  (int)$zvG['entries'][0]['visits'], '  └ 计次 1');
+
+$zvBefore = $zvApp->members()->findById($zvM);
+eq(1, (int)$zvBefore['visit_count'], '前提：会员计次 1');
+
+// POS 侧整单作废：金额归零
+foreach ($zvPos->heads as $i => $h) {
+    if ($h['serial_id'] === '9202220001') {
+        $zvPos->heads[$i]['original_amount'] = '0.00';
+        $zvPos->heads[$i]['should_amount']   = '0.00';
+        $zvPos->heads[$i]['actual_amount']   = '0.00';
+    }
+}
+$zvApp->orders()->markVerified('9202220001', 0);
+$zvR = $zvApp->reconcile()->verifyAmounts();
+ok($zvR['ok'], '值比对执行成功');
+
+$zvAfter = $zvApp->members()->findById($zvM);
+eq(0, (int)$zvAfter['points_balance'], '整单归零 → 积分退干净');
+eq(0, (int)$zvAfter['visit_count'],
+   '★★★ 整单归零 → 【计次也收回】。原来只退分不退次，十送一那个格子会白留一格');
+
+$zvRef = $zvDb->one(
+    'SELECT * FROM point_ledger WHERE store_code=? AND serial_id=? AND entry_type=3',
+    [SMOKE_STORE, '9202220001']);
+ok($zvRef !== null, '产生了冲正流水');
+eq(-1, (int)$zvRef['counted_visit'],
+   '  └ 流水里如实记着 -1 次（不是偷偷改 member 表，账本仍然是唯一真相）');
+
+/**
+ * ★★★ 打错单 → 作废 → 同一餐期重打一张，客人必须仍然拿到 1 次。
+ *
+ *   这是「整单归零收回计次」带出来的第二层问题，不补上就是把一个洞
+ *   换成另一个洞：countedThisSitting() 判「本餐期记过没有」走的是
+ *   earnedInRange()，只看 entry_type=消费 且 status=有效 ——
+ *   作废单的原始流水还挂在那儿，就一直占着「已经记过了」这个位置。
+ *   于是作废退掉一次、重打的那单又不计次，客人白吃一顿。
+ */
+$zvPos->addHead([
+    'serial_id' => '9202220003', 'order_head_id' => 920003, 'check_id' => 1,
+    'table_name' => 'ZV3', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($zvPos->now) - 260),
+]);
+$zvPos->addDetail(920003, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$zvApp->points()->locate('ZV3', 600);
+$zvM3 = (int)$zvApp->members()->create('TK-00092203-ZVC', null, null, null)['id'];
+$zvApp->points()->grant('9202220003',
+    [['member_id' => $zvM3, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $zvOp);
+eq(1, (int)$zvApp->members()->findById($zvM3)['visit_count'], '打错的那一单先记上：计次 1');
+
+foreach ($zvPos->heads as $i => $h) {          // POS 侧作废
+    if ($h['serial_id'] === '9202220003') {
+        $zvPos->heads[$i]['original_amount'] = '0.00';
+        $zvPos->heads[$i]['should_amount']   = '0.00';
+        $zvPos->heads[$i]['actual_amount']   = '0.00';
+    }
+}
+$zvApp->orders()->markVerified('9202220003', 0);
+$zvApp->reconcile()->verifyAmounts();
+eq(0, (int)$zvApp->members()->findById($zvM3)['visit_count'], '  └ 作废后退回 0 次');
+eq(2, (int)$zvDb->value(
+        'SELECT status FROM point_ledger WHERE store_code=? AND serial_id=? AND entry_type=1',
+        [SMOKE_STORE, '9202220003']),
+   '  └ 原始流水标记为已冲正（status=2），退出风控视野');
+
+// 同一餐期重打一张，记给同一张卡
+$zvPos->addHead([
+    'serial_id' => '9202220004', 'order_head_id' => 920004, 'check_id' => 1,
+    'table_name' => 'ZV4', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($zvPos->now) - 200),
+]);
+$zvPos->addDetail(920004, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$zvApp->points()->locate('ZV4', 600);
+$zvR3 = $zvApp->points()->grant('9202220004',
+    [['member_id' => $zvM3, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $zvOp);
+eq(1, (int)$zvR3['entries'][0]['visits'],
+   '★★★ 重打的那一单【正常计次】—— 作废单不再占着「本餐期已记过」');
+eq(1, (int)$zvApp->members()->findById($zvM3)['visit_count'],
+   '  └ 客人真吃了一顿，最终就是 1 次（不多不少）');
+
+/**
+ * ★ 对照组：同样的路径，但只缩水一半 —— 计次必须【不动】。
+ *   没有这一条的话，把 counted_visit 无脑改成「总是收回」也能让上面那条变绿。
+ */
+$zvPos->addHead([
+    'serial_id' => '9202220002', 'order_head_id' => 920002, 'check_id' => 1,
+    'table_name' => 'ZV2', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($zvPos->now) - 280),
+]);
+$zvPos->addDetail(920002, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$zvApp->points()->locate('ZV2', 600);
+$zvM2 = (int)$zvApp->members()->create('TK-00092202-ZVB', null, null, null)['id'];
+$zvApp->points()->grant('9202220002',
+    [['member_id' => $zvM2, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $zvOp);
+foreach ($zvPos->heads as $i => $h) {
+    if ($h['serial_id'] === '9202220002') {
+        $zvPos->heads[$i]['original_amount'] = '23.90';
+        $zvPos->heads[$i]['should_amount']   = '23.90';
+        $zvPos->heads[$i]['actual_amount']   = '23.90';
+    }
+}
+$zvApp->orders()->markVerified('9202220002', 0);
+$zvApp->reconcile()->verifyAmounts();
+$zvA2 = $zvApp->members()->findById($zvM2);
+eq(1, (int)$zvA2['visit_count'],
+   '★★ 对照：只缩水一半 → 计次【原样保留】（那顿饭确实吃了）');
+eq(23, (int)$zvA2['points_balance'], '  └ 分按比例退到 23');
+
+$zvIds = implode(',', [$zvM, $zvM2, $zvM3]);
+$zvDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$zvIds})", [SMOKE_STORE]);
+$zvDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$zvIds})", [SMOKE_STORE]);
+$zvDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$zvIds})", [SMOKE_STORE]);
+$zvDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '92022200%'", [SMOKE_STORE]);
+
+step('㉜ 后台红条：按次数积分 × 按份数计次');
+
+/**
+ * ★ 两个正交开关相乘出来的坑。
+ *   by_visit 的分【直接乘计次数】，而 by_portion 下一张 10 人 10 份的小票计 10 次。
+ *   于是后台标签写着「来一次积几分」，实际是「一份积几分」——
+ *   捡到这样一张小票的人当场就能换一顿免费的饭，外加 10 分。
+ *   不拦（店家可能真想要），但必须让他知道自己选的是这个。
+ */
+$wOf = static function (array $ws, string $key): ?array {
+    foreach ($ws as $w) { if (($w['key'] ?? '') === $key) { return $w; } }
+    return null;
+};
+eq(null, $wOf(Vip\Features::warnings(false, [], true, 2, 'by_amount', 'by_portion'), 'by_visit_by_portion'),
+   '按金额积分 + 按份数计次 → 不提醒（分不跟着份数走）');
+eq(null, $wOf(Vip\Features::warnings(false, [], true, 2, 'by_visit', 'once_per_period'), 'by_visit_by_portion'),
+   '按次数积分 + 一人一餐期一次 → 不提醒（这才是它的正常搭配）');
+$wHit = $wOf(Vip\Features::warnings(false, [], false, 2, 'by_visit', 'by_portion'), 'by_visit_by_portion');
+ok($wHit !== null, '★★★ 按次数积分 + 按份数计次 → 后台挂红条');
+eq('error', $wHit['level'] ?? '', '  └ 级别是 error，不是可以忽略的提示');
+ok(str_contains($wHit['text'] ?? '', '一份积几分'),
+   '  └ 说清了后果：「来一次积几分」实际变成了「一份积几分」');
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(
@@ -3017,6 +3208,36 @@ $memBad = $db->all(
      HAVING m.points_balance <> COALESCE(SUM(l.points),0)',
     [SMOKE_STORE]);
 eq([], $memBad, '★ 每名会员的积分余额与其流水合计一致');
+
+/**
+ * ★ 计次也要对得上账本。
+ *
+ *   以前没有这一条，因为计次只增不减 —— member.visit_count 和
+ *   SUM(counted_visit) 不可能分家。现在值比对会在【整单归零】时
+ *   写 -1 次（㉛），撤销也会写负数，两边就可能对不上了：
+ *   少写一边的后果是十送一凭空多一格或少一格，而账本才是唯一真相。
+ */
+/**
+ * ★ 排除三个【手工写死 visit_count】的夹具会员（⑫bis 与金卡门槛那两段）。
+ *   它们是为了测「门槛改了之后应发数怎么自愈」，直接把计次设成 8/10/20，
+ *   没有对应的账本流水 —— 那是测试的抄近路，不是产品的不一致。
+ */
+$seeded = implode(',', array_map('intval', [$rwId, $goldMid, $plainMid]));
+$visitBad = $db->all(
+    "SELECT m.card_no, m.visit_count, COALESCE(SUM(l.counted_visit),0) AS s
+       FROM member m
+       LEFT JOIN point_ledger l ON l.member_id = m.id AND l.store_code = m.store_code
+      WHERE m.store_code = ? AND m.id NOT IN ({$seeded})
+      GROUP BY m.id, m.card_no, m.visit_count
+     HAVING m.visit_count <> COALESCE(SUM(l.counted_visit),0)",
+    [SMOKE_STORE]);
+eq([], $visitBad, '★ 每名会员的计次与其流水 counted_visit 合计一致');
+
+$negBad = $db->all(
+    'SELECT card_no, points_balance, visit_count FROM member
+      WHERE store_code = ? AND (points_balance < 0 OR visit_count < 0)',
+    [SMOKE_STORE]);
+eq([], $negBad, '★ 没有负积分 / 负计次的会员（冲正不该把人扣穿）');
 
 $auditN = (int)$db->value('SELECT COUNT(*) FROM audit_log WHERE store_code=?', [SMOKE_STORE]);
 ok($auditN >= 5, "审计日志 {$auditN} 条（发分/撤销/手工录入均留痕）");

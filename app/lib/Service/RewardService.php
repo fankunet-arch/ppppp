@@ -333,16 +333,42 @@ final class RewardService
      * 后两个参数是【为了事后能解释】：门槛与倍率都是活查的，改一次之后
      * 「这张券当初凭什么发的」就再也答不上来。客人申诉、会计对账都要看它。
      */
+    /**
+     * 券的到期日 = 发券当天 + N 个【日历天】。0 天 = 永久（返回 null）。
+     *
+     * ── 🔴 为什么不能写成 strtotime($now) + N * 86400 ──────
+     *
+     * 跨夏令时切换时两者差一小时，足以把日期推过午夜：
+     *
+     *     Europe/Madrid  2026-07-29 00:30 发券 + 90 天
+     *       加秒数 → 2026-10-26      日历天 → 2026-10-27   ❌ 少一天
+     *
+     * 而晚市餐期是 19:30–次日 02:00（db/seeds/002_meal_period.sql），
+     * **00:xx 发券是这家店的常态**，不是边角。实测 Madrid 全年
+     * ×3 个时刻 ×3 档有效期共 3285 组，旧写法错 550 组（17%）。
+     *
+     * docs/11 立的规矩是「券面/卡面上印的日子就是最终的日子」——
+     * 少一天正好落在这条承诺的反面，而客人是拿着券被拒时才发现的。
+     *
+     * ★ 单独拎成静态方法是为了能不连库、跨时区地测（tests/cases/RewardTest.php）。
+     */
+    public static function expiryDate(string $issuedAt, int $validDays): ?string
+    {
+        if ($validDays <= 0) {
+            return null;
+        }
+        return (new \DateTimeImmutable($issuedAt))
+            ->modify('+' . $validDays . ' days')
+            ->format('Y-m-d');
+    }
+
     private function issue(int $memberId, int $source, int $progress,
                            int $validDays, ?string $note, array $operator,
                            ?string $tierCode = null, ?int $threshold = null): array
     {
         $now  = $this->db->now();
         $code = strtoupper(bin2hex(random_bytes(4)));   // 8 位，够短能口头核对
-        // 发券当刻定死；0 = 永久（valid_to 存 NULL）
-        $to   = $validDays > 0
-            ? date('Y-m-d', strtotime($now) + $validDays * 86400)
-            : null;
+        $to   = self::expiryDate($now, $validDays);
 
         $this->db->exec(
             'INSERT INTO coupon

@@ -105,6 +105,7 @@ require __DIR__ . '/cases/BootGuardTest.php';
 require __DIR__ . '/cases/SqlTextTest.php';
 require __DIR__ . '/cases/CardNumberTest.php';
 require __DIR__ . '/cases/ContainerCompatTest.php';
+require __DIR__ . '/cases/RewardTest.php';
 require __DIR__ . '/cases/I18nTest.php';
 require __DIR__ . '/cases/CacheBustTest.php';
 require __DIR__ . '/cases/DomRefTest.php';
