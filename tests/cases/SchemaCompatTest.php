@@ -706,9 +706,19 @@ T::false((bool)preg_match('/checkIntegrity\(\(int\)\(\$argv\[2\]/', $cronSrc),
 T::true((bool)preg_match('/\$a\[0\]\s*!==\s*.-./', $cronSrc),
     'cron 解析位置参数时先剔除 - 开头的选项');
 
-// 实跑：-v 绝不能改变检查天数
+/**
+ * 实跑：-v 绝不能改变检查天数。
+ *
+ * ★ 这一段需要 app/config/config.php（cron 要连库）。没有配置文件时
+ *   【必须明说跳过了】—— 原来是静默 if，新人 clone 之后跑出来是 887 项，
+ *   而 README 写着 892，对不上还查不出原因；而跳掉的这几条
+ *   恰恰是检查部署配置的那几条。静默跳过比跑不过更危险。
+ */
 $cronBin = __DIR__ . '/../../bin/cron.php';
-if (is_file(__DIR__ . '/../../app/config/config.php')) {
+if (!is_file(__DIR__ . '/../../app/config/config.php')) {
+    T::skip(5, '缺 app/config/config.php —— cron 实跑那 5 项跳过'
+              . '（复制 app/config/config.example.php 并填好数据库即可跑全）');
+} else {
     $run = static function (string $args) use ($cronBin): int {
         $out = (string)shell_exec('php ' . escapeshellarg($cronBin) . ' ' . $args . ' 2>&1');
         // findings 里每条都带一个 "kind"，数它就知道到底查了没有

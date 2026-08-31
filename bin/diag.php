@@ -92,6 +92,31 @@ if (($local['password'] ?? '') === '') {
 }
 echo "     本地库目标：{$local['user']}@{$local['host']}:{$local['port']}/{$local['database']}\n";
 
+/**
+ * ★ card_prefix 必须在这里查，不能等到发卡那天。
+ *
+ *   前缀含 I / L / O / U 时，扫码纠错（normalize）会把它们换成
+ *   1 / 1 / 0 / V，卡号于是跟自己对不上 —— 自己生成的卡号被自己判为非法，
+ *   查卡、建卡、激活全部失效。而按 docs/10 的上线步骤，
+ *   发卡是最后一步：卡都印出来了才发现，就只能重印。
+ */
+// ★ 这里【不加载 autoloader】—— diag 的全部价值就在于「什么都坏了它还能跑」。
+//   所以规则在这儿抄一份（与 CardNumber 构造函数一致），而不是去 new 它。
+$prefix = strtoupper(trim((string)($cfg['card_prefix'] ?? 'TK')));
+if (!preg_match('/^[A-Z]{1,4}$/', $prefix)) {
+    $no("config.card_prefix = {$prefix} —— 必须是 1~4 位字母");
+    $fail++;
+} elseif (strpbrk($prefix, 'ILOU') !== false) {
+    $no("config.card_prefix = {$prefix} —— 不能含 I / L / O / U");
+    echo "\n     这几个字母在卡面上与 1 / 0 / V 分不清，扫码纠错会把它们换掉，\n";
+    echo "     卡号于是跟自己对不上：查卡、建卡、激活会全部失效。\n";
+    echo "     而按 docs/10，发卡是上线的最后一步 —— 不改的话，卡印出来了才会发现。\n";
+    echo "     改成不含这四个字母的即可（TK、SV、MK…）。\n\n";
+    $fail++;
+} else {
+    $ok("config.card_prefix = {$prefix}（不含 I/L/O/U，可用）");
+}
+
 // ── 2. PHP 扩展 ───────────────────────────────────────────
 $hd('② PHP 扩展');
 foreach (['pdo_mysql' => '本地库', 'mysqli' => 'POS 只读'] as $ext => $why) {

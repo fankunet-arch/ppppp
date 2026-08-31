@@ -229,41 +229,72 @@ final class RewardService
             return ['granted' => 0, 'pending' => 0, 'coupons' => []];
         }
 
-        $m = $this->members->findById($memberId);
-        if ($m === null) {
-            return ['granted' => 0, 'pending' => 0, 'coupons' => []];
-        }
-        $p = $this->progressOf($m, $tier);
-        if ($p['pending'] <= 0) {
-            return ['granted' => 0, 'pending' => 0, 'coupons' => []];
-        }
-        if (!$r['auto_grant']) {
-            // 只提示不发，后台「会员」页可手工发
-            return ['granted' => 0, 'pending' => $p['pending'], 'coupons' => []];
-        }
+        /**
+         * ★★★ 整段必须在【一个事务】里，并且第一步就把会员那一行锁住。
+         *
+         * ── 不锁会怎样 ──────────────────────────────────
+         * 这个方法原来是「读 → 算 pending → 发券 → 加计数」四步裸奔。
+         * 幂等只靠 rewards_issued，而那个结论【只在串行下成立】：
+         *
+         *   两个请求同时读到 rewards_issued = 0、visit_count = 10
+         *   → 各自算出 pending = 1 → 各发一张 → 各加 1
+         *   实测 4 个进程对齐调用：发出 4 张免费餐券（应发 1 张）。
+         *
+         * ── 现实中怎么撞上 ──────────────────────────────
+         * ① 门店有多台 Pad。grantMerged() 专门为「两台 Pad 同时合并」
+         *    写了排序防死锁，多 Pad 并发是这套系统的既定前提。
+         * ② 同一位客人的两桌单被两名收银员几乎同时记账 —— 而「同行分桌」
+         *    正是这套系统重点支持的场景。
+         * ③ ★ 不需要并发也会中招：原来是【全部发完才加计数】，
+         *    中间任何一次进程终止（PHP 超时、平板断网重试打断 FPM）
+         *    都会留下「券已发出、计数没加」，下一次记账再发一遍。
+         *    实测：券 1 张 + 计数 0 → 下次记账又发 1 张 → 共 2 张。
+         *
+         * 券是真金白银的一顿饭，而 void() 不回退 rewards_issued，
+         * 发多了只能人工逐张作废。
+         *
+         * ★ 调用方（api/routes.php）刻意把 checkAndGrant 放在记账事务【之外】
+         *   —— 发券失败不该把已记好的积分一起回滚。那个决定是对的，
+         *   所以这里自己开一个独立事务，而不是指望外面那个。
+         */
+        return $this->db->transaction(function () use ($memberId, $tier, $r, $operator): array {
+            // 行锁：并发的第二个请求会停在这里，等第一个提交后才读到新的 rewards_issued
+            $m = $this->members->lockById($memberId);
+            if ($m === null) {
+                return ['granted' => 0, 'pending' => 0, 'coupons' => []];
+            }
+            $p = $this->progressOf($m, $tier);
+            if ($p['pending'] <= 0) {
+                return ['granted' => 0, 'pending' => 0, 'coupons' => []];
+            }
+            if (!$r['auto_grant']) {
+                // 只提示不发，后台「会员」页可手工发
+                return ['granted' => 0, 'pending' => $p['pending'], 'coupons' => []];
+            }
 
-        $out = [];
-        for ($i = 0; $i < $p['pending']; $i++) {
-            $out[] = $this->issue(
-                $memberId,
-                $r['mode'] === 'amount' ? self::SRC_AMOUNT : self::SRC_VISITS,
-                $p['progress'],
-                $r['valid_days'],
-                null,
-                $operator,
-                // 门槛是活查的 —— 券上不定格的话，改一次门槛就再也说不清
-                // 「这张券当初凭什么发的」。客人申诉、会计对账都要看它
-                $tier['code'] ?? null,
-                $p['threshold']
+            $out = [];
+            for ($i = 0; $i < $p['pending']; $i++) {
+                $out[] = $this->issue(
+                    $memberId,
+                    $r['mode'] === 'amount' ? self::SRC_AMOUNT : self::SRC_VISITS,
+                    $p['progress'],
+                    $r['valid_days'],
+                    null,
+                    $operator,
+                    // 门槛是活查的 —— 券上不定格的话，改一次门槛就再也说不清
+                    // 「这张券当初凭什么发的」。客人申诉、会计对账都要看它
+                    $tier['code'] ?? null,
+                    $p['threshold']
+                );
+            }
+            $this->db->exec(
+                'UPDATE member SET rewards_issued = rewards_issued + ?, updated_at = ?
+                  WHERE store_code = ? AND id = ?',
+                [count($out), $this->db->now(), $this->storeCode, $memberId]
             );
-        }
-        $this->db->exec(
-            'UPDATE member SET rewards_issued = rewards_issued + ?, updated_at = ?
-              WHERE store_code = ? AND id = ?',
-            [count($out), $this->db->now(), $this->storeCode, $memberId]
-        );
 
-        return ['granted' => count($out), 'pending' => 0, 'coupons' => $out];
+            return ['granted' => count($out), 'pending' => 0, 'coupons' => $out];
+        });
     }
 
     /** 后台手工发一张（补偿、投诉处理等），需写明原因 */

@@ -28,6 +28,9 @@ final class T
 {
     public static int $pass = 0;
     public static int $fail = 0;
+    public static int $skip = 0;
+    /** @var array<int,string> */
+    private static array $skips = [];
     private static string $group = '';
 
     public static function group(string $g): void
@@ -59,12 +62,33 @@ final class T
         self::eq(false, $v, $msg);
     }
 
+    /**
+     * 明说「这几项跳过了，因为……」。
+     *
+     * ★ 静默跳过比跑不过更危险：新人 clone 之后跑出来的项数与 README 对不上，
+     *   查不出原因，而跳掉的往往正是检查部署配置的那几条。
+     *   跳过的项数计入总数，末尾单独列出来，谁也不会以为「全跑了」。
+     */
+    public static function skip(int $n, string $why): void
+    {
+        self::$skip += $n;
+        self::$skips[] = "{$n} 项：{$why}";
+        echo "  \033[33m⊘\033[0m 跳过 {$n} 项 —— {$why}\n";
+    }
+
     public static function summary(): int
     {
-        $total = self::$pass + self::$fail;
+        $total = self::$pass + self::$fail + self::$skip;
         echo "\n" . str_repeat('─', 60) . "\n";
+        if (self::$skip > 0) {
+            echo "\033[33m跳过 " . self::$skip . " 项\033[0m\n";
+            foreach (self::$skips as $line) {
+                echo "  · $line\n";
+            }
+        }
         if (self::$fail === 0) {
-            echo "\033[32m全部通过\033[0m  $total 项断言\n";
+            echo "\033[32m全部通过\033[0m  " . self::$pass . " 项断言"
+               . (self::$skip > 0 ? '（另跳过 ' . self::$skip . ' 项，共 ' . $total . '）' : '') . "\n";
             return 0;
         }
         echo "\033[31m失败 " . self::$fail . "\033[0m / 共 $total 项断言\n";

@@ -230,8 +230,45 @@ $api->on('POST', '/order/locate', static function () use ($app, $requireOperator
     if ($table === '') {
         Api::fail('bad_request');
     }
-    $win = Api::int($b, 'window_minutes', 0);
-    $r   = $app->points()->locate($table, $win > 0 ? $win : null);
+    /**
+     * ★★★ 找单的时间窗【由服务端说了算】，客户端只能在后台设定的范围内挑。
+     *
+     * ── 原来漏了什么 ──────────────────────────────────
+     * 原来是 `$win > 0 ? $win : null`，客户端传多少就是多少，一路传到
+     * PosReader 的 `WHERE order_end_time >= NOW() - INTERVAL ? MINUTE`，
+     * 中间没有任何封顶。实测：一个普通收银员账号传 window_minutes=5256000
+     * （十年），一次捞回 19 张跨三周的历史单，带金额、份数、菜品明细、
+     * 已经记给了谁。
+     *
+     * 两件事同时坏掉：
+     *
+     * ① 后台那两项配置形同虚设。order_lookup_window_min /
+     *    lookup_fallback_window_min 正是店家用来限制「能往回捞多久」的。
+     *    补记时限（late_grant_minutes）只在【记账】时拦，【找单】不拦 ——
+     *    而找单本身就把别桌的单摊开给你看了。
+     *
+     * ② 对 POS 的无上限扫描入口。docs/02 铁律第一条是「绝不全表扫」，
+     *    docs/README「核心前提」写着「POS 主机性能极度受限」。
+     *    虽然 SQL 带 LIMIT 20，但十年窗口 + table_name 无索引 =
+     *    沿 idx_order_end_time 一路倒扫，冷门桌号能扫到库底。
+     *
+     * ── 对照 ──────────────────────────────────────────
+     * /order/locate-invoice 把「会被人拿去当探针」写进了注释，做了四层防护。
+     * 按桌号这条是同一类入口，原来一层都没有。
+     *
+     * 现在：客户端最多只能放宽到后台设定的「放宽窗口」，
+     * 传得再大也按那个数走，并且回话里把真正生效的 window 告诉前端。
+     */
+    $reqWin = Api::int($b, 'window_minutes', 0);
+    // 上限取两项配置里较大的那个：默认窗口本身就是店家认可的范围，
+    // 若它比「放宽窗口」还大，客户端不该反而被卡到更小的数上
+    $capWin = max(
+        1,
+        $app->cfg()->int('order_lookup_window_min', 30),
+        $app->cfg()->int('lookup_fallback_window_min', 60)
+    );
+    $win    = $reqWin > 0 ? min($reqWin, $capWin) : null;
+    $r      = $app->points()->locate($table, $win);
 
     if (!$r['ok'] && ($r['reason'] ?? '') === 'pos_unavailable') {
         Api::fail('pos_unavailable', 503);
@@ -329,7 +366,15 @@ $api->on('POST', '/order/free-meal', static function () use ($app, $requireOpera
         Api::fail('order_not_found', Api::NOT_FOUND);
     }
     $app->orders()->markFreeMeal($serial, $isFree);
-    $app->audit()->log('coupon_redeem', [
+    /**
+     * ★ 单独一个 action 名，不要借用 coupon_redeem。
+     *
+     *   RewardService::redeem() 用的就是 coupon_redeem。两件事混在同一个桶里，
+     *   后台审计页按 action 一筛，「真的核销了一张券」和「服务员点了下免费餐开关」
+     *   分不开 —— 而这与 auditForced() 里立的原则正相反
+     *   （「单独一个 action 名，筛一下就是全部破例」）。
+     */
+    $app->audit()->log('order_free_meal', [
         'target_type' => 'order', 'target_id' => $serial,
         'operator_id' => $op['id'], 'operator_name' => $op['name'], 'device' => $op['device'],
         'detail' => ['is_free_meal' => $isFree],
@@ -875,10 +920,32 @@ $api->on('POST', '/points/split', static function () use ($app, $requireOperator
     $remainPort  = (int)$o['portions_counted'] - (int)$o['allocated_portions'];
 
     $parts = PE::splitEvenly(max(0, $remainCents), max(0, $remainPort), $n);
-    Api::ok(['shares' => array_map(static fn($p) => [
-        'amount'   => Money::toStr($p['amount_cents']),
-        'portions' => $p['portions'],
-    ], $parts)]);
+
+    /**
+     * ★ once_per_period 口径下，每人就是【1 份】，不按剩余份数摊。
+     *
+     *   splitEvenly 会把 8 份摊给 7 个人成 [2,1,1,1,1,1,1] —— 第一位拿 2 份。
+     *   而在这个口径下多出来的那 1 份对他毫无意义（照样只记 1 次），
+     *   却会让界面上出现一个「2」，看着像哪里算错了。
+     *
+     *   人数已经被 too_many_members 限制在 ≤ 份数以内，
+     *   所以每人 1 份的合计一定不超。仍然按剩余份数兜一道底：
+     *   万一人数比份数多（绕开界面直接调的），排在后面的人拿 0 份，
+     *   由服务端的 exceeds_portions / portions_without_amount 接住。
+     */
+    $perPerson = $app->cfg()->get('visit_count_mode', 'once_per_period') === 'once_per_period' ? 1 : null;
+    $left      = max(0, $remainPort);
+    $shares    = [];
+    foreach ($parts as $p) {
+        $give = $p['portions'];
+        if ($perPerson !== null) {
+            // 没分到钱的人不给份 —— 与 splitEvenly / portions_without_amount 同一条规则
+            $give = ($p['amount_cents'] > 0 && $left > 0) ? min($perPerson, $left) : 0;
+            $left -= $give;
+        }
+        $shares[] = ['amount' => Money::toStr($p['amount_cents']), 'portions' => $give];
+    }
+    Api::ok(['shares' => $shares, 'portions_per_person' => $perPerson]);
 });
 
 /** 撤销 —— 追加反向冲正，不物理删除 */

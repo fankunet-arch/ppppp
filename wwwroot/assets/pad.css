@@ -338,23 +338,28 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
  *   只是这个位子有人了。红橙两档要留给「必须处理」和「看一眼」，
  *   第三种状态再挤进去，三种就都不管用了。
  */
-.person.locked {
-  background: #f1f3f6;
-  border-style: dashed;
-  border-color: var(--exit-line);
-  color: var(--muted);
-}
-.person.locked .who b { color: var(--exit); font-variant-numeric: tabular-nums; }
-.person.locked .lockmark {
-  flex: 0 0 auto;
-  font-size: 13px;
-  font-weight: 600;
+/**
+ * 已经记掉的那一行。
+ *
+ * ★ 骨架与可编辑行完全相同（卡号 + 金额框 + 份数框），
+ *   唯一的差别是【框是灰的、点不动】—— 那正是要传达的信息：
+ *   这个位子有人了。长得不一样的话，服务员得横着比才看得出差别。
+ */
+.person.locked { background: #f6f7f9; }
+.person.locked .who b {
   color: var(--exit);
-  background: var(--exit-bg);
-  border: 1px solid var(--exit-line);
-  border-radius: 999px;
-  padding: 4px 12px;
-  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  font-size: 17px;
+}
+
+/* 锁死的输入框：灰底、深字（不是浅灰），值必须读得清 —— 它是答案，不是占位符 */
+.person input:disabled,
+.person input[readonly] {
+  background: #e7eaef;
+  color: var(--exit);
+  border-color: var(--exit-line);
+  cursor: not-allowed;
+  font-weight: 600;
 }
 
 .totals {

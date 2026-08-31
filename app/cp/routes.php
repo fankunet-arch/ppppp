@@ -110,10 +110,30 @@ $api->on('GET', '/dashboard', static function () use ($app, $requireManager): vo
     Api::ok([
         'business_date' => $today,
         'orders_today'  => $row('SELECT COUNT(*) FROM pos_order WHERE store_code=? AND business_date=?', [$store, $today]),
-        'granted_today' => $row('SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND entry_type=1 AND status=1 AND created_at>=?',
-                                [$store, date('Y-m-d 00:00:00')]),
-        'points_today'  => $row('SELECT COALESCE(SUM(points),0) FROM point_ledger WHERE store_code=? AND created_at>=?',
-                                [$store, date('Y-m-d 00:00:00')]),
+        /**
+         * ★ 三个「今天」必须是【同一个今天】。
+         *
+         *   orders_today 走 business_date（02:00 切点），而这两个原来走
+         *   date('Y-m-d 00:00:00')（自然日）。00:00–02:00 之间
+         *   （晚市餐期还没结束）：订单数还算昨天的，笔数和分数已经跳到今天，
+         *   夜班收银员看到的首页三个数互相对不上。
+         *
+         * ★ points_today 是【净额】：包含撤销与冲正的负分，故意不筛 entry_type
+         *   —— 首页要回答的是「今天实际发出去多少分」。
+         *   granted_today 只数 entry_type=1，回答的是「记了几笔」。
+         *   两者口径不同是有意的，标签里已经写清楚。
+         */
+        'granted_today' => $row('SELECT COUNT(*) FROM point_ledger l JOIN pos_order o
+                                    ON o.store_code=l.store_code AND o.serial_id=l.serial_id
+                                  WHERE l.store_code=? AND l.entry_type=1 AND l.status=1
+                                    AND o.business_date=?', [$store, $today])
+                         + $row('SELECT COUNT(*) FROM point_ledger
+                                  WHERE store_code=? AND entry_type=1 AND status=1
+                                    AND serial_id IS NULL AND created_at>=? AND created_at<?',
+                                array_merge([$store], $app->businessDay()->range($today))),
+        'points_today'  => $row('SELECT COALESCE(SUM(points),0) FROM point_ledger
+                                  WHERE store_code=? AND created_at>=? AND created_at<?',
+                                array_merge([$store], $app->businessDay()->range($today))),
         'members_total' => $row('SELECT COUNT(*) FROM member WHERE store_code=? AND pseudonymized=0', [$store]),
         'members_pending' => $row('SELECT COUNT(*) FROM member WHERE store_code=? AND consent_status=0', [$store]),
         'reviews_pending' => $row('SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND review_status=1', [$store]),
@@ -201,15 +221,42 @@ $api->on('POST', '/reviews/decide', static function () use ($app, $requireManage
     }
 
     if ($accept) {
+        /**
+         * ★ 自审自批要能筛得出来。
+         *
+         *   docs/03 §12.4 的整套设计建立在「痕迹每周有人看一眼」之上，
+         *   而原来提交人和审批人是同一个人时，审计里【看不出任何区别】——
+         *   两条 review_accept 长得一模一样。
+         *
+         *   实测：同一个管理员提交 999999.99 的手工录入、然后自己点通过，
+         *   审计只留下一条 action=review_accept、detail 为空的记录。
+         *
+         *   现在自审单独一个 action 名（与 point_grant_forced、
+         *   card_replace_forced 同一套做法）—— 后台按 action 筛一下，
+         *   就是全部「自己批自己」的记录。
+         *
+         * ★ 不拦。一个人的店里经理本来就只有一个，拦住等于这条路不能用。
+         */
+        $row = $app->localDb()->one(
+            'SELECT operator_id, operator_name, amount FROM point_ledger WHERE store_code=? AND id=?',
+            [$app->storeCode(), $id]
+        );
+        $isSelf = $row !== null && (int)$row['operator_id'] === (int)$op['id'];
+
         $app->localDb()->exec(
             'UPDATE point_ledger SET review_status=2, approved_by=? WHERE store_code=? AND id=? AND review_status=1',
             [$op['id'], $app->storeCode(), $id]
         );
-        $app->audit()->log('review_accept', [
+        $app->audit()->log($isSelf ? 'review_accept_self' : 'review_accept', [
             'target_type' => 'ledger', 'target_id' => (string)$id,
             'operator_id' => $op['id'], 'operator_name' => $op['name'],
+            'detail' => [
+                'self_approved' => $isSelf,
+                'submitted_by'  => $row['operator_name'] ?? null,
+                'amount'        => $row['amount'] ?? null,
+            ],
         ]);
-        Api::ok(['id' => $id, 'accepted' => true]);
+        Api::ok(['id' => $id, 'accepted' => true, 'self_approved' => $isSelf]);
     }
 
     $r = $app->points()->reverse($id, '后台复核驳回：' . $reason, [
@@ -292,6 +339,21 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $w
     $val = Api::str($b, 'value', '') ?? '';
     if ($key === '') {
         Api::fail('bad_request');
+    }
+    /**
+     * ★ 只认登记过的键。
+     *
+     *   原来只判 $key !== ''，管理员可以往 sys_config 写任意键值。
+     *   这不算越权（本来就是管理员），但会让那张表慢慢积起一堆
+     *   没人认识的行 —— 而下一个来看这套系统的人分不清
+     *   「这是某个功能在读的」还是「谁当年手滑写进去的」。
+     *
+     *   ConfigSchema 自己的注释就写着「加新配置项时必须在这里登记」。
+     *   这一道让那句话真的生效。
+     */
+    if (!isset(\Vip\ConfigSchema::ITEMS[$key])) {
+        Api::fail('bad_request', 400, ['hint' => '没有这一项配置：' . $key
+            . '（新加配置项要先在 ConfigSchema 里登记）']);
     }
     // 按 schema 校验，别让「几次送一次」被填成负数或文字
     $err = \Vip\ConfigSchema::validate($key, $val);
@@ -458,8 +520,26 @@ $api->on('POST', '/operators/create', static function () use ($app, $requireAdmi
     $pin    = Api::str($b, 'pin', '') ?: '';
     $role   = Api::int($b, 'role', AuthService::ROLE_STAFF);
 
-    if ($login === '' || $name === '' || strlen($pin) < 4) {
-        Api::fail('bad_request', 400, ['hint' => 'PIN 至少 4 位']);
+    /**
+     * ★ 门槛用服务层的常量，不写字面量。
+     *
+     *   原来这里写死 `< 4`，而 AuthService::MIN_PIN 是 6 ——
+     *   4 位和 5 位的 PIN 过得了路由这一关，到服务层才抛
+     *   InvalidArgumentException，于是变成 HTTP 500。三处都错：
+     *   提示语写着「至少 4 位」（真实下限 6）、状态码 500（该是 400）、
+     *   错误码 E203（按 docs/06 指向 POS 主库，方向完全反了）。
+     *
+     * ★ 三个条件也要分开报。原来 login / name / pin 任一为空
+     *   都回同一句「PIN 至少 4 位」—— 少填了显示名，界面却让你去改 PIN。
+     */
+    if ($login === '') {
+        Api::fail('bad_request', 400, ['hint' => '请填写工号']);
+    }
+    if ($name === '') {
+        Api::fail('bad_request', 400, ['hint' => '请填写显示名']);
+    }
+    if (strlen($pin) < AuthService::MIN_PIN) {
+        Api::fail('bad_request', 400, ['hint' => 'PIN 至少 ' . AuthService::MIN_PIN . ' 位']);
     }
     if (!in_array($role, [1, 2, 3], true)) {
         Api::fail('bad_request');
@@ -468,6 +548,9 @@ $api->on('POST', '/operators/create', static function () use ($app, $requireAdmi
         $id = $app->auth()->createOperator($login, $name, $pin, $role, $nameEs);
     } catch (\PDOException $e) {
         Api::fail('bad_request', 400, ['hint' => '工号已存在']);
+    } catch (\InvalidArgumentException $e) {
+        // 服务层还有自己的校验（口令强度等）—— 那也是参数问题，不是系统故障
+        Api::fail('bad_request', 400, ['hint' => $e->getMessage()]);
     }
     $app->audit()->log('operator_create', [
         'target_type' => 'operator', 'target_id' => (string)$id,

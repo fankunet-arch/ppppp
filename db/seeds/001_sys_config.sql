@@ -119,6 +119,8 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 一天超过几次就告警（不拦，只记）。0 = 关闭。
 (@store,'alert_span_hours','6',@now),
   -- 当天记的几单结账时间跨度超过多少小时就告警。0 = 关闭。
+(@store,'manual_entry_hard_limit','5000.00',@now),
+  -- 手工录入的绝对上限，经理也不能超。拦的是手滑多打几个零。0 = 不设。
 (@store,'alert_invoice_miss','12',@now),
   -- 一个操作员在下面那个时间窗里查不到几个小票号就告警。0 = 关闭。
   -- 小票号是连号整数，往前减就能一个个试别人的单；界面上「查不到」与
