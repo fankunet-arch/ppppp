@@ -420,7 +420,25 @@ $api->on('POST', '/order/free-meal', static function () use ($app, $requireOpera
 // ════════════════════════════════════════════════════════════
 
 /** 三选一检索：卡号 / 手机号 / 邮箱。不做跨字段模糊搜索。 */
-$api->on('POST', '/member/search', static function () use ($app, $requireOperator): void {
+/**
+ * 「这一单给这位客人会不会计次」—— 选会员时就把答案带上。
+ *
+ * ★ 为什么挂在查会员这一步，而不是等提交：
+ *   once_per_period 下同餐期第二单照样记得上，但计次是 0。
+ *   原来这件事只在结果页说，那时账已经记了，服务员没法再回头问客人。
+ *   一桌吃完又加点甜点另开一单，是天天发生的事。
+ *
+ * serial_id 是可选的 —— 发卡、查卡这些没有订单的场景照常用这两个接口，
+ * 不传就不算，返回里也不会有这一项。
+ */
+$visitPreview = static function (?string $serialId, int $memberId) use ($app): ?array {
+    if ($serialId === null || $serialId === '') {
+        return null;
+    }
+    return $app->points()->visitPreview($memberId, $serialId);
+};
+
+$api->on('POST', '/member/search', static function () use ($app, $requireOperator, $visitPreview): void {
     $requireOperator();
     $b    = Api::body();
     $type = Api::str($b, 'type', '');
@@ -443,6 +461,8 @@ $api->on('POST', '/member/search', static function () use ($app, $requireOperato
         'consent_status' => (int)$m['consent_status'],
         // 未同意前积分冻结、不可兑换、不可营销推送
         'points_frozen'  => (int)$m['consent_status'] !== 1,
+        // 带着订单来查时，顺便告诉 Pad「这一单会不会计次」
+        'visit_preview'  => $visitPreview(Api::str($b, 'serial_id', '') ?: null, (int)$m['id']),
     ]]);
 });
 
@@ -461,7 +481,7 @@ $api->on('POST', '/member/search', static function () use ($app, $requireOperato
  * ★ 防伪造就在这里：卡号不在 card 库存表里一律拒绝。
  *   卡号里的随机后缀只让人猜不到，判真伪的是那张表。
  */
-$api->on('POST', '/card/lookup', static function () use ($app, $requireOperator): void {
+$api->on('POST', '/card/lookup', static function () use ($app, $requireOperator, $visitPreview): void {
     $requireOperator();
     $b   = Api::body();
     $raw = Api::str($b, 'card_no', '');
@@ -521,6 +541,7 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator)
             'visit_count'    => (int)$m['visit_count'],
             'consent_status' => (int)$m['consent_status'],
             'points_frozen'  => (int)$m['consent_status'] !== 1,
+            'visit_preview'  => $visitPreview(Api::str($b, 'serial_id', '') ?: null, (int)$m['id']),
         ];
     }
     Api::ok($out);

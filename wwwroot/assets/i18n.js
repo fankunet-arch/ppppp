@@ -214,6 +214,32 @@
     'assign.portions':    { zh: '份数',        es: 'Menús' },
     'assign.memberN':     { zh: '会员 {n}',    es: 'Socio {n}' },
     'assign.visits':      { zh: '已 {n} 次',   es: '{n} visitas' },
+
+    /* ── 「这一单不计次」的提前告知 ────────────────────────
+     *
+     * once_per_period 下同餐期第二单照样记得上，但计次是 0。
+     * 原来只在结果页说 —— 那时账已经记了，服务员没法再回头问客人。
+     * 一桌吃完又加点甜点另开一单，是天天发生的事。
+     *
+     * 挂在人员行上的那一条是【常驻】的：服务员要拿着这句话去跟客人说，
+     * 而他往往是先选人、再算金额、再回头解释，中间隔着好几步。
+     */
+    'assign.noVisit':     { zh: '⚠️ 本餐期已记过 1 次 —— 这一单不计次（积分照常）',
+                            es: '⚠️ Ya tiene su visita en este servicio: este apunte no suma visita (los puntos sí)' },
+    // 按次数积分口径下，不计次 = 一分都没有，措辞必须换
+    'assign.noVisitByVisit':{ zh: '⚠️ 本餐期已记过 1 次 —— 这一单不计次，也不加分',
+                            es: '⚠️ Ya tiene su visita en este servicio: este apunte no suma ni visita ni puntos' },
+    'assign.noVisitFree': { zh: '⚠️ 这一餐是用券兑换的 —— 不计次',
+                            es: '⚠️ Esta comida es un canje: no suma visita' },
+
+    'confirm.noVisit':    { zh: '{cards} 本餐期已经记过 1 次了。\n\n这一单【不会计入次数】（积分照常给）。\n请先告知客人，再决定是否继续记账。',
+                            es: '{cards} ya tiene su visita en este servicio.\n\nEste apunte NO suma visita (los puntos sí se dan).\nAvise al cliente antes de continuar.' },
+    'confirm.noVisitByVisit':{ zh: '{cards} 本餐期已经记过 1 次了。\n\n这一单【不会计入次数，也不会加分】。\n请先告知客人，再决定是否继续记账。',
+                            es: '{cards} ya tiene su visita en este servicio.\n\nEste apunte NO suma visita NI puntos.\nAvise al cliente antes de continuar.' },
+    'confirm.noVisitFree':{ zh: '这一餐是用券兑换的，{cards} 不会计入次数。\n\n请先告知客人，再决定是否继续记账。',
+                            es: 'Esta comida es un canje: {cards} no suma visita.\n\nAvise al cliente antes de continuar.' },
+    'confirm.noVisitOk':  { zh: '仍然记账',   es: 'Apuntar igualmente' },
+    'confirm.noVisitCancel':{ zh: '返回修改', es: 'Volver' },
     'assign.pendingTag':  { zh: '待确认',      es: 'sin confirmar' },
     'assign.allocated':   { zh: '已分配',      es: 'Asignado' },
     'assign.total':       { zh: '可分配',      es: 'Disponible' },

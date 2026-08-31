@@ -327,6 +327,20 @@ button[disabled] { opacity: .5; cursor: not-allowed; }
 .person .who { flex: 1 1 160px; min-width: 0; }
 .person .who b { display: block; }
 .person .who small { color: var(--muted); }
+/* 「这一单不计次」——【常驻】而不是弹一下就没：
+   服务员要拿着这句话去跟客人说，而他往往是先选人、再算金额、再回头解释 */
+.person .who .no-visit,
+#merge-member .no-visit {
+  color: var(--warn, #b26a00);
+  background: #fff8e6;              /* 与上面那个「已记给谁」的黄框同一支黄，看着是一件事 */
+  border-left: 3px solid var(--warn, #b26a00);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  margin-top: 6px;
+  padding: 5px 8px;
+  border-radius: 0 4px 4px 0;
+}
 .person .amt { width: 110px; }
 .person .prt { width: 84px; }
 .person .amt input, .person .prt input { margin: 0; padding: 9px 10px; font-size: 16px; }

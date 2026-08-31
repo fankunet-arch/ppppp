@@ -120,8 +120,19 @@ const grant = async (table, people, cards) => {
     await page.waitForTimeout(400);
   }
   await page.click('#btn-submit');
+  /**
+   * ★ 这一单里如果有人不计次，提交会先弹一次页内确认（§3.7）——
+   *   本文件 ③ 测的正是「同餐期第二单」，必然会撞上。
+   *   这里点掉它继续；那个确认框本身由 novisit.mjs 专门守着。
+   */
+  if (await page.locator('.ui-ask:not([hidden])').count() > 0) {
+    sawConfirm = true;
+    await page.locator('.ui-ask .ui-ok').click();
+  }
   await page.waitForSelector('#step-done.active', { timeout: 10000 });
 };
+
+let sawConfirm = false;
 
 console.log('\n【① 界面上根本没有「整单记一人」】');
 await page.fill('#table-input', String(BIG.table));
@@ -187,6 +198,8 @@ const done = await page.locator('#done-body').textContent();
 ok(/本餐期已记过|只记积分不计次/.test(done),
    `★★★ 结果页明说了为什么：「${done.replace(/\s+/g, ' ').trim().slice(0, 70)}…」`);
 ok(/\+0 次/.test(done), '  └ 计次是大字那一行，明写 +0，不是含糊带过');
+ok(sawConfirm,
+   '★★★ 而且这一单在【提交之前】就弹过确认 —— 服务员不是记完才知道（§3.7）');
 
 const ptsA = parseInt(php(`
   require "app/bootstrap.php";

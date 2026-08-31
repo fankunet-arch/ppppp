@@ -1060,6 +1060,35 @@ function seatsLeft() {
   return Math.max(0, memberCap() - alreadyOnOrder().length);
 }
 
+/**
+ * 这一单给这位客人会不会计次 —— 服务端在选会员时就算好了（visit_preview）。
+ * 拿不到（老版本接口、手工录入路径）时一律当「会计次」，不吓唬人。
+ */
+function willNotCount(m) {
+  const v = m && m.visit_preview;
+  return !!(v && v.counts_visit === false);
+}
+
+/**
+ * 挂在人员行上的那一条常驻提示。
+ *
+ * ★ 为什么要常驻，而不是只弹一次确认：
+ *   服务员要拿着这句话去跟客人说。弹框一关就没了，
+ *   而他往往是先选人、再算金额、再回头跟客人解释 ——
+ *   中间隔着好几步，那句话必须一直在屏幕上。
+ *
+ * ★ 措辞按积分口径换：by_visit 下不计次就等于【一分都没有】，
+ *   照着「积分照常」念出来是错的（同 done.noVisit 那一对）。
+ */
+function noVisitLine(m) {
+  if (!willNotCount(m)) { return ''; }
+  const reason = (m.visit_preview || {}).reason;
+  const byVisit = (S.settings || {}).points_mode === 'by_visit';
+  const key = reason === 'free_meal' ? 'assign.noVisitFree'
+            : (byVisit ? 'assign.noVisitByVisit' : 'assign.noVisit');
+  return `<div class="no-visit">${T(key)}</div>`;
+}
+
 function renderPeople(keepItems) {
   renderAlreadyOnOrder();
   const box = $('#assign-people');
@@ -1122,6 +1151,7 @@ function renderPeople(keepItems) {
       <div class="who">
         ${p.member
           ? `<b>${escapeHtml(p.member.card_no)}</b><small>${p.member.points_balance} ${T('common.points')} · ${T('assign.visits', { n: p.member.visit_count })}${p.member.points_frozen ? ' · ' + T('assign.pendingTag') : ''}</small>
+             ${noVisitLine(p.member)}
              <div class="reward-slot" data-rw="${i}"></div>`
           : `<button class="link" data-pick="${i}">${T('assign.pickMember')}</button>`}
       </div>
@@ -1349,6 +1379,41 @@ async function offerForceRedeem(c, personIndex, memberId) {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+/**
+ * 提交前的最后一道告知：这一单里有人【不会计次】，问一句再走。
+ *
+ * ── 为什么必须在提交【之前】────────────────────────
+ *
+ * once_per_period 下同餐期第二单照样记得上（金额、积分都进账），
+ * 但计次是 0。原来这件事只在结果页那行橙字上说 —— 那时账已经记了，
+ * 服务员没法再回头问客人一句「这一单不攒次数，还记吗」。
+ *
+ * 现实场景：一桌吃完结了账，又加点甜点酒水另开一单。服务员照常拿卡去记，
+ * 客人以为又攒了一次，回头发现没有 —— 投诉就是这么来的。
+ *
+ * ★ 用 UI.confirm 而不是原生 confirm()：容器里的原生弹框要么被吞掉，
+ *   要么长得像浏览器警告，会当着客人的面吓人一跳（见 ui.js 的说明）。
+ *
+ * ★ 只在真有人不计次时才弹。正常单一次都不打扰 ——
+ *   每单都弹的确认框，三天之后就变成闭着眼睛点「继续」。
+ */
+async function confirmNoVisit(members) {
+  const hit = (members || []).filter(willNotCount);
+  if (!hit.length) { return true; }
+
+  const cards   = hit.map(m => maskCard(m.card_no)).join('、');
+  const byVisit = (S.settings || {}).points_mode === 'by_visit';
+  const allFree = hit.every(m => (m.visit_preview || {}).reason === 'free_meal');
+
+  const key = allFree ? 'confirm.noVisitFree'
+            : (byVisit ? 'confirm.noVisitByVisit' : 'confirm.noVisit');
+  return UI.confirm(T(key, { cards, n: hit.length }), {
+    okText:     T('confirm.noVisitOk'),
+    cancelText: T('confirm.noVisitCancel'),
+    danger:     true,
+  });
+}
+
 /* ── 提交 ────────────────────────────────────────── */
 $('#btn-submit').onclick = async () => {
   showErr('#assign-err', '');
@@ -1369,6 +1434,13 @@ $('#btn-submit').onclick = async () => {
     .filter(p => p.member && (p.amountCents > 0 || p.portions > 0))
     .map(p => ({ member_id: p.member.id, amount: money(p.amountCents), portions: p.portions }));
   if (!allocations.length) return showErr('#assign-err', T('assign.needOne'));
+
+  // ★ 提交前最后一道：有人这一单不计次，先让服务员明确「知道了，继续」
+  if (!await confirmNoVisit(S.people
+        .filter(p => p.member && (p.amountCents > 0 || p.portions > 0))
+        .map(p => p.member))) {
+    return;
+  }
 
   const btn = $('#btn-submit');
   btn.disabled = true;
@@ -1464,6 +1536,7 @@ function renderMerge() {
   $('#merge-member').innerHTML = m.member
     ? `<div class="lrow"><span><b>${escapeHtml(m.member.card_no || '')}</b> · ${
          T('member.statsShort', { points: m.member.points_balance, visits: m.member.visit_count })}</span></div>`
+      + noVisitLine(m.member)
     : '';
   showErr('#merge-err', '');
 }
@@ -1495,6 +1568,10 @@ $('#btn-merge-submit').onclick = async () => {
   const m = S.merge || { orders: [], member: null };
   if (m.orders.length < 2) return showErr('#merge-err', T('merge.needTwo'));
   if (!m.member)           return showErr('#merge-err', T('merge.needMember'));
+
+  // ★ 不计次的告知排在合并确认【之前】——
+  //   服务员要先决定「这一单还记不记」，再去确认合并几张、多少钱
+  if (!await confirmNoVisit([m.member])) return;
 
   const sum = m.orders.reduce((a, o) => a + o.remaining_cents, 0);
   if (!await UI.confirm(T('merge.confirm', {
@@ -1611,6 +1688,24 @@ function currentSearchType() {
   return t;
 }
 
+/**
+ * 预览「会不会计次」时要带上的订单号。
+ *
+ * 分配流程用当前这一单；多桌合并用第一单 —— 能合并的几张单
+ * 本来就被 merge_span_minutes 限制在同一顿里，问哪一张答案都一样。
+ * 手工录入、发卡、查卡这些没有订单，返回 null，后端就不算。
+ */
+function previewSerial() {
+  if (S.memberTarget === 'merge') {
+    const o = (S.merge && S.merge.orders && S.merge.orders[0]) || null;
+    return o ? o.serial_id : null;
+  }
+  if (typeof S.memberTarget === 'number') {
+    return S.order ? S.order.serial_id : null;
+  }
+  return null;                       // 手工录入：本来就永远不计次
+}
+
 async function doMemberSearch() {
   resetLookupState();
   const type = currentSearchType();
@@ -1623,7 +1718,7 @@ async function doMemberSearch() {
   if (type === 'card') { return doCardLookup(value); }
 
   try {
-    const d = await api('/member/search', { type, value });
+    const d = await api('/member/search', { type, value, serial_id: previewSerial() });
     if (!d.found) {
       $('#member-result').innerHTML = `<p class="muted">${T('member.none')}</p>`;
       $('#member-new').open = true;
@@ -1649,7 +1744,7 @@ async function doMemberSearch() {
 async function doCardLookup(value) {
   resetLookupState();
   try {
-    const d = await api('/card/lookup', { card_no: value });
+    const d = await api('/card/lookup', { card_no: value, serial_id: previewSerial() });
 
     /**
      * 过期卡 —— 不是死路，是换卡的入口。
