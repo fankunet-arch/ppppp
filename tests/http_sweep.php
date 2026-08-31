@@ -21,9 +21,16 @@ declare(strict_types=1);
  *   ② 没登录时【不能返回数据】—— 任何一个漏判鉴权的接口都是个洞。
  *
  * 用法：
- *   php -S 127.0.0.1:8910 -t wwwroot &      # 另开一个终端
+ *   PHP_CLI_SERVER_WORKERS=8 php -S 127.0.0.1:8910 -t wwwroot &   # 另开一个终端
  *   php tests/http_sweep.php
  *   BASE=https://lms.sushisom.net php tests/http_sweep.php   # 打真机
+ *
+ * 🔴 **`php -S` 默认是单进程的** —— 它把请求排队一个个处理，于是任何并发
+ *    缺陷（死锁、竞态、重复发券）在本地开发服务器上【结构性地复现不出来】，
+ *    跑多少轮都是绿的。而现场真机跑的是 PHP-FPM，天然多进程 ——
+ *    也就是说开发环境比生产环境更宽容，宽容的还正好是最难查的那一类。
+ *    所以务必带上 PHP_CLI_SERVER_WORKERS。
+ *    （真正的并发断言在 `smoke.php` ㉖ / ㊱，它们自己 fork 进程，不靠这里。）
  *
  * ⚠️ 会在库里留下少量测试数据（一个批次的卡、一个操作员），跑完自己清掉。
  *    别对着生产库跑。
@@ -351,6 +358,13 @@ group('⑨ 小票号：查不到与超时效，对收银员必须长得一模一
  *
  *   ★ 只改前端文案是没用的：Pad 是柜台上一台安卓平板，返回的 JSON 谁都看得见。
  *     所以这一组断言打的是【接口本身】。
+ */
+/**
+ * ⚠️ 这个号码是【跟着夹具库走】的：要在库里真实存在、且已超过
+ *    invoice_lookup_max_days。换一个库就要跟着换，否则会走 not_found 分支
+ *    （那一支不返回 max_days），下面「回溯天数还给」那条断言会红 ——
+ *    看上去像撞了 bug，其实只是夹具不对。
+ *    换法：SWEEP_OLD_INVOICE=<库里一个够老的 order_head_id> php tests/http_sweep.php
  */
 $OLD_INVOICE  = (int)(getenv('SWEEP_OLD_INVOICE') ?: 92521);   // 真实存在、但已超回溯天数
 $FAKE_INVOICE = 99999999;                                       // 不存在

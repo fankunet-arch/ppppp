@@ -261,6 +261,10 @@ async function doMemberSearch() {
         <div class="stat"><div class="n">${m.points_balance}</div><div class="k">积分余额</div></div>
         <div class="stat"><div class="n">${m.visit_count}</div><div class="k">累计次数</div></div>
         <div class="stat"><div class="n">€ ${esc(m.total_spent)}</div><div class="k">累计消费</div></div>
+        <!-- ★ 已发券计数：pending = 应发 − 已发，这个数虚高 1 客人就永远少一张券，
+             而进度条上那句「还差 N 次」看上去完全正常。以前它在任何页面上都不出现，
+             店里发现不了也核对不了 —— 摆出来才有人能对账 -->
+        <div class="stat"><div class="n">${m.rewards_issued}</div><div class="k">已发券（靠消费挣的）</div></div>
       </div>
       <p><b>${esc(m.card_no)}</b> ${CST[m.consent_status] || ''}
         <span class="muted small">　手机 ${esc(m.phone || '—')}　邮箱 ${esc(m.email || '—')}　注册 ${esc(m.created_at)}</span>

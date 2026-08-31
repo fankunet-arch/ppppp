@@ -91,6 +91,8 @@ final class Api
         'exceeds_manual_hard_limit' => '超过手工录入的绝对上限，经理也不能放行 —— 请核对金额是不是多打了零',
         'invalid_amount'         => '金额不合法',
         'db_unavailable'         => '本地数据库暂时不可用，请联系管理员',
+        // ★ 死锁不是故障，别把人指去找管理员 —— 再点一次就好
+        'db_busy'                => '系统正忙了一下，这一单没有记进去。请再点一次「提交」（不用找管理员）',
 
         // ── 防刷闸门（docs/03 §12）──────────────────────────
         // 每一条都要说清【为什么被拦】和【下一步找谁】，
@@ -181,6 +183,7 @@ final class Api
         'exceeds_manual_hard_limit' => 'Supera el límite absoluto de entrada manual; ni el encargado puede autorizarlo. Compruebe si sobran ceros',
         'invalid_amount'         => 'Importe no válido',
         'db_unavailable'         => 'La base de datos local no responde, avise al administrador',
+        'db_busy'                => 'El sistema se ha saturado un momento y este apunte no se ha guardado. Pulse «Enviar» otra vez (no hace falta avisar a nadie)',
 
         // ── Tarjeta física ──────────────────────────────────
         'card_malformed'         => 'Número de tarjeta incompleto, vuelva a escanear o compruebe el número',
@@ -267,8 +270,18 @@ final class Api
             error_log(sprintf('[api] %s %s | %s: %s @ %s:%d',
                 $ref, $key, get_class($e), $e->getMessage(), $e->getFile(), $e->getLine()));
 
-            // 本地库不可达单独给 503，前端才能提示得准确（其余一律 500）
+            /**
+             * 本地库不可达单独给 503，前端才能提示得准确（其余一律 500）。
+             *
+             * ★ 死锁（E110）再单独分出来：它和「库不可达」在技术上都是 PDOException，
+             *   但在柜台上是两件完全不同的事 ——
+             *   前者【再点一次就好】，后者才需要找人。
+             *   给同一句话的后果是收银员当着客人的面去打电话，而系统根本没坏。
+             */
             $isDb = $e instanceof \PDOException;
+            if ($code === 'E110') {
+                self::fail('db_busy', 503, [], $ref);
+            }
             self::fail($isDb ? 'db_unavailable' : 'server_error', $isDb ? 503 : 500, [], $ref);
         }
     }
@@ -316,6 +329,20 @@ final class Api
                 1045             => 'E105',   // 口令错，或该来源主机没被授权
                 1044, 1049       => 'E107',   // 库不存在，或该用户对这个库没权限
                 1040, 1203       => 'E108',   // 连接数打满
+                /**
+                 * ★ 死锁与等锁超时【不是故障】，别和「库连不上」混在一起。
+                 *
+                 *   1213 是 MySQL 在两笔事务互等时主动挑一个牺牲者回滚，
+                 *   1205 是等锁超时 —— 两者都是整笔已回滚、重放一次就好。
+                 *   原来它们落进 default→E109，界面上说的是
+                 *   「本地数据库暂时不可用，请联系管理员」：库好得很，
+                 *   而人被指到了完全没有问题的地方（classify 的分类粒度
+                 *   本来就是按【该去查哪里】定的，这一档指错了方向）。
+                 *
+                 *   能走到这里说明 LocalDb::transaction() 的自动重放也没救回来，
+                 *   属于真的忙，而不是需要找管理员。
+                 */
+                1213, 1205       => 'E110',
                 default          => str_starts_with($state, '08') ? 'E101' : 'E109',
             };
         }

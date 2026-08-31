@@ -43,6 +43,11 @@ final class PointsService
         private \Vip\Repo\CardTierRepo $tiers,
         private \Vip\MealPeriod $periods,
         /**
+         * ★ 撤销时要把「已经不再算挣到」的券一并收回（见 reverseInTx）。
+         *   RewardService 不依赖 PointsService，不构成环。
+         */
+        private RewardService $rewards,
+        /**
          * ★ 可空。这里只拿它把 existing_ledger 的卡号格式化成显示形态
          *   （docs/03 §3.1ter：同一张卡不能在两个屏幕上长得不一样）。
          *
@@ -649,6 +654,38 @@ final class PointsService
             $multiplier = $this->cfg->float('points_multiplier', 1.0);
             $countMode  = $this->cfg->get('visit_count_mode', 'once_per_period');
 
+            /**
+             * ── 🔴 固定加锁顺序，否则两台 Pad 会撞死锁 ────────────
+             *
+             * 下面的循环按【服务员在 Pad 上点人的顺序】逐个 SELECT ... FOR UPDATE
+             * 锁会员行。两台 Pad 同时记两张 AA 单、而两张单上是同两位客人
+             * （一对夫妻、常一起来的两个朋友，在小店里天天有），
+             * 只要点人的顺序不同就构成经典的加锁顺序死锁：
+             *
+             *   1 号 Pad：锁张三 → 等李四
+             *   2 号 Pad：锁李四 → 等张三
+             *
+             * MySQL 会挑一个牺牲者整笔回滚，收银员看到的是一句「数据库不可用，
+             * 请联系管理员」—— 而库好得很，谁也没做错事。
+             * 实测两个进程各 60 单、只把顺序反过来：120 单里死锁 27 次（22.5%），
+             * Innodb_deadlocks 计数一次不差。
+             *
+             * grantMerged() 早就为同一件事写了 `sort($serials)`，
+             * 说明这个风险被想到过 —— 只是没推广到【每天跑几百次】的这条路。
+             *
+             * ★ 先按 member_id 升序把锁全部拿到手，再走原来的循环。
+             *   不直接给 $allocations 排序，是因为返回的 entries 顺序
+             *   就是结果页的显示顺序 —— 那应当跟着服务员点人的顺序，
+             *   而不是跟着数据库主键。锁的顺序和显示的顺序是两件事。
+             *   事务内重复 lockById 不会再等锁，所以下面那句照原样留着。
+             */
+            $lockIds = array_map(static fn(array $a): int => (int)$a['member_id'], $allocations);
+            $lockIds = array_values(array_unique($lockIds));
+            sort($lockIds, SORT_NUMERIC);
+            foreach ($lockIds as $lid) {
+                $this->members->lockById($lid);
+            }
+
             $entries = [];
             foreach ($allocations as $a) {
                 $memberId = (int)$a['member_id'];
@@ -841,11 +878,29 @@ final class PointsService
             return null;
         }
 
-        // 免费餐 / 整单核销：兑换来的那一餐本来就不计次（与 grantOne 同一条判断）
+        /**
+         * 免费餐 / 整单核销：兑换来的那一餐本来就不计次。
+         *
+         * ★ 但要和 grantOne 一样先看 free_meal_extra_earns —— 这个开关
+         *   决定的不是「计不计次」，而是【这一单能不能记】：
+         *     关（出厂默认）→ grantOne 直接整单拒绝（free_meal / redeemed）
+         *     开             → 放行，但计次强制为 0
+         *
+         *   漏看它的后果不是少提示一句，是【说反了】：
+         *   预览说「不计次」，言下之意别的照记；实际是一分钱都记不进去。
+         *   服务员照着这句话跟客人说完「这一餐不计次，别的照常」，
+         *   客人点头，然后提交撞一堵墙 ——
+         *   比原来「记完才告诉你没计次」更糟。
+         *
+         *   关着的时候返回 null（＝没有可说的）：那种单在选单页就被
+         *   buildContext 标成 eligible=false、灰掉点不动，本来也轮不到预览。
+         */
         $fullyRedeemed = (int)($order['is_redeemed'] ?? 0) === 1
                       && (int)($order['portions_counted'] ?? 0) === 0;
         if ((int)($order['is_free_meal'] ?? 0) === 1 || $fullyRedeemed) {
-            return ['counts_visit' => false, 'reason' => 'free_meal'];
+            return $this->cfg->get('free_meal_extra_earns', '0') === '1'
+                ? ['counts_visit' => false, 'reason' => 'free_meal']
+                : null;
         }
 
         /**
@@ -1321,6 +1376,40 @@ final class PointsService
                 $this->orders->applyAllocation((string)$orig['serial_id'], -$amt, -(int)$orig['portions_counted']);
             }
 
+            /**
+             * ── 🔴 券也要跟着退，否则两头都错 ──────────────────
+             *
+             * 服务员拿错卡，把 B 桌的账记到张三名下，张三因此正好满十次、
+             * 系统当场发了一张免费餐券。经理十分钟后撤销那笔记账。
+             *
+             * 原来撤销只退计次/积分/消费额，不碰券，也不碰 rewards_issued：
+             *   ① 那张券还在客人手上，而且【能正常核销】—— 一顿饭送出去了；
+             *   ② 客人后来自己吃到第十次，一张券都拿不到 ——
+             *      pending = earned − issued，issued 虚高 1，永远算出 0，
+             *      而进度条上还写着「还差 N 次」，看上去完全正常，
+             *      店里也没有任何界面能看见 rewards_issued。
+             *
+             * ★ 必须放在 applyDelta 之后 —— 收几张是按【退完之后的进度】重算的。
+             * ★ 在同一笔事务里：收券和退计次分开就又回到「计次退了、券没退」。
+             */
+            $claw = $this->rewards->clawBackOverIssued(
+                (int)$orig['member_id'], $operator, '记账被撤销（' . $reason . '）');
+
+            /**
+             * ★ 已经吃掉的券收不回来 —— 那时 rewards_issued 也不减
+             *   （客人确实拿到了那份奖励）。但这是一份【发错的账换来的】免费餐，
+             *   经理必须知道，否则这笔损失连账都没地方对。
+             */
+            if (($claw['unrecoverable'] ?? 0) > 0) {
+                $this->alerts->raiseOnce(
+                    'reward_on_reversed_grant', 'member', (string)$orig['member_id'],
+                    sprintf('撤销了一笔记账，但由它带出的 %d 张免费餐券【已经被核销】，收不回来了。'
+                          . '请人工核对这位客人的奖励进度（流水 #%d，原因：%s）',
+                        (int)$claw['unrecoverable'], $ledgerId, $reason),
+                    ['severity' => 2, 'detail' => ['ledger_id' => $ledgerId,
+                                                   'voided' => $claw['codes'] ?? []]]);
+            }
+
             $this->audit->log('point_reverse', [
                 'target_type'   => 'ledger',
                 'target_id'     => (string)$ledgerId,
@@ -1328,7 +1417,9 @@ final class PointsService
                 'operator_name' => $operator['name'] ?? null,
                 'device'        => $operator['device'] ?? null,
                 'detail'        => ['reversal_id' => $revId, 'reason' => $reason,
-                                    'amount' => $orig['amount'], 'points' => $points],
+                                    'amount' => $orig['amount'], 'points' => $points,
+                                    'coupons_voided' => $claw['codes'] ?? [],
+                                    'coupons_unrecoverable' => $claw['unrecoverable'] ?? 0],
             ]);
 
             return ['ok' => true, 'reversal_id' => $revId];

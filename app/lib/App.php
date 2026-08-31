@@ -151,8 +151,11 @@ final class App
 
     public function cards(): CardRepo
     {
+        // ★ 可空：card_prefix 配错时【发卡】停用，但查卡/记账/撤销照常。
+        //   传 cardNumber() 会让 App::cards() 构造即抛，而它被
+        //   rewards() → points() 一路带着 —— 结果是整个收银台停摆。
         return $this->once('cards', fn() => new CardRepo(
-            $this->localDb(), $this->storeCode(), $this->cardNumber()
+            $this->localDb(), $this->storeCode(), $this->cardNumberOrNull()
         ));
     }
 
@@ -276,6 +279,7 @@ final class App
             $this->businessDay(),
             $this->cardTiers(),
             $this->mealPeriods(),
+            $this->rewards(),
             // ★ 可空：card_prefix 配错时卡片功能停用，但【记账必须还能用】。
             //   传 cardNumber() 会让 App::points() 直接构造失败，
             //   于是找单/记账/手工录入全部 500 —— 与 docs/03 §10 相反。

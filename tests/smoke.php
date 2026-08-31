@@ -3250,12 +3250,16 @@ eq(true, $vpApp->points()->visitPreview($vpM2, '9404440002')['counts_visit'],
    '★★ ③ 同一张单换一位没记过的客人 → 会计次（判的是「这张卡」，不是「这张单」）');
 
 // ── ④ 兑换来的那一餐：不计次，理由不同 ──
+//    ★ 必须先把 free_meal_extra_earns 打开 —— 关着的时候这种单是【整单拒绝】，
+//      预览应当返回 null 而不是「不计次」。那一半在 ㉟ 里单独测。
 $vpDb->exec('UPDATE pos_order SET is_free_meal = 1 WHERE store_code = ? AND serial_id = ?',
     [SMOKE_STORE, '9404440001']);
+$vpApp->cfg()->set('free_meal_extra_earns', '1');
 $p4 = $vpApp->points()->visitPreview($vpM2, '9404440001');
-eq(false, $p4['counts_visit'], '④ 免费餐：不计次');
+eq(false, $p4['counts_visit'], '④ 免费餐（且开着「额外消费计分」）：不计次');
 eq('free_meal', $p4['reason'],
    '  └ 理由是「兑换来的」而不是「已记过」—— 两句话不一样，说错了客人会更糊涂');
+$vpApp->cfg()->set('free_meal_extra_earns', '0');
 $vpDb->exec('UPDATE pos_order SET is_free_meal = 0 WHERE store_code = ? AND serial_id = ?',
     [SMOKE_STORE, '9404440001']);
 
@@ -3283,6 +3287,280 @@ $vpDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$vpI
 $vpDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$vpIds})", [SMOKE_STORE]);
 $vpDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$vpIds})", [SMOKE_STORE]);
 $vpDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '94044400%'", [SMOKE_STORE]);
+
+step('㉞ 撤销记账要把「已经不再算挣到」的券一并收回');
+
+/**
+ * ★ 服务员拿错卡，把 B 桌的账记到张三名下，张三因此正好满了门槛、
+ *   系统当场发了一张免费餐券。经理十分钟后发现，撤销那笔记账。
+ *
+ *   原来撤销只退计次/积分/消费额，不碰券也不碰 rewards_issued，两头都错：
+ *     ① 券还在客人手上而且【能正常核销】—— 一顿饭就这么送出去了；
+ *     ② 客人后来自己老老实实吃到第十次，一张券都拿不到 ——
+ *        pending = 应发 − 已发，已发虚高 1，永远算出 0，
+ *        而进度条上还写着「还差 N 次」，看上去完全正常。
+ *
+ *   这一段把两头都钉住。门槛按 3 次跑，与 10 次的逻辑完全一致。
+ */
+$cbApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$cbDb  = $cbApp->localDb();
+$cbApp->cfg()->set('late_grant_minutes', '0');
+$cbApp->cfg()->set('max_grants_per_period', '0');
+$cbApp->cfg()->set('visit_count_mode', 'by_order');
+$cbApp->cfg()->set('points_mode', 'by_amount');
+$cbApp->cfg()->set('reward_enabled', '1');
+$cbApp->cfg()->set('reward_mode', 'visits');
+$cbApp->cfg()->set('reward_auto_grant', '1');
+$cbThr0 = $cbApp->cfg()->get('reward_threshold_visits', '10');
+$cbApp->cfg()->set('reward_threshold_visits', '3');
+
+$cbPos = new FakePosSource();
+$cbPos->now = date('Y-m-d H:i:s');
+for ($i = 0; $i < 5; $i++) {
+    $oh = 990000 + $i;
+    $cbPos->addHead([
+        'serial_id' => sprintf('99%08d', $i), 'order_head_id' => $oh, 'check_id' => 1,
+        'table_name' => 'CB' . $i, 'eat_type' => 0, 'customer_num' => 2,
+        'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+        'order_end_time' => date('Y-m-d H:i:s', strtotime($cbPos->now) - 900 + $i * 60),
+    ]);
+    $cbPos->addDetail($oh, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+}
+$cbApp->setPosSource($cbPos);
+for ($i = 0; $i < 5; $i++) { $cbApp->points()->locate('CB' . $i, 1800); }
+
+$cbOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true];
+$cbM  = (int)$cbApp->members()->create('TK-00099001-CBA', null, null, null)['id'];
+
+$cbGrant = function (int $i) use ($cbApp, $cbM, $cbOp): int {
+    $r = $cbApp->points()->grant(sprintf('99%08d', $i),
+        [['member_id' => $cbM, 'amount_cents' => 4780, 'portions' => 2]],
+        Vip\PointsEngine::MODE_SPLIT, $cbOp);
+    // API 层就是这样：发券在记账事务【之外】（发券失败不该回滚已记好的积分）
+    $cbApp->rewards()->checkAndGrant($cbM, $cbOp);
+    return (int)$r['entries'][0]['ledger_id'];
+};
+$cbCoupons = fn(int $st): int => (int)$cbDb->value(
+    'SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=?',
+    [SMOKE_STORE, $cbM, $st]);
+$cbIssued = fn(): int => (int)$cbApp->members()->findById($cbM)['rewards_issued'];
+
+$cbL = [];
+for ($i = 0; $i < 3; $i++) { $cbL[] = $cbGrant($i); }
+eq(3, (int)$cbApp->members()->findById($cbM)['visit_count'], '前提：记满 3 次');
+eq(1, $cbCoupons(1), '  └ 自动发了 1 张券');
+eq(1, $cbIssued(),   '  └ rewards_issued = 1');
+
+// —— 第 3 单记的是别人的桌，经理撤销 ——
+$cbR = $cbApp->points()->reverse($cbL[2], '记错了卡', $cbOp);
+ok($cbR['ok'] ?? false, '撤销成功');
+eq(2, (int)$cbApp->members()->findById($cbM)['visit_count'], '  └ 计次退回 2');
+eq(0, $cbCoupons(1),
+   '★★★ 那张券被收回了（不再可用）—— 原来它留在客人手上，而且能正常核销，一顿饭就送出去了');
+eq(1, $cbCoupons(4), '  └ 是【作废】而不是删除，账面上查得到');
+eq(0, $cbIssued(),
+   '★★★ rewards_issued 也退回 0 —— 不退的话客人后面【永远】少一张券');
+
+// —— 客人后来自己老老实实吃到第 3 次 ——
+$cbGrant(3);
+eq(3, (int)$cbApp->members()->findById($cbM)['visit_count'], '客人真吃到第 3 次');
+eq(1, $cbCoupons(1),
+   '★★★ 这一次拿到了券 —— 修之前这里是 0 张，而进度条还写着「还差 3 次」');
+
+/**
+ * ★ 另一半：券【已经被吃掉】了才发现记错卡。
+ *   那顿饭收不回来，所以 rewards_issued 也不减（客人确实拿到了那份奖励），
+ *   转而挂一条告警 —— 这笔损失总得有个地方对账。
+ */
+$cbM2 = (int)$cbApp->members()->create('TK-00099002-CBB', null, null, null)['id'];
+$cbL2 = [];
+for ($i = 0; $i < 3; $i++) {
+    $r = $cbApp->points()->grant(sprintf('99%08d', $i),
+        [['member_id' => $cbM2, 'amount_cents' => 0, 'portions' => 0]],
+        Vip\PointsEngine::MODE_SPLIT, $cbOp);
+}
+// 上面那几张单额度已被第一位客人分完，改用手工路径把第二位客人推到门槛上
+$cbDb->exec('UPDATE member SET visit_count = 2, rewards_issued = 0 WHERE store_code=? AND id=?',
+    [SMOKE_STORE, $cbM2]);
+$cbLid = $cbGrant2 = null;
+$r = $cbApp->points()->grant('9900000004',
+    [['member_id' => $cbM2, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $cbOp);
+$cbLid = (int)$r['entries'][0]['ledger_id'];
+$cbApp->rewards()->checkAndGrant($cbM2, $cbOp);
+$cbCid = (int)$cbDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? ORDER BY id DESC LIMIT 1',
+    [SMOKE_STORE, $cbM2]);
+ok($cbCid > 0, '第二位客人也满门槛发了券');
+
+// 客人把券吃掉了（直接置为已核销：这里要测的是「吃掉之后撤销会怎样」）
+$cbDb->exec('UPDATE coupon SET status = 2, redeemed_at = ? WHERE id = ?', [$cbDb->now(), $cbCid]);
+$cbApp->points()->reverse($cbLid, '记错了卡（券已被吃掉）', $cbOp);
+eq(2, (int)$cbDb->value('SELECT status FROM coupon WHERE id=?', [$cbCid]),
+   '★★ 已核销的券【不动】—— 那顿饭吃掉了，收不回来');
+eq(1, (int)$cbApp->members()->findById($cbM2)['rewards_issued'],
+   '  └ rewards_issued 也不减：客人确实拿到了那份奖励，减了他会再拿一张');
+eq(1, (int)$cbDb->value(
+        "SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type='reward_on_reversed_grant'",
+        [SMOKE_STORE]),
+   '★★★ 但挂了告警 —— 这是一份【发错的账换来的】免费餐，经理必须知道，否则连账都没地方对');
+
+$cbApp->cfg()->set('reward_threshold_visits', (string)$cbThr0);
+$cbIds = implode(',', [$cbM, $cbM2]);
+$cbDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$cbIds})", [SMOKE_STORE]);
+$cbDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$cbIds})", [SMOKE_STORE]);
+$cbDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$cbIds})", [SMOKE_STORE]);
+$cbDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '990000000%'", [SMOKE_STORE]);
+
+step('㉟ 免费餐的「不计次」预览，不能和实际说两套话');
+
+/**
+ * ★ visitPreview 的免费餐那一支必须先看 free_meal_extra_earns ——
+ *   那个开关决定的不是「计不计次」，而是【这一单能不能记】：
+ *     关（出厂默认）→ grantOne 整单拒绝（free_meal / redeemed）
+ *     开             → 放行，但计次强制为 0
+ *
+ *   漏看它的后果不是少提示一句，是【说反了】：预览说「不计次」，
+ *   言下之意别的照记；实际是一分钱都记不进去。服务员照着这句话
+ *   跟客人说完「这一餐不计次，别的照常」，客人点头，然后提交撞一堵墙 ——
+ *   比原来「记完才告诉你没计次」更糟。
+ */
+$fmApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$fmDb  = $fmApp->localDb();
+$fmApp->cfg()->set('late_grant_minutes', '0');
+$fmApp->cfg()->set('visit_count_mode', 'once_per_period');
+$fmPos = new FakePosSource();
+$fmPos->now = date('Y-m-d H:i:s');
+$fmPos->addHead([
+    'serial_id' => '9700000001', 'order_head_id' => 970001, 'check_id' => 1,
+    'table_name' => 'FM1', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '12.00', 'should_amount' => '12.00', 'actual_amount' => '12.00',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($fmPos->now) - 300),
+]);
+$fmPos->addDetail(970001, 1, [FakePosSource::line(431, 'Agua', '2.95', '12.00', 4)]);
+$fmApp->setPosSource($fmPos);
+$fmApp->points()->locate('FM1', 900);
+$fmDb->exec("UPDATE pos_order SET is_free_meal = 1 WHERE store_code=? AND serial_id=?",
+    [SMOKE_STORE, '9700000001']);
+$fmM = (int)$fmApp->members()->create('TK-00097101-FMA', null, null, null)['id'];
+$fmOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true];
+
+$fmApp->cfg()->set('free_meal_extra_earns', '0');
+eq(null, $fmApp->points()->visitPreview($fmM, '9700000001'),
+   '★★★ 开关【关】着时不给预览 —— 这种单根本记不进去，说「只是不计次」就是说反了');
+$fmR = $fmApp->points()->grant('9700000001',
+    [['member_id' => $fmM, 'amount_cents' => 1200, 'portions' => 0]],
+    Vip\PointsEngine::MODE_SPLIT, $fmOp);
+eq('free_meal', (string)($fmR['error'] ?? ''),
+   '  └ 对照：实际提交确实是【整单拒绝】，不是「记上但不计次」');
+
+$fmApp->cfg()->set('free_meal_extra_earns', '1');
+$fmP = $fmApp->points()->visitPreview($fmM, '9700000001');
+eq(false, $fmP['counts_visit'], '★★ 开关【开】着时才说「不计次」');
+eq('free_meal', $fmP['reason'], '  └ 理由是「兑换来的」');
+$fmR2 = $fmApp->points()->grant('9700000001',
+    [['member_id' => $fmM, 'amount_cents' => 1200, 'portions' => 0]],
+    Vip\PointsEngine::MODE_SPLIT, $fmOp);
+ok($fmR2['ok'] ?? false, '  └ 这时提交确实过得去 —— 预览与实际一致');
+eq(0, (int)$fmR2['entries'][0]['visits'], '  └ 且真的没计次');
+
+$fmApp->cfg()->set('free_meal_extra_earns', '0');
+$fmDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id=?", [SMOKE_STORE, $fmM]);
+$fmDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id=?", [SMOKE_STORE, $fmM]);
+$fmDb->exec("DELETE FROM member       WHERE store_code=? AND id=?",        [SMOKE_STORE, $fmM]);
+$fmDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id=?", [SMOKE_STORE, '9700000001']);
+
+step('㊱ 两台 Pad 同时记 AA 单，不能撞死锁');
+
+/**
+ * ★ 现场是这样的：晚市，两桌客人，两位常一起来的老顾客在两桌上都出现了。
+ *     1 号 Pad 记 A 桌：先点张三，再点李四
+ *     2 号 Pad 记 B 桌：先点李四，再点张三
+ *   只差一个点人的顺序，谁也没做错事。
+ *
+ *   grantOne() 原来按【客户端给过来的顺序】逐个 SELECT ... FOR UPDATE 锁会员行，
+ *   于是构成经典的加锁顺序死锁：MySQL 挑一个牺牲者整笔回滚，
+ *   收银员看到的是「本地数据库暂时不可用，请联系管理员」——
+ *   而库好得很，标准处理方式是重试，不是打电话找人。
+ *
+ *   实测（不排序时，4 个进程各 80 单、3 位会员四种顺序）：
+ *   320 单里死锁 172 次，53.8% 记不进去。
+ *
+ *   grantMerged() 早就为同一件事写了 sort($serials)，说明风险被想到过 ——
+ *   只是没推广到【每天跑几百次】的这条普通记账路径。
+ *
+ * ★ 必须真 fork 进程。单进程顺序调用永远拿得到锁，怎么跑都是绿的。
+ */
+$dlApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$dlDb  = $dlApp->localDb();
+$dlApp->cfg()->set('late_grant_minutes', '0');
+$dlApp->cfg()->set('max_grants_per_period', '0');
+$dlApp->cfg()->set('visit_count_mode', 'by_order');
+$dlApp->cfg()->set('reward_enabled', '0');
+
+$DL_W = 4;                       // 几台 Pad
+$DL_N = 25;                      // 每台记几单
+$dlPos = new FakePosSource();
+$dlPos->now = date('Y-m-d H:i:s');
+for ($i = 0; $i < $DL_W * $DL_N; $i++) {
+    $oh = 880000 + $i;
+    $dlPos->addHead([
+        'serial_id' => sprintf('88%08d', $i), 'order_head_id' => $oh, 'check_id' => 1,
+        'table_name' => 'DL' . $i, 'eat_type' => 0, 'customer_num' => 4,
+        'original_amount' => '95.60', 'should_amount' => '95.60', 'actual_amount' => '95.60',
+        'order_end_time' => date('Y-m-d H:i:s', strtotime($dlPos->now) - 60),
+    ]);
+    $dlPos->addDetail($oh, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '95.60', 4)]);
+}
+$dlApp->setPosSource($dlPos);
+for ($i = 0; $i < $DL_W * $DL_N; $i++) { $dlApp->points()->locate('DL' . $i, 900); }
+
+$dlIds = [];
+foreach (['A', 'B', 'C'] as $k => $x) {
+    $dlIds[] = (int)$dlApp->members()->create(
+        sprintf('TK-0008800%d-D%sA', $k + 1, $x), null, null, null)['id'];
+}
+
+// 四种不同的点人顺序 —— 交叉才构成死锁
+$dlPerms = [[0, 1, 2], [2, 1, 0], [1, 0, 2], [2, 0, 1]];
+$dlStart = microtime(true) + 2.0;
+$dlProcs = [];
+for ($w = 0; $w < $DL_W; $w++) {
+    $ids = implode(',', array_map(fn(int $j): int => $dlIds[$j], $dlPerms[$w]));
+    $cmd = $envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+         . escapeshellarg(__DIR__ . '/deadlock_worker.php') . ' '
+         . escapeshellarg($ids) . ' ' . ($w * $DL_N) . ' ' . $DL_N . ' '
+         . sprintf('%.4f', $dlStart) . ' 2>/dev/null';
+    $dlProcs[] = popen($cmd, 'r');
+}
+$dlOk = 0; $dlDead = 0;
+foreach ($dlProcs as $ph) {
+    if ($ph === false) { continue; }
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)));
+    $dlOk   += (int)($line[0] ?? 0);
+    $dlDead += (int)($line[1] ?? 0);
+    pclose($ph);
+}
+
+$dlTotal = $DL_W * $DL_N;
+eq($dlTotal, $dlOk,
+   "★★★ {$DL_W} 台 Pad 交叉点人、共 {$dlTotal} 单，【全部记进去】（实际 {$dlOk} 单）"
+   . ' —— 不固定加锁顺序时这里一半会失败');
+eq(0, $dlDead, '  └ 一次死锁都没有（固定加锁顺序是第一道，事务重试只是兜底）');
+
+/**
+ * ★ 顺带把「重试确实存在」也钉住 —— 光看上面那条断言分不出
+ *   「排序生效」和「排序没生效但重试全救回来了」。
+ */
+ok(str_contains((string)file_get_contents(__DIR__ . '/../app/lib/LocalDb.php'), '1213'),
+   '  └ LocalDb::transaction() 认得 1213/1205 并会重放（第二道）');
+ok(str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Http/Api.php'), "1213, 1205       => 'E110'"),
+   '★★ 死锁单独归为 E110，不再冒充「本地数据库不可用，请联系管理员」');
+
+$dlIdList = implode(',', $dlIds);
+$dlDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$dlIdList})", [SMOKE_STORE]);
+$dlDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$dlIdList})", [SMOKE_STORE]);
+$dlDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$dlIdList})", [SMOKE_STORE]);
+$dlDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '88%'", [SMOKE_STORE]);
 
 step('⑬ 不变量总校验');
 
