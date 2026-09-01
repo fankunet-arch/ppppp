@@ -466,6 +466,20 @@ $api->on('POST', '/members/search', static function () use ($app, $requireManage
         'phone' => $m['phone'], 'email' => $m['email'], 'birthday' => $m['birthday'],
         'points_balance' => (int)$m['points_balance'], 'visit_count' => (int)$m['visit_count'],
         'total_spent' => $m['total_spent'], 'consent_status' => (int)$m['consent_status'],
+        /**
+         * ★ 已发券计数要露出来。
+         *
+         *   pending = 应发 − 已发，所以这个数虚高 1，客人就【永远少一张券】，
+         *   而进度条上那句「还差 N 次」看上去完全正常，谁也不会觉得不对。
+         *   它以前不在任何一个接口、任何一个后台页面上出现 ——
+         *   店里没有办法发现，更没有办法核对。
+         *
+         *   撤销记账现在会自动把多发的券收回并把这个数减回去
+         *   （PointsService::reverseInTx → RewardService::clawBackOverIssued），
+         *   但已经【被吃掉】的券收不回来，那时这个数会合理地留在高位；
+         *   经理要能看见它，才对得上账。
+         */
+        'rewards_issued' => (int)($m['rewards_issued'] ?? 0),
         'created_at' => $m['created_at'],
     ], 'ledger' => array_map(static fn($l) => [
         'id' => (int)$l['id'], 'serial_id' => $l['serial_id'],

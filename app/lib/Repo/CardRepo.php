@@ -46,7 +46,18 @@ final class CardRepo
     public function __construct(
         private LocalDb $db,
         private string $storeCode,
-        private CardNumber $cardNo,
+        /**
+         * ★ 可空 —— 与 PointsService 的 $cardNo 同一个理由（docs/03 §10）。
+         *
+         *   card_prefix 配错时 CardNumber 构造即抛。这里若是必填的，
+         *   App::cards() 就构造不出来，而它被 rewards() → points() 一路带着，
+         *   于是【连记账都起不来】—— 收银员登得进去，一单也记不了。
+         *
+         *   本类只有 generateBatch()（发卡）真正需要它：那本来就该在
+         *   前缀配错时停用，所以只在那一处显式拒绝，其余照常工作
+         *   （查卡走 CardNumber::normalize() 静态方法，不需要实例）。
+         */
+        private ?CardNumber $cardNo,
     ) {
     }
 
@@ -138,6 +149,16 @@ final class CardRepo
         }
 
         $tierCode = ($tierCode !== null && trim($tierCode) !== '') ? trim($tierCode) : null;
+
+        /**
+         * ★ 发卡是唯一真正需要 CardNumber 的动作：要按 card_prefix 拼出卡号。
+         *   前缀配错时这一步必须停 —— 拼出来的卡号跟自己都对不上。
+         *   但停的只是发卡，找单、记账、撤销照常（docs/03 §10）。
+         */
+        if ($this->cardNo === null) {
+            throw new \RuntimeException(
+                'card_prefix 配置不合法，发卡功能已停用 —— 请先在后台改正前缀（不能含 I / L / O / U）');
+        }
 
         $now   = $this->db->now();
         $start = $this->nextSerial();

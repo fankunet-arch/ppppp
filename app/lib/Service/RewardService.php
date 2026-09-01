@@ -534,6 +534,95 @@ final class RewardService
         return ['ok' => true];
     }
 
+    /**
+     * 计次/消费被退回之后，把【已经不再算挣到】的券收回来。
+     *
+     * ── 🔴 不做这件事会怎样 ────────────────────────────
+     *
+     * 服务员拿错卡，把 B 桌的账记到张三名下，张三因此正好满了十次、
+     * 系统当场发了一张免费餐券。经理十分钟后发现，撤销那笔记账。
+     *
+     * 撤销回退了计次、积分、累计消费 —— 唯独没碰券，也没碰 rewards_issued。
+     * 于是两头都错：
+     *   ① 那张券还在客人手上，而且【能正常核销】—— 一顿饭就这么送出去了；
+     *   ② 客人后来自己老老实实吃到第十次，一张券都拿不到 ——
+     *      progressOf 里 pending = earned − issued，issued 虚高 1，
+     *      于是永远算出 0。界面上还写着「还差 N 次」，看上去完全正常。
+     *
+     * 实测（门槛按 3 次）：撤销后计次退回 2，券仍在且核销成功；
+     * 客人真吃到第 3 次时 checkAndGrant 发出 0 张。
+     *
+     * ── 为什么按「应发 − 已发」重算，而不是记住哪张券是哪笔账发的 ──
+     *
+     * 与 §5.2 的自愈公式同一条思路：只看当下的进度该发几张、已经发了几张，
+     * 多出来的收回。这样无论中间经历过改门槛、补录、多次撤销，都能自动对上，
+     * 不需要在券和流水之间维护一条会断的对应关系。
+     *
+     * ★ 已核销的券不动。那顿饭已经吃掉了，收不回来 ——
+     *   这时 rewards_issued 也【不减】（客人确实拿到了那份奖励），
+     *   转而挂一条告警让经理知道有一份奖励是发错的账换来的。
+     *
+     * ★ 必须由调用方开事务并先锁住会员行（reverseInTx 已经锁了）。
+     *   这里不自己开事务：收回券和退回计次必须是同一笔，
+     *   中间断开就又回到「计次退了、券没退」那个状态。
+     *
+     * @return array{voided:int, unrecoverable:int, codes:array<int,string>}
+     */
+    public function clawBackOverIssued(int $memberId, array $operator, string $reason): array
+    {
+        $m = $this->members->findById($memberId);
+        if ($m === null) {
+            return ['voided' => 0, 'unrecoverable' => 0, 'codes' => []];
+        }
+
+        $p    = $this->progressOf($m, $this->tiers->forMember($memberId));
+        $over = (int)$p['issued'] - (int)$p['earned'];
+        if ($over <= 0) {
+            return ['voided' => 0, 'unrecoverable' => 0, 'codes' => []];
+        }
+
+        /**
+         * 只收【靠消费挣来的】券，后台手工发的那些不动 ——
+         * 那是补偿、投诉处理发出去的，与计次进度无关
+         * （grantManual 本来也不加 rewards_issued，见 §5.2）。
+         * 新发的先收：越靠后的那张越可能就是这次撤销带出来的。
+         */
+        $cands = $this->db->all(
+            'SELECT id, code FROM coupon
+              WHERE store_code = ? AND member_id = ? AND status = ? AND source IN (?, ?)
+              ORDER BY id DESC LIMIT ' . max(1, min($over, 50)),
+            [$this->storeCode, $memberId, self::ST_ACTIVE, self::SRC_VISITS, self::SRC_AMOUNT]
+        );
+
+        $codes = [];
+        foreach ($cands as $c) {
+            $this->db->exec('UPDATE coupon SET status = ? WHERE id = ?', [self::ST_VOID, (int)$c['id']]);
+            $this->audit->log('coupon_void', [
+                'target_type'   => 'coupon', 'target_id' => (string)$c['id'],
+                'operator_id'   => $operator['id']   ?? null,
+                'operator_name' => $operator['name'] ?? null,
+                'detail' => ['code' => $c['code'], 'reason' => $reason, 'auto' => 'clawback'],
+            ]);
+            $codes[] = (string)$c['code'];
+        }
+
+        /**
+         * ★ rewards_issued 只按【真收回来的张数】减。
+         *
+         *   减多了的后果比不减更糟：pending 会立刻变正，
+         *   下一次记账把刚作废的那张原样再发一遍。
+         */
+        if ($codes) {
+            $this->db->exec(
+                'UPDATE member SET rewards_issued = GREATEST(0, rewards_issued - ?), updated_at = ?
+                  WHERE store_code = ? AND id = ?',
+                [count($codes), $this->db->now(), $this->storeCode, $memberId]
+            );
+        }
+
+        return ['voided' => count($codes), 'unrecoverable' => $over - count($codes), 'codes' => $codes];
+    }
+
     /** 后台统计 */
     public function stats(): array
     {
