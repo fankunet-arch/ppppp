@@ -1516,6 +1516,36 @@ final class PointsService
                     'detail' => ['min' => Money::toStr($minManual),
                                  'given' => Money::toStr($amountCents)]];
         }
+
+        /**
+         * ── 🔴 日【累计金额】上限 —— 单笔限额挡不住的那一半 ──────
+         *
+         * 原来的风控是：单笔上限（超了要经理放行）、单笔硬上限、
+         * 以及同一员工单日【笔数】超过 N 笔就告警。三条都管不住这个：
+         *
+         *   reward_mode = amount、门槛 100.00 时，
+         *   经理连录 3 笔 200.00 → 消费额 600.00 → 当场发出【6 张免费餐券】。
+         *   单笔没超限、笔数 3 < 告警阈值 5 —— 一声不响，六顿饭。
+         *
+         * 笔数管不住钱，只有钱能管钱。这一条把最坏情况框住：
+         * 一天最多能凭空造出多少额度，是个可以写进规章的数。
+         *
+         * ★ 它拦的是【累计】，不是单笔 —— 与 manual_entry_limit 是两个维度，
+         *   谁也替代不了谁。填 0 = 不设。
+         * ★ 超了就是超了，经理也不能放行：能放行的话它就不是上限，
+         *   而放行权本身就在最可能滥用的那个人手里。
+         */
+        $dayCap = Money::toCents($this->cfg->get('manual_entry_daily_cap', '0'));
+        $opIdPre = (int)($operator['id'] ?? 0);
+        if ($dayCap > 0 && $opIdPre > 0) {
+            $usedToday = $this->ledger->manualAmountToday($opIdPre);
+            if ($usedToday + $amountCents > $dayCap) {
+                return ['ok' => false, 'error' => 'exceeds_manual_daily_cap',
+                        'detail' => ['cap' => Money::toStr($dayCap),
+                                     'used' => Money::toStr($usedToday),
+                                     'given' => Money::toStr($amountCents)]];
+            }
+        }
         /**
          * 两道上限，管的事情不一样：
          *

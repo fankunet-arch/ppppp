@@ -128,6 +128,8 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
 (@store,'alert_span_hours','6',@now),
   -- 当天记的几单结账时间跨度超过多少小时就告警。0 = 关闭。
 -- 手工录入的最低金额。防的是员工连着录很多笔极小金额刷分（docs/03 §10.3）
+-- 单个员工每天手工录入的累计上限。原风控只数笔数，管不住金额（docs/03 §10.3）
+(@store,'manual_entry_daily_cap','300.00',@now),
 (@store,'manual_entry_min','1.00',@now),
 (@store,'manual_entry_hard_limit','5000.00',@now),
   -- 手工录入的绝对上限，经理也不能超。拦的是手滑多打几个零。0 = 不设。

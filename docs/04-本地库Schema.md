@@ -499,6 +499,7 @@ CREATE TABLE `sys_config` (
 | `points_multiplier` | `1.0` | 积分倍率（1.0 = 不启用） |
 | `min_amount_per_visit` | `5.00` | 计一次至少要分到多少钱。一分钱不能换一次「十送一」进度，见 `03` §3.1quinquies。填 0 = 不设门槛 |
 | `manual_entry_min` | `1.00` | 手工录入的最低金额。按次数积分口径下自动抬到与上一项的较大值，见 `03` §10.3 |
+| `manual_entry_daily_cap` | `300.00` | 单个员工每天手工录入的**累计**上限，超了经理也不能放行。原风控只数笔数，管不住金额，见 `03` §10.3 |
 | `points_include_tax` | `1` | 积分按含税价（已确认为 1） |
 | `free_meal_extra_earns` | `0` | 免费餐当次的额外消费（饮料甜品）是否计金额积分 |
 | `visit_count_mode` | `once_per_period` | 计次口径：**`once_per_period`=一张卡一个餐期 1 次（现行，见 `03` §13）**／`by_portion`=按套餐份数（旧默认）／`by_order`=每笔流水最多 1 次 |

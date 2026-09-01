@@ -46,6 +46,12 @@ final class ReconcileService
         private AlertRepo  $alerts,
         private AuditRepo  $audit,
         private MealRules  $rules,
+        /**
+         * ★ 缩水/作废之后要把「已经不再算挣到」的券收回来。
+         *   与 PointsService::reverseInTx 走同一个方法 ——
+         *   两条路对同一件事必须给出同一个结果。
+         */
+        private RewardService $rewards,
     ) {
     }
 
@@ -330,6 +336,48 @@ final class ReconcileService
                  */
                 if ($newTotal === 0) {
                     $this->ledger->markReversed((int)$e['id'], $refundId);
+                }
+            }
+
+            /**
+             * ── 🔴 券也要跟着退 —— 这条路原来完全没做 ──────────
+             *
+             * 撤销记账（reverseInTx）会收回「已经不再算挣到」的券，
+             * 但【值比对】这条路原来只退计次/积分/消费额，一个字没碰券。
+             * 于是同一件事在两条路上结果不同：
+             *
+             *   收银员记错卡 → 经理手工撤销 → 券收回        ✓
+             *   POS 侧整单作废 → 夜间值比对退回 → 【券还在，且能核销】 🔴
+             *
+             * 实测两种口径都漏：
+             *   按次数：记满 3 次发券 → 第 3 单作废 → 计次退回 2，券状态照旧可用
+             *   按金额：消费 191.20 发券 → 退到 95.60（门槛 100）→ 该发 0 张、
+             *           已发 1 张，券还在客人手上
+             *
+             * 后者更隐蔽：不需要整单归零，任何一次让进度跌破门槛的缩水都会漏。
+             * 而 POS 侧改单/作废是店里每天都在发生的事。
+             *
+             * ★ 放在 applyAllocation 之前、applyDelta 之后：收几张是按
+             *   【退完之后的进度】重算的。
+             * ★ 在同一笔事务里：分开就又回到「进度退了、券没退」。
+             */
+            foreach (array_unique(array_map(
+                        static fn(array $e): int => (int)$e['member_id'], $earns)) as $mid) {
+                $claw = $this->rewards->clawBackOverIssued(
+                    (int)$mid, ['id' => null, 'name' => '值比对'],
+                    sprintf('值比对：订单 %s 金额由 %s 变为 %s',
+                        $serial, Money::toStr($oldTotal), Money::toStr($newTotal)));
+                if (($claw['unrecoverable'] ?? 0) > 0) {
+                    /**
+                     * 已经吃掉的券收不回来。那顿饭是拿一笔【后来被 POS 退掉的】
+                     * 消费换的 —— 店里实打实亏了一顿，必须有人知道。
+                     */
+                    $this->alerts->raiseOnce(
+                        'reward_on_shrunk_order', 'member', (string)$mid,
+                        sprintf('订单 %s 金额缩水后，由它带出的 %d 张免费餐券【已经被核销】，收不回来了。'
+                              . '请人工核对这位客人的奖励进度', $serial, (int)$claw['unrecoverable']),
+                        ['severity' => 2, 'detail' => ['serial_id' => $serial,
+                                                       'voided' => $claw['codes'] ?? []]]);
                 }
             }
 

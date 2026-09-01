@@ -245,6 +245,7 @@ final class App
         return $this->once('reconcile', fn() => new ReconcileService(
             $this->localDb(), $this->posReader(), $this->cfg(), $this->orders(),
             $this->members(), $this->ledger(), $this->alerts(), $this->audit(), $this->mealRules(),
+            $this->rewards(),
         ));
     }
 
@@ -261,6 +262,7 @@ final class App
         return $this->once('rewards', fn() => new RewardService(
             $this->localDb(), $this->storeCode(), $this->cfg(),
             $this->members(), $this->audit(), $this->cards(), $this->cardTiers(),
+            $this->ledger(), $this->alerts(),
         ));
     }
 

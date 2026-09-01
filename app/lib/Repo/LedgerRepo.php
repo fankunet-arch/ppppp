@@ -179,6 +179,43 @@ final class LedgerRepo
         );
     }
 
+    /**
+     * 同一员工今日手工录入的【金额合计】（分）。
+     *
+     * ★ 与 manualCountToday 是两件事，不能互相代替：
+     *   原来的风控只数【笔数】（超过 5 笔告警）。可 3 笔 200.00 就是 600.00，
+     *   在「按金额」发券、门槛 100 的配置下等于当场造出 6 张免费餐券 ——
+     *   笔数没超，告警不响，账面上什么都看不出来。
+     *   钱的事要用钱来管。
+     */
+    public function manualAmountToday(int $operatorId): int
+    {
+        return Money::toCents((string)($this->db->value(
+            'SELECT COALESCE(SUM(amount), 0) FROM point_ledger
+              WHERE store_code = ? AND source = ? AND operator_id = ?
+                AND status = ? AND created_at >= ?',
+            [$this->storeCode, self::SRC_MANUAL, $operatorId, self::S_ACTIVE, date('Y-m-d 00:00:00')]
+        ) ?? '0'));
+    }
+
+    /**
+     * 这位会员的累计消费里，有多少是【手工录入】来的（分）。
+     *
+     * 给发券那一刻的风控用：手工录入没有 POS 订单作证，
+     * 它证明的只是「有人说这笔钱花了」。在「按金额」口径下它却
+     * 全额计入 total_spent、直接换券 —— 而「按次数」口径下同一笔录入
+     * 计次恒为 0，一张券都换不到。同一个动作在两种口径下待遇天差地别，
+     * 这个差别没有任何人会预料到。
+     */
+    public function manualAmountByMember(int $memberId): int
+    {
+        return Money::toCents((string)($this->db->value(
+            'SELECT COALESCE(SUM(amount), 0) FROM point_ledger
+              WHERE store_code = ? AND member_id = ? AND source = ? AND status = ?',
+            [$this->storeCode, $memberId, self::SRC_MANUAL, self::S_ACTIVE]
+        ) ?? '0'));
+    }
+
     /** 待复核队列 */
     public function pendingReview(int $limit = 50): array
     {

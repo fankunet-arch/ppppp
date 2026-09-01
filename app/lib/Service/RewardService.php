@@ -46,6 +46,12 @@ final class RewardService
         private AuditRepo  $audit,
         private CardRepo   $cards,
         private \Vip\Repo\CardTierRepo $tiers,
+        /**
+         * ★ 都是只挂在 localDb 上的普通仓储，不会像 CardRepo 那样
+         *   牵出 CardNumber —— card_prefix 配错时本类照样构造得出来。
+         */
+        private \Vip\Repo\LedgerRepo $ledger,
+        private \Vip\Repo\AlertRepo  $alerts,
     ) {
     }
 
@@ -292,6 +298,38 @@ final class RewardService
                   WHERE store_code = ? AND id = ?',
                 [count($out), $this->db->now(), $this->storeCode, $memberId]
             );
+
+            /**
+             * ── 🔴 这一张是不是"打字打出来的" ────────────────────
+             *
+             * 手工录入没有 POS 订单作证，它证明的只是「有人说这笔钱花了」。
+             * 按次数口径下这一点是落实了的 —— 手工录入 counted_visit 恒为 0，
+             * 一张券都换不到（PointsService::manualGrant 的说明）。
+             *
+             * 但按【金额】口径下，同一笔录入全额计入 total_spent、直接换券。
+             * 同一个动作在两种口径下待遇天差地别，而没有任何人会预料到这一点。
+             *
+             * 事前拦不住：手工录入是 POS 挂掉时的降级通道，堵死它等于
+             * 把正常客人一起挡在门外（docs/03 §10）。所以做两件事 ——
+             * 上限把最坏情况框住（manual_entry_daily_cap），
+             * 这里保证【造出免费餐的那一刻永远不是静默的】。
+             *
+             * 判据取「手工录入的金额本身已经够一个门槛」：正常的偶发降级
+             * （POS 抽风一两次）远达不到，不会天天叫；而真要靠打字凑出一顿饭，
+             * 必然越过它。
+             */
+            if ($r['mode'] === 'amount') {
+                $manual = $this->ledger->manualAmountByMember($memberId);
+                if ($manual >= $r['threshold_cents']) {
+                    $this->alerts->raise(
+                        'reward_from_manual_entry',
+                        sprintf('刚给会员 #%d 发出 %d 张免费餐券，而这位客人的累计消费里有 € %s '
+                              . '来自【手工录入】（没有 POS 订单作证，金额是收银员填的）。'
+                              . '请核对这些录入是否真实', $memberId, count($out), Money::toStr($manual)),
+                        ['severity' => 2, 'ref_type' => 'member', 'ref_id' => (string)$memberId]
+                    );
+                }
+            }
 
             return ['granted' => count($out), 'pending' => 0, 'coupons' => $out];
         });
@@ -650,6 +688,44 @@ final class RewardService
         return ['voided' => count($codes), 'unrecoverable' => $over - count($codes), 'codes' => $codes];
         // unrecoverable > 0 ＝ 有券【发于已被退掉的那段进度】却已经吃掉了：
         // 白送了一顿饭，rewards_issued 也就不减（客人确实拿到了那份奖励）
+    }
+
+    /**
+     * 按【当前规则】算一遍：全店总共还欠多少张券。
+     *
+     * ★ 用途只有一个：门槛调低时，把「这一下会补发多少张」摆在店家面前。
+     *
+     *   达标判定是自愈式的（应发 = floor(进度 / 门槛) − 已发），
+     *   所以把「十次送一」改成「三次送一」的那一刻，系统会按全部历史进度
+     *   给每一位会员回溯补发。一个来过 10 次的客人当场从 1 张变成 3 张。
+     *   **而发出去的券收不回来**（docs/03 §5.1）。
+     *
+     *   这件事本身是有意的设计（改门槛能自动对上，既不重复也不遗漏），
+     *   问题在于它原来是【静默】的：后台点一下保存，提示「已保存」，
+     *   几十顿饭就送出去了，没有任何地方说过一句。
+     *
+     * ⚠️ 这是个【估算】：按全局门槛算，不逐个套用卡片等级的门槛
+     *   （分级会员的实际张数可能更多）。用途是给人一个量级，
+     *   不是精确账 —— 精确数在真正发券时由 checkAndGrant 逐人算。
+     */
+    public function pendingAcrossMembers(): int
+    {
+        $r = $this->rule(null);
+        if (!$r['enabled']) {
+            return 0;
+        }
+        if ($r['mode'] === 'amount') {
+            $sql = 'SELECT COALESCE(SUM(GREATEST(0,
+                        FLOOR(total_spent * 100 / ?) - rewards_issued)), 0)
+                      FROM member WHERE store_code = ?';
+            $thr = max(1, $r['threshold_cents']);
+        } else {
+            $sql = 'SELECT COALESCE(SUM(GREATEST(0,
+                        FLOOR(visit_count / ?) - rewards_issued)), 0)
+                      FROM member WHERE store_code = ?';
+            $thr = max(1, $r['threshold_visits']);
+        }
+        return (int)$this->db->value($sql, [$thr, $this->storeCode]);
     }
 
     /** 后台统计 */
