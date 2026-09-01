@@ -93,6 +93,7 @@ final class Api
         // 一分钱不能换一次「十送一」的进度 —— 门槛在后台「防刷与风控」里
         'amount_too_small_for_visit' => '要计一次，这位客人分到的金额太少了。请核对是谁点的计次套餐',
         'below_manual_min'       => '手工录入的金额低于下限，不能记账',
+        'exceeds_manual_daily_cap' => '今天手工录入的累计金额已到上限，这一笔不能再记（经理也不能放行）。请核对是不是重复录入了',
         'db_unavailable'         => '本地数据库暂时不可用，请联系管理员',
         // ★ 死锁不是故障，别把人指去找管理员 —— 再点一次就好
         'db_busy'                => '系统正忙了一下，这一单没有记进去。请再点一次「提交」（不用找管理员）',
@@ -187,6 +188,7 @@ final class Api
         'invalid_amount'         => 'Importe no válido',
         'amount_too_small_for_visit' => 'El importe asignado es demasiado bajo para contar una visita. Compruebe quién pidió el menú',
         'below_manual_min'       => 'El importe de la entrada manual está por debajo del mínimo',
+        'exceeds_manual_daily_cap' => 'Se ha alcanzado el tope diario acumulado de entradas manuales; ni el encargado puede autorizarlo. Compruebe si se ha duplicado algún apunte',
         'db_unavailable'         => 'La base de datos local no responde, avise al administrador',
         'db_busy'                => 'El sistema se ha saturado un momento y este apunte no se ha guardado. Pulse «Enviar» otra vez (no hace falta avisar a nadie)',
 

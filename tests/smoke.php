@@ -3749,6 +3749,189 @@ $msg = Vip\ConfigSchema::validate('redeem_line_patterns', 'Dto');
 ok(str_contains((string)$msg, '前台无法补救'),
    '  └ 并且说清后果，不是干巴巴一句"格式不对"');
 
+step('㊵ 值比对退掉消费之后，券也要跟着退');
+
+/**
+ * ★ 撤销记账（reverseInTx）早就会收回「已经不再算挣到」的券，
+ *   但【值比对】这条路原来一个字没碰券 —— 同一件事在两条路上结果不同：
+ *
+ *     收银员记错卡 → 经理手工撤销 → 券收回                ✓
+ *     POS 侧整单作废 → 夜间值比对退回 → 券还在，且能核销   🔴 一顿饭
+ *
+ *   而 POS 侧改单/作废是店里每天都在发生的事，撤销反而是少数。
+ *   按【金额】发券时更隐蔽：不需要整单归零，任何一次让进度跌破门槛的
+ *   缩水都会漏。
+ */
+$rcApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$rcDb  = $rcApp->localDb();
+foreach (['late_grant_minutes' => '0', 'max_grants_per_period' => '0',
+          'visit_count_mode' => 'by_order', 'points_mode' => 'by_amount',
+          'reward_enabled' => '1', 'reward_mode' => 'visits',
+          'reward_auto_grant' => '1'] as $k => $v) { $rcApp->cfg()->set($k, $v); }
+$rcThr0 = $rcApp->cfg()->get('reward_threshold_visits', '10');
+$rcApp->cfg()->set('reward_threshold_visits', '3');
+
+$rcPos = new FakePosSource();
+$rcPos->now = date('Y-m-d H:i:s');
+for ($i = 0; $i < 3; $i++) {
+    $oh = 530000 + $i;
+    $rcPos->addHead([
+        'serial_id' => sprintf('53%08d', $i), 'order_head_id' => $oh, 'check_id' => 1,
+        'table_name' => 'RC' . $i, 'eat_type' => 0, 'customer_num' => 2,
+        'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+        'order_end_time' => date('Y-m-d H:i:s', strtotime($rcPos->now) - 1800 + $i * 120),
+    ]);
+    $rcPos->addDetail($oh, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+}
+$rcApp->setPosSource($rcPos);
+for ($i = 0; $i < 3; $i++) { $rcApp->points()->locate('RC' . $i, 3600); }
+
+$rcOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => true];
+$rcM  = (int)$rcApp->members()->create('TK-00053001-RCA', null, null, null)['id'];
+for ($i = 0; $i < 3; $i++) {
+    $rcApp->points()->grant(sprintf('53%08d', $i),
+        [['member_id' => $rcM, 'amount_cents' => 4780, 'portions' => 2]],
+        Vip\PointsEngine::MODE_SPLIT, $rcOp);
+    $rcApp->rewards()->checkAndGrant($rcM, $rcOp);
+}
+eq(3, (int)$rcApp->members()->findById($rcM)['visit_count'], '前提：记满 3 次');
+eq(1, (int)$rcDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                        [SMOKE_STORE, $rcM]), '  └ 自动发了 1 张可用券');
+
+// POS 侧把第 3 单整单作废
+foreach ($rcPos->heads as $i => $h) {
+    if ($h['serial_id'] === '5300000002') {
+        $rcPos->heads[$i]['original_amount'] = '0.00';
+        $rcPos->heads[$i]['should_amount']   = '0.00';
+        $rcPos->heads[$i]['actual_amount']   = '0.00';
+    }
+}
+$rcApp->orders()->markVerified('5300000002', 0);
+$rcApp->reconcile()->verifyAmounts();
+
+eq(2, (int)$rcApp->members()->findById($rcM)['visit_count'], '值比对退回计次');
+eq(0, (int)$rcDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                        [SMOKE_STORE, $rcM]),
+   '★★★ 券也跟着收回了 —— 原来这条路只退计次不退券，那张券留在客人手上还能核销');
+eq(0, (int)$rcApp->members()->findById($rcM)['rewards_issued'],
+   '  └ 已发计数同步退回，客人后面不会平白少一张');
+
+/**
+ * ★ 按【金额】发券：不需要整单归零，任何一次让进度跌破门槛的缩水都算。
+ */
+$rcApp->cfg()->set('reward_mode', 'amount');
+$rcThrA0 = $rcApp->cfg()->get('reward_threshold_amount', '300.00');
+$rcApp->cfg()->set('reward_threshold_amount', '100.00');
+$rcM2 = (int)$rcApp->members()->create('TK-00053002-RCB', null, null, null)['id'];
+$rcApp->points()->grant('5300000000',
+    [['member_id' => $rcM2, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $rcOp);
+$rcApp->points()->grant('5300000001',
+    [['member_id' => $rcM2, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $rcOp);
+$rcDb->exec('UPDATE member SET total_spent = ? WHERE store_code=? AND id=?', ['191.20', SMOKE_STORE, $rcM2]);
+$rcApp->rewards()->checkAndGrant($rcM2, $rcOp);
+eq(1, (int)$rcDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                        [SMOKE_STORE, $rcM2]), '按金额：消费 191.20 → 1 张券');
+$rcDb->exec('UPDATE member SET total_spent = ? WHERE store_code=? AND id=?', ['95.60', SMOKE_STORE, $rcM2]);
+$rcApp->rewards()->clawBackOverIssued($rcM2, $rcOp, '值比对');
+eq(0, (int)$rcDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                        [SMOKE_STORE, $rcM2]),
+   '★★ 消费退到 95.60（门槛 100）→ 券收回。按金额口径下不需要整单归零就会漏');
+
+$rcApp->cfg()->set('reward_threshold_visits', (string)$rcThr0);
+$rcApp->cfg()->set('reward_threshold_amount', (string)$rcThrA0);
+$rcApp->cfg()->set('reward_mode', 'visits');
+$rcIds = implode(',', [$rcM, $rcM2]);
+$rcDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$rcIds})", [SMOKE_STORE]);
+$rcDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$rcIds})", [SMOKE_STORE]);
+$rcDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$rcIds})", [SMOKE_STORE]);
+$rcDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '53%'", [SMOKE_STORE]);
+
+step('㊶ 手工录入不能靠打字造出免费餐');
+
+/**
+ * ★ 手工录入没有 POS 订单作证，它证明的只是「有人说这笔钱花了」。
+ *   按次数口径下这一点是落实了的（counted_visit 恒为 0，一张券都换不到）。
+ *   但按【金额】口径下同一笔录入全额计入 total_spent、直接换券 ——
+ *   同一个动作在两种口径下待遇天差地别，没有人会预料到。
+ *
+ *   实测：门槛 100 时经理连录 3 笔 200.00 → 消费 600.00 → 当场 6 张免费餐券。
+ *   单笔没超限、笔数 3 < 告警阈值 5 —— 一声不响，六顿饭。
+ *   原来的日风控只数【笔数】，笔数管不住钱。
+ */
+$mmApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$mmDb  = $mmApp->localDb();
+foreach (['manual_entry_enabled' => '1', 'manual_entry_limit' => '500.00',
+          'manual_entry_min' => '1.00', 'manual_entry_daily_cap' => '300.00',
+          'reward_enabled' => '1', 'reward_mode' => 'amount',
+          'reward_threshold_amount' => '100.00', 'reward_auto_grant' => '1',
+          'points_mode' => 'by_amount'] as $k => $v) { $mmApp->cfg()->set($k, $v); }
+$mmOp = ['id' => 91, 'name' => '冒烟经理', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$mmM  = (int)$mmApp->members()->create('TK-00052001-MMA', null, null, null)['id'];
+
+$mmOk = 0; $mmErr = '';
+for ($i = 0; $i < 3; $i++) {
+    $r = $mmApp->points()->manualGrant($mmM, 20000, 'network_error', $mmOp);
+    if ($r['ok'] ?? false) { $mmOk++; } else { $mmErr = (string)($r['error'] ?? ''); }
+}
+eq(1, $mmOk, '★★★ 日累计上限 300.00 → 3 笔 200.00 只放过 1 笔');
+eq('exceeds_manual_daily_cap', $mmErr, '  └ 错误码说清是【累计】到顶，不是单笔超限');
+$mmDeny = $mmApp->points()->manualGrant($mmM, 20000, 'network_error', $mmOp);
+eq('exceeds_manual_daily_cap', (string)($mmDeny['error'] ?? ''),
+   '★★ 经理也不能放行 —— 能放行的话它就不是上限，而放行权就在最可能滥用的人手里');
+
+$mmAl0 = (int)$mmDb->value("SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type='reward_from_manual_entry'", [SMOKE_STORE]);
+$mmApp->rewards()->checkAndGrant($mmM, $mmOp);
+eq($mmAl0 + 1, (int)$mmDb->value(
+        "SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type='reward_from_manual_entry'", [SMOKE_STORE]),
+   '★★★ 靠手工录入凑出来的券【一定会留下告警】—— 造出免费餐那一刻永远不是静默的');
+
+$mmApp->cfg()->set('reward_mode', 'visits');
+$mmDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id=?", [SMOKE_STORE, $mmM]);
+$mmDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id=?", [SMOKE_STORE, $mmM]);
+$mmDb->exec("DELETE FROM member       WHERE store_code=? AND id=?",        [SMOKE_STORE, $mmM]);
+
+step('㊷ 奖励门槛：0 要拦，调低要留痕');
+
+/**
+ * ★ 门槛填 0：rule() 里是 max(1,...) 静默兜住的，所以不报错 ——
+ *   它会变成「每来一次送一次」，而达标判定是自愈式的，保存那一刻
+ *   系统按【全部历史进度】给每一位会员回溯补发。
+ *   实测：一位来过 10 次的会员当场发出 10 张。一个按键，十顿饭。
+ */
+ok(Vip\ConfigSchema::validate('reward_threshold_visits', '0') !== null,
+   '★★★ 门槛填 0 被拦下');
+ok(str_contains((string)Vip\ConfigSchema::validate('reward_threshold_visits', '0'), '收不回来'),
+   '  └ 并且说清后果（回溯补发、券收不回来），不是干巴巴一句"格式不对"');
+eq(null, Vip\ConfigSchema::validate('reward_threshold_visits', '1'), '填 1 放行（每次送一次是合法促销）');
+ok(Vip\ConfigSchema::validate('reward_threshold_amount', '0.00') !== null, '按金额的门槛同理');
+eq(null, Vip\ConfigSchema::validate('reward_threshold_amount', '300.00'), '  └ 正常值照常放行');
+
+/**
+ * ★ 调低门槛不拦（店家有权做促销），但必须算得出「这一下会补发多少张」。
+ */
+$tlApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$tlDb  = $tlApp->localDb();
+$tlApp->cfg()->set('reward_enabled', '1');
+$tlApp->cfg()->set('reward_mode', 'visits');
+$tlThr0 = $tlApp->cfg()->get('reward_threshold_visits', '10');
+$tlApp->cfg()->set('reward_threshold_visits', '10');
+$tlM = (int)$tlApp->members()->create('TK-00052002-TLA', null, null, null)['id'];
+$tlDb->exec('UPDATE member SET visit_count = 10, rewards_issued = 1 WHERE store_code=? AND id=?',
+    [SMOKE_STORE, $tlM]);
+$tlBefore = $tlApp->rewards()->pendingAcrossMembers();
+$tlApp->cfg()->set('reward_threshold_visits', '2');
+$tlAfter = $tlApp->rewards()->pendingAcrossMembers();
+ok($tlAfter > $tlBefore,
+   "★★★ 把门槛从 10 调到 2，全店待补发从 {$tlBefore} 张涨到 {$tlAfter} 张 —— "
+   . '这个数必须算得出来，否则店家点一下"保存"就送出几十顿饭而毫不知情');
+
+$tlApp->cfg()->set('reward_threshold_visits', (string)$tlThr0);
+$tlDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id=?", [SMOKE_STORE, $tlM]);
+$tlDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id=?", [SMOKE_STORE, $tlM]);
+$tlDb->exec("DELETE FROM member       WHERE store_code=? AND id=?",        [SMOKE_STORE, $tlM]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

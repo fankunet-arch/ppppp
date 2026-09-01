@@ -385,14 +385,50 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $w
     if ($err !== null) {
         Api::fail('bad_request', 400, ['hint' => $err]);
     }
+    /**
+     * ── 🔴 把门槛【调低】不是普通的改配置，是一次发钱 ──────
+     *
+     * 达标判定是自愈式的（应发 = floor(进度 / 门槛) − 已发），所以
+     * 「十次送一」改成「三次送一」的那一刻，系统会按全部历史进度给
+     * 每一位会员回溯补发：一个来过 10 次的客人当场从 1 张变成 3 张。
+     * **而发出去的券收不回来。**
+     *
+     * 自愈本身是有意的设计，问题在于它原来【完全静默】——
+     * 点一下保存，提示「已保存」，几十顿饭就送出去了，没有任何地方说过一句。
+     *
+     * 这里不拦（店家有权做促销），但要做到两件事：
+     *   ① 把「这一下会补发多少张」算出来回给界面；
+     *   ② 无论界面显不显示，都在告警里留一条 —— 事后对账要找得到。
+     */
+    $thrKeys = ['reward_threshold_visits', 'reward_threshold_amount'];
+    $before  = in_array($key, $thrKeys, true) ? (float)$app->cfg()->get($key, '0') : null;
+
     $app->cfg()->set($key, $val);
+
+    $willIssue = null;
+    if ($before !== null && (float)$val > 0 && (float)$val < $before) {
+        $willIssue = $app->rewards()->pendingAcrossMembers();
+        if ($willIssue > 0) {
+            $app->alerts()->raise(
+                'reward_threshold_lowered',
+                sprintf('奖励门槛由 %s 调低到 %s，全店将回溯补发约 %d 张免费餐券 —— '
+                      . '发出去的券收不回来。操作人：%s',
+                    (string)$before, $val, $willIssue, (string)($op['name'] ?? $op['id'])),
+                ['severity' => 3, 'ref_type' => 'config', 'ref_id' => $key]
+            );
+        }
+    }
+
     $app->audit()->log('config_save', [
         'target_type' => 'config', 'target_id' => $key,
         'operator_id' => $op['id'], 'operator_name' => $op['name'],
-        'detail' => ['value' => $val],
+        'detail' => ['value' => $val]
+                  + ($before === null ? [] : ['old' => $before])
+                  + ($willIssue === null ? [] : ['will_issue' => $willIssue]),
     ]);
     // 顺带把最新提醒带回去，前端不用为了刷新红条再请求一次
-    Api::ok(['key' => $key, 'value' => $val, 'warnings' => $warnings()]);
+    Api::ok(['key' => $key, 'value' => $val, 'warnings' => $warnings()]
+          + ($willIssue === null ? [] : ['will_issue' => $willIssue]));
 });
 
 // ════════════════════════════════════════════════════════════

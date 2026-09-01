@@ -51,14 +51,14 @@ final class ConfigSchema
                           'amount' => '按金额（累计消费满 X 元送 1 次）'],
         ],
         'reward_threshold_visits' => [
-            'group' => 'reward', 'type' => 'int', 'unit' => '次',
+            'group' => 'reward', 'type' => 'positive_int', 'unit' => '次',
             'label' => '几次送一次',
             'desc'  => '「按次数」口径下生效。填 10 就是十送一，填 8 就是八送一。'
                      . '改完之后历史进度会自动重算，不会重复发也不会漏发',
             'active_when' => ['key' => 'reward_mode', 'value' => 'visits'],
         ],
         'reward_threshold_amount' => [
-            'group' => 'reward', 'type' => 'decimal', 'unit' => '€',
+            'group' => 'reward', 'type' => 'positive_decimal', 'unit' => '€',
             'label' => '累计消费多少送一次',
             'desc'  => '「按金额」口径下生效',
             'active_when' => ['key' => 'reward_mode', 'value' => 'amount'],
@@ -232,6 +232,16 @@ final class ConfigSchema
                      . '★ 积分口径选「按次数」时门槛自动取本项与「计一次至少多少钱」'
                      . '两者的较大值 —— 那个口径下不论金额多少都按一次给分，'
                      . '0.01 欧元一笔和一顿正餐拿到的分是一样的',
+        ],
+        'manual_entry_daily_cap' => [
+            'group' => 'manual', 'type' => 'decimal', 'unit' => '€',
+            'label' => '单个员工每天最多能手工录入多少钱（累计）',
+            'desc'  => '★ 这一条管的是【累计】，与上面的单笔上限是两个维度。'
+                     . '原来的风控只数笔数：单日超过 N 笔才告警。'
+                     . '可「按金额」发券、门槛 100 时，连录 3 笔 200 就是 600 —— '
+                     . '当场造出 6 张免费餐券，笔数没超、一声不响。笔数管不住钱。'
+                     . '★ 超了经理也不能放行 —— 能放行的话它就不是上限，'
+                     . '而放行权本身就在最可能滥用的那个人手里。填 0 = 不设',
         ],
         'manual_entry_hard_limit' => [
             'group' => 'manual', 'type' => 'decimal', 'unit' => '€',
@@ -484,6 +494,24 @@ final class ConfigSchema
         return match ($meta['type']) {
             'bool'    => in_array($value, ['0', '1'], true) ? null : '只能是 0 或 1',
             'int'     => ctype_digit($value) ? null : '只能填非负整数',
+            /**
+             * ★ 门槛类的数【不能是 0】。
+             *
+             *   rule() 里是 max(1, ...) 静默兜住的，所以填 0 不会报错 ——
+             *   它会变成「每来 1 次就送 1 次」。而达标判定是自愈式的
+             *   （应发 = floor(进度 / 门槛)），于是保存的那一刻，
+             *   系统会按【全部历史进度】给每一位会员回溯补发：
+             *   一个来过 10 次的客人当场拿到 10 张免费餐券。
+             *   一个按键，几十顿饭，而且发出去的券收不回来。
+             *
+             *   实测：门槛填 0 → 一位 10 次的会员当场发出 10 张。
+             */
+            'positive_int' => (ctype_digit($value) && (int)$value >= 1) ? null
+                              : '必须是 1 或更大的整数。填 0 会变成「每来一次送一次」，'
+                              . '而且会按历史进度给所有会员回溯补发 —— 发出去的券收不回来',
+            'positive_decimal' => (preg_match('/^\d+(\.\d{1,2})?$/', $value) && (float)$value > 0) ? null
+                              : '必须大于 0，最多两位小数。填 0 会让每一笔消费都达标，'
+                              . '并按历史消费给所有会员回溯补发',
             // ★ 可正可负的整数。时钟偏差就是这一类 —— POS 比本机慢时它天然是负的，
             //   用 'int' 会变成「能改坏、改不回来」（负值填不进去）
             'int_signed' => preg_match('/^-?\d+$/', $value) ? null : '只能填整数（可以是负数）',
