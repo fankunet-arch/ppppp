@@ -115,6 +115,17 @@ final class ConfigSchema
             'desc'  => '消费 1 欧元得到多少积分',
             'active_when' => ['key' => 'points_mode', 'value' => 'by_amount'],
         ],
+        'min_amount_per_visit' => [
+            'group' => 'risk', 'type' => 'decimal', 'unit' => '€',
+            'label' => '计一次至少要分到多少钱',
+            'desc'  => '★ 一分钱不能换一次「十送一」的进度。'
+                     . '要计一次，那位客人分到的金额至少得有这么多；不够就整笔拒绝。'
+                     . '只管【要计次的那几笔】—— 只点一杯酒水的客人照常积分、本来也不计次。'
+                     . '★ 建议填到最便宜的那款计次套餐的一半左右（本店儿童套餐 14.90，'
+                     . '所以默认 5.00 是留了余量的）。填 0 = 不设门槛。'
+                     . '★ 不设的后果：一桌 71.70 三份套餐，让真正点套餐的人认领 71.69，'
+                     . '把剩下的 0.01 连着 1 份丢给同行没点套餐的人，那个人就白得一次进度',
+        ],
         'points_multiplier' => [
             'group' => 'points', 'type' => 'decimal', 'unit' => '倍',
             'label' => '积分倍率',
@@ -211,6 +222,17 @@ final class ConfigSchema
             'desc'  => '同一张卡当天记的几单，最早和最晚结账时间差得太远 —— '
                      . '这是「攒了一把小票一起来兑」的典型形状。同样只告警不拦。填 0 = 关闭',
         ],
+        'manual_entry_min' => [
+            'group' => 'manual', 'type' => 'decimal', 'unit' => '€',
+            'label' => '手工录入的最低金额',
+            'desc'  => '低于这个数的手工录入一律拒绝。'
+                     . '★ 防的是【员工这一侧】：手工录入不需要真实订单，'
+                     . '连着录很多笔极小金额就是一条零成本的刷分后门，'
+                     . '而日频告警只要控制在阈值以内就看不出来。'
+                     . '★ 积分口径选「按次数」时门槛自动取本项与「计一次至少多少钱」'
+                     . '两者的较大值 —— 那个口径下不论金额多少都按一次给分，'
+                     . '0.01 欧元一笔和一顿正餐拿到的分是一样的',
+        ],
         'manual_entry_hard_limit' => [
             'group' => 'manual', 'type' => 'decimal', 'unit' => '€',
             'label' => '手工录入的绝对上限（经理也不能超）',
@@ -251,7 +273,7 @@ final class ConfigSchema
                      . '编号见 POS 的菜品分组表（docs/01）',
         ],
         'redeem_line_patterns' => [
-            'group' => 'lookup', 'type' => 'text',
+            'group' => 'lookup', 'type' => 'redeem_patterns',
             'label' => '核销折扣行的名称',
             'desc'  => '收银员在 POS 上做十送一核销时打的那条折扣行叫什么名字，'
                      . '逗号分隔可填多个。系统靠它识别「这一单是在用券」。'
@@ -469,7 +491,43 @@ final class ConfigSchema
             'time'    => preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $value) ? null : '格式应为 HH:MM',
             'select'  => isset($meta['options'][$value]) ? null
                          : '只能是：' . implode(' / ', array_keys($meta['options'])),
+            'redeem_patterns' => self::checkRedeemPatterns($value),
             default   => null,
         };
+    }
+
+    /**
+     * 普通折扣的名字【绝不能】填进核销匹配串里。
+     *
+     * ── 🔴 填错一次，天天都在误伤 ──────────────────────
+     *
+     * is_redeemed 靠这份自由文本去匹配 POS 的负数折扣行名称。一旦把普通
+     * 折扣的名字填进来，所有只是用了满减券、平台折扣的普通客人都会被判成
+     * 「在用十送一的券」：这一单的计次全部剥夺，连金额积分也一并没收
+     * （free_meal_extra_earns 出厂是关的），而收银员在前台【没有任何补救手段】。
+     *
+     * 实测样本里 `CUPON DE 5 EUROS`（满 50 减 5 的纸质券）的出现频率是
+     * 真核销的 5 倍 —— 把它填进来，等于每五单里误伤一单。
+     *
+     * 只拦【已知的】那几个词，因为名称是会变的（Dto. -20% 在新样本里已经
+     * 换成了 Dto. -15%）。真正兜底的是 SyncService::checkIntegrity() 里那条
+     * 按比例的告警：核销占比异常高就报警，不依赖具体写了什么词。
+     */
+    private static function checkRedeemPatterns(string $value): ?string
+    {
+        // 子串匹配、忽略大小写 —— 与 PointsEngine 判折扣行时的口径一致
+        $banned = ['DTO', 'DESCUENTO', 'CUPON', 'CUPÓN', 'PROMO', 'OFERTA', 'REBAJA', '%'];
+        foreach (PointsEngine::redeemPatternsFrom($value) as $pat) {
+            $up = mb_strtoupper($pat);
+            foreach ($banned as $b) {
+                if (str_contains($up, $b)) {
+                    return "「{$pat}」看着是普通折扣（含「{$b}」），不能当核销标记。"
+                         . '填进来的话，所有用了满减/折扣的普通客人都会被判成「在用券」——'
+                         . '这一单的计次和积分会一并没收，而且前台无法补救。'
+                         . '这里只填【十送一核销专用】的那条折扣行名称（本店是 TARJETA 10+1）';
+                }
+            }
+        }
+        return null;
     }
 }

@@ -120,8 +120,8 @@ php bin/init.php migrate        # 增量迁移，已应用的不重跑
 php bin/init.php seed
 php bin/init.php repair         # 或分步：migrate + seed（含默认账号）
 
-php tests/run.php               # 纯逻辑，967 项断言，不需要数据库
-php tests/smoke.php --fresh     # 真本地库 + FakePos，561 项断言
+php tests/run.php               # 纯逻辑，982 项断言，不需要数据库
+php tests/smoke.php --fresh     # 真本地库 + FakePos，581 项断言
 php tests/e2e_pos.php           # 真 POS + 真本地库，95 项断言
 php bin/cron.php nightly -v     # 夜间全套跑在真实数据上
 ```

@@ -277,6 +277,43 @@ final class SyncService
             }
         }
 
+        /**
+         * ── 🔴 C. 核销识别是不是把普通折扣也算进去了 ──────────
+         *
+         * is_redeemed 靠 redeem_line_patterns 匹配 POS 的负数折扣行名称。
+         * 那是一份【后台可改的自由文本】，没有任何东西拦得住店家把
+         * 普通折扣的名字（Dto. / CUPON DE 5 EUROS 之类）填进去 ——
+         * 保存时 ConfigSchema 会拦一层，但拦的是已知词，名称是会变的。
+         *
+         * 一旦填错，所有用了普通折扣的客人都会被判成"在用券"：
+         * 计次全部剥夺，连金额积分也一并没收（free_meal_extra_earns 默认关），
+         * 而收银员在前台【没有任何补救手段】。
+         * 实测样本里 CUPON DE 5 EUROS 的出现频率是真核销的 5 倍 ——
+         * 填错一次，天天都在误伤。
+         *
+         * 所以按【比例】兜一层：十送一是稀有事件，正常占比在个位数百分比。
+         * 超过 30% 说明匹配串几乎肯定框进了普通折扣。
+         * 只读本地镜像，不打 POS。
+         */
+        $rdWindow = date('Y-m-d', strtotime('-' . max(1, $days) . ' days'));
+        $rd    = $this->orders->redeemShareSince($rdWindow);
+        $rdAll = $rd['total'];
+        $rdHit = $rd['redeemed'];
+        // 样本太小时不判 —— 三五单里有一单核销完全正常
+        if ($rdAll >= 50) {
+            $rdPct = (int)round($rdHit * 100 / $rdAll);
+            if ($rdPct >= 30) {
+                $findings[] = ['kind' => 'redeem_rate_high', 'pct' => $rdPct,
+                               'hit' => $rdHit, 'total' => $rdAll];
+                $this->alerts->raiseOnce('redeem_rate_high', 'config', 'redeem_line_patterns',
+                    sprintf('近 %d 天有 %d%%（%d/%d）的订单被判成「十送一核销」—— 这个比例不合常理，'
+                          . '多半是「核销折扣行的名称」里填进了普通折扣（如 Dto.、CUPON）。'
+                          . '这些客人的计次与积分都被没收了，请立刻核对后台该项配置',
+                        $days, $rdPct, $rdHit, $rdAll),
+                    ['severity' => 3, 'detail' => ['pct' => $rdPct, 'hit' => $rdHit, 'total' => $rdAll]]);
+            }
+        }
+
         return ['ok' => true, 'findings' => $findings];
     }
 }

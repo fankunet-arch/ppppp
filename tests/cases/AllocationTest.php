@@ -187,3 +187,63 @@ $r = PE::validateAllocations([
     ['member_id' => 7, 'amount_cents' => 2390, 'portions' => 1],
 ], $T, 0, $P, 0);
 T::true($r['ok'], '撤销回退后改记 AA 三人 → 通过');
+
+T::group('计次的最低金额门槛 —— 一分钱不能换一次「十送一」');
+
+/**
+ * ★ portions_without_amount 只堵住了 0 元，0.01 元照样过。
+ *
+ *   一桌四个人 71.70、三份套餐，实际只有一个人点了计次套餐。
+ *   点选菜品模式下让他认领 71.69 计 1 次，
+ *   再把剩下的 0.01 连着 1 份丢给同行没点套餐的人 ——
+ *   那个人就白得一次「十送一」的进度。实测确实通得过。
+ *
+ *   次数才是奖励的真正来源（十送一 = 一顿免费的饭），金额是死的、分完就没了，
+ *   所以真正要守的门槛在次数这一侧。
+ */
+$MIN = 500;    // 5.00 €，与 db/seeds 的出厂值一致
+
+$r = PE::validateAllocations([
+    ['member_id' => 1, 'amount_cents' => 7169, 'portions' => 1],
+    ['member_id' => 2, 'amount_cents' => 1,    'portions' => 1],   // 1 分钱换 1 次
+], $T, 0, $P, 0, $MIN);
+T::false($r['ok'], '★★★ 0.01 € 换 1 次 → 拒绝');
+T::eq('amount_too_small_for_visit', $r['error'], '  └ 错误码说清是「金额不够计一次」，不是含糊的守恒失败');
+
+$r = PE::validateAllocations([
+    ['member_id' => 1, 'amount_cents' => 7169, 'portions' => 1],
+    ['member_id' => 2, 'amount_cents' => 499,  'portions' => 1],
+], $T, 0, $P, 0, $MIN);
+T::false($r['ok'], '  └ 差一分钱也不行（4.99 < 5.00）—— 门槛不能是"大概"');
+
+$r = PE::validateAllocations([
+    ['member_id' => 1, 'amount_cents' => 6670, 'portions' => 1],
+    ['member_id' => 2, 'amount_cents' => 500,  'portions' => 1],
+], $T, 0, $P, 0, $MIN);
+T::true($r['ok'], '  └ 正好够门槛就放行');
+
+/**
+ * ★ 只管【要计次的那几笔】。
+ *   只点一杯酒水的客人该积分不该计次，那是正常生意，不能拦。
+ */
+$r = PE::validateAllocations([
+    ['member_id' => 1, 'amount_cents' => 7169, 'portions' => 3],
+    ['member_id' => 2, 'amount_cents' => 1,    'portions' => 0],   // 有钱没份
+], $T, 0, $P, 0, $MIN);
+T::true($r['ok'], '★★ 有钱【没份】的 0.01 € 照常通过 —— 绑定只有「份数 ⇒ 够金额」这一个方向');
+
+// 正常的四人 AA（71.70 / 4 ≈ 17.92）不受影响 —— 这一条是防止门槛误伤日常生意
+$r = PE::validateAllocations([
+    ['member_id' => 1, 'amount_cents' => 1793, 'portions' => 1],
+    ['member_id' => 2, 'amount_cents' => 1792, 'portions' => 1],
+    ['member_id' => 3, 'amount_cents' => 1792, 'portions' => 1],
+    ['member_id' => 4, 'amount_cents' => 1793, 'portions' => 0],
+], $T, 0, $P, 0, $MIN);
+T::true($r['ok'], '★★ 正常四人 AA 照常通过 —— 门槛不能挡住日常生意');
+
+// 填 0 = 不设门槛（旧行为，给不想用这条规则的门店留后路）
+$r = PE::validateAllocations([
+    ['member_id' => 1, 'amount_cents' => 7169, 'portions' => 1],
+    ['member_id' => 2, 'amount_cents' => 1,    'portions' => 1],
+], $T, 0, $P, 0, 0);
+T::true($r['ok'], '门槛填 0 时退回旧行为（只要求「有钱」）');

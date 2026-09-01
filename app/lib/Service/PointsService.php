@@ -633,7 +633,12 @@ final class PointsService
             }
 
             // ★ 金额守恒校验（纯函数，见 PointsEngine::validateAllocations 与其测试）
-            $v = PE::validateAllocations($allocations, $total, $allocated, $totalPort, $allocPort);
+            /**
+             * ★ 计次的最低金额门槛 —— 一分钱不能换一次「十送一」的进度。
+             *   门槛由后台配（不同门店套餐价差很大），填 0 就是不设。
+             */
+            $v = PE::validateAllocations($allocations, $total, $allocated, $totalPort, $allocPort,
+                Money::toCents($this->cfg->get('min_amount_per_visit', '0')));
             if (!$v['ok']) {
                 return [
                     'ok'     => false,
@@ -1486,6 +1491,30 @@ final class PointsService
         }
         if ($amountCents <= 0) {
             return ['ok' => false, 'error' => 'invalid_amount'];
+        }
+
+        /**
+         * ── 🔴 手工录入的【下限】—— 防的是员工这一侧 ──────────
+         *
+         * 手工录入不需要真实订单，金额是收银员自己填的。原来只校验了
+         * 「> 0」，于是连着录很多笔 0.01 欧元就是一条零成本的刷分后门：
+         * 日频告警只要控制在阈值以内，账面上完全看不出来。
+         *
+         * ★ 按次数积分（by_visit）口径下更严重：那时不论金额多少
+         *   都按【一次】给分（否则 POS 挂掉时降级路径永远 0 分，见下方说明），
+         *   也就是 0.01 欧元一笔和一顿正餐拿到的分一模一样。
+         *   实测：三笔 0.01 欧元 → 3 分。
+         *   所以这个口径下门槛取「手工录入下限」与「计一次至少多少钱」
+         *   两者的较大值 —— 它买到的东西和一次计次等价，门槛就该看齐。
+         */
+        $minManual = Money::toCents($this->cfg->get('manual_entry_min', '0'));
+        if ($this->cfg->get('points_mode', 'by_amount') === 'by_visit') {
+            $minManual = max($minManual, Money::toCents($this->cfg->get('min_amount_per_visit', '0')));
+        }
+        if ($minManual > 0 && $amountCents < $minManual) {
+            return ['ok' => false, 'error' => 'below_manual_min',
+                    'detail' => ['min' => Money::toStr($minManual),
+                                 'given' => Money::toStr($amountCents)]];
         }
         /**
          * 两道上限，管的事情不一样：
