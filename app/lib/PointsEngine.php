@@ -660,7 +660,14 @@ final class PointsEngine
         int $totalCents,
         int $allocatedCents,
         int $totalPortions,
-        int $allocatedPortions
+        int $allocatedPortions,
+        /**
+         * 一份计次至少要分到多少钱（分）。0 = 不设门槛（旧行为）。
+         *
+         * 见下方 amount_too_small_for_visit 处的说明。
+         * 作为参数而不是在这里读配置：本类是纯函数，好测也好在别处复用。
+         */
+        int $minPerVisitCents = 0
     ): array {
         $fail = static fn(string $e, int $a = 0, int $p = 0) =>
             ['ok' => false, 'error' => $e, 'sum_amount' => $a, 'sum_portions' => $p];
@@ -714,6 +721,33 @@ final class PointsEngine
              */
             if ($prt > 0 && $amt === 0) {
                 return $fail('portions_without_amount');
+            }
+
+            /**
+             * ★ 光有钱还不够，得有【像样的】钱 —— 一分钱不能换一次计次。
+             *
+             *   上面那条只堵住了 0 元。可 0.01 元照样过：
+             *   一桌四个人 71.70、三份套餐，实际只有一个人点了计次套餐。
+             *   点选菜品模式下让他认领 71.69 计 1 次，
+             *   再把剩下的 0.01 元连着 1 份丢给同行没点套餐的人 ——
+             *   那个人就白得一次「十送一」的进度。
+             *   实测确实通得过：0.01 元 → 计次 1。
+             *
+             *   次数才是奖励的真正来源（十送一 = 一顿免费的饭），
+             *   而金额是死的、分完就没了。所以真正要守的门槛在次数这一侧：
+             *   要计一次，分到的钱至少得够得上一份计次套餐的下限。
+             *
+             *   ★ 只管【要计次的那几笔】。有钱没份照常通过 ——
+             *     只点一杯酒水的客人该积分不该计次，那是正常生意。
+             *
+             *   ★ 门槛由后台配（min_amount_per_visit），填 0 就是不设 ——
+             *     不同门店的套餐价差很大，写死在代码里没法用。
+             */
+            if ($prt > 0 && $minPerVisitCents > 0 && $amt < $minPerVisitCents) {
+                return ['ok' => false, 'error' => 'amount_too_small_for_visit',
+                        'sum_amount' => 0, 'sum_portions' => 0,
+                        'detail' => ['min' => Money::toStr($minPerVisitCents),
+                                     'given' => Money::toStr($amt)]];
             }
 
             $sumAmount += $amt;

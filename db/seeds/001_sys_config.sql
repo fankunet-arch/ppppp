@@ -23,6 +23,9 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
 (@store,'points_per_visit','1.0',@now),
   -- 「按次数」口径下来一次积几分。填 1 就是「一次积一分」。
 (@store,'points_per_euro','1',@now),
+-- 计一次至少要分到多少钱。一分钱不能换一次「十送一」的进度（docs/03 §3.1quinquies）
+-- 5.00 是本店最便宜的计次套餐（儿童 14.90）的三分之一，留了余量；填 0 = 不设门槛
+(@store,'min_amount_per_visit','5.00',@now),
 (@store,'points_multiplier','1.0',@now),
   -- 1.0 = 不启用倍率
 (@store,'points_include_tax','1',@now),
@@ -124,6 +127,8 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 一天超过几次就告警（不拦，只记）。0 = 关闭。
 (@store,'alert_span_hours','6',@now),
   -- 当天记的几单结账时间跨度超过多少小时就告警。0 = 关闭。
+-- 手工录入的最低金额。防的是员工连着录很多笔极小金额刷分（docs/03 §10.3）
+(@store,'manual_entry_min','1.00',@now),
 (@store,'manual_entry_hard_limit','5000.00',@now),
   -- 手工录入的绝对上限，经理也不能超。拦的是手滑多打几个零。0 = 不设。
 (@store,'alert_invoice_miss','12',@now),

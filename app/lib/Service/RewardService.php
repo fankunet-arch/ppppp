@@ -582,17 +582,44 @@ final class RewardService
         }
 
         /**
+         * ── 🔴 只收【新进度已经不再支撑】的那几张，不能"抓一张顶数" ──
+         *
+         * 每张券上都定格着发它时的进度（progress_at_grant，见 issue()）。
+         * 退完之后进度变成 P，那么「发于进度 > P」的那些券就是这次
+         * 撤销带出来的；发于进度 ≤ P 的是客人早就挣到的，不能动。
+         *
+         * ★ 原来这里是 `ORDER BY id DESC` 拿最新的几张 —— 看着差不多，
+         *   实际会挑错人。实测：客人在进度 3 时挣到 C1（还拿在手上），
+         *   记错账把他推到进度 6 发出 C2，客人把 C2 吃掉了；
+         *   撤销时 C2 已是"已核销"选不中，于是【C1 被作废】——
+         *   客人手里那张合法的券凭空消失。
+         *   总张数最后会自愈（挣几张给几张），但客人当场看到的是
+         *   "我的券没了"，而且没有任何人能解释清楚。
+         *
+         * ★ 更糟的是那时【告警不会响】：因为找到了一张可作废的券，
+         *   unrecoverable 是 0，于是"白送了一顿饭"这件事没人知道。
+         *   按进度定位之后，C2 已核销 → unrecoverable=1 → 告警照响。
+         *
          * 只收【靠消费挣来的】券，后台手工发的那些不动 ——
          * 那是补偿、投诉处理发出去的，与计次进度无关
          * （grantManual 本来也不加 rewards_issued，见 §5.2）。
-         * 新发的先收：越靠后的那张越可能就是这次撤销带出来的。
          */
-        $cands = $this->db->all(
-            'SELECT id, code FROM coupon
-              WHERE store_code = ? AND member_id = ? AND status = ? AND source IN (?, ?)
-              ORDER BY id DESC LIMIT ' . max(1, min($over, 50)),
-            [$this->storeCode, $memberId, self::ST_ACTIVE, self::SRC_VISITS, self::SRC_AMOUNT]
+        $stale = $this->db->all(
+            'SELECT id, code, status FROM coupon
+              WHERE store_code = ? AND member_id = ? AND source IN (?, ?)
+                AND progress_at_grant > ?
+              ORDER BY progress_at_grant DESC, id DESC LIMIT 50',
+            [$this->storeCode, $memberId, self::SRC_VISITS, self::SRC_AMOUNT, (int)$p['progress']]
         );
+
+        /**
+         * 已经核销掉的排在后面不动 —— 那顿饭吃掉了，收不回来。
+         * 它们仍然占着 rewards_issued（客人确实拿到了那份奖励），
+         * 由调用方按 unrecoverable 去挂告警。
+         */
+        $cands = array_values(array_filter(
+            $stale, static fn(array $c): bool => (int)$c['status'] === self::ST_ACTIVE));
+        $cands = array_slice($cands, 0, $over);
 
         $codes = [];
         foreach ($cands as $c) {
@@ -621,6 +648,8 @@ final class RewardService
         }
 
         return ['voided' => count($codes), 'unrecoverable' => $over - count($codes), 'codes' => $codes];
+        // unrecoverable > 0 ＝ 有券【发于已被退掉的那段进度】却已经吃掉了：
+        // 白送了一顿饭，rewards_issued 也就不减（客人确实拿到了那份奖励）
     }
 
     /** 后台统计 */

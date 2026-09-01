@@ -90,6 +90,9 @@ final class Api
         'exceeds_manual_limit'   => '超过手工录入单笔限额，需经理授权',
         'exceeds_manual_hard_limit' => '超过手工录入的绝对上限，经理也不能放行 —— 请核对金额是不是多打了零',
         'invalid_amount'         => '金额不合法',
+        // 一分钱不能换一次「十送一」的进度 —— 门槛在后台「防刷与风控」里
+        'amount_too_small_for_visit' => '要计一次，这位客人分到的金额太少了。请核对是谁点的计次套餐',
+        'below_manual_min'       => '手工录入的金额低于下限，不能记账',
         'db_unavailable'         => '本地数据库暂时不可用，请联系管理员',
         // ★ 死锁不是故障，别把人指去找管理员 —— 再点一次就好
         'db_busy'                => '系统正忙了一下，这一单没有记进去。请再点一次「提交」（不用找管理员）',
@@ -182,6 +185,8 @@ final class Api
         'exceeds_manual_limit'   => 'Supera el límite por entrada manual, hace falta un encargado',
         'exceeds_manual_hard_limit' => 'Supera el límite absoluto de entrada manual; ni el encargado puede autorizarlo. Compruebe si sobran ceros',
         'invalid_amount'         => 'Importe no válido',
+        'amount_too_small_for_visit' => 'El importe asignado es demasiado bajo para contar una visita. Compruebe quién pidió el menú',
+        'below_manual_min'       => 'El importe de la entrada manual está por debajo del mínimo',
         'db_unavailable'         => 'La base de datos local no responde, avise al administrador',
         'db_busy'                => 'El sistema se ha saturado un momento y este apunte no se ha guardado. Pulse «Enviar» otra vez (no hace falta avisar a nadie)',
 

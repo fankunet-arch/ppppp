@@ -225,4 +225,26 @@ final class OrderRepo
             [$this->storeCode, $date]
         );
     }
+
+    /**
+     * 近期有多少单被判成「十送一核销」。
+     *
+     * 给 SyncService::checkIntegrity() 用：核销识别靠一份后台可改的
+     * 自由文本（redeem_line_patterns）匹配 POS 折扣行名称，填错一次
+     * 就会把所有用普通折扣的客人判成"在用券"，计次与积分一并没收。
+     * 十送一是稀有事件，占比异常高就是配置出了问题。
+     *
+     * 一次查询两个数，避免扫两遍。只读本地镜像，不打 POS。
+     *
+     * @return array{total:int, redeemed:int}
+     */
+    public function redeemShareSince(string $businessDate): array
+    {
+        $r = $this->db->one(
+            'SELECT COUNT(*) AS total, SUM(is_redeemed = 1) AS redeemed
+               FROM pos_order WHERE store_code = ? AND business_date >= ?',
+            [$this->storeCode, $businessDate]
+        );
+        return ['total' => (int)($r['total'] ?? 0), 'redeemed' => (int)($r['redeemed'] ?? 0)];
+    }
 }
