@@ -176,6 +176,59 @@ final class OrderRepo
         );
     }
 
+    /**
+     * App 自己核销了一张券在这一单上 —— 把这个【确知的事实】写回镜像。
+     *
+     * ── 🔴 为什么必须有这一步 ─────────────────────────────
+     *
+     * 「这一餐是不是用券吃的」原来【唯一】的判据是拿 redeem_line_patterns
+     * 去匹配 POS 折扣行的名称。那是一份后台可改的自由文本，而名称是会变的
+     * （实测 `Dto. -20%` 已经换成 `-15%`）。匹配串一旦对不上：
+     *
+     *   免费餐那一单 is_redeemed = 0 → 服务员照常记账 → 【又攒一次】
+     *   于是免费餐自己在为下一顿免费餐攒进度：
+     *   门槛 10 时变成「9 顿付费就送 1 顿」，发放量约多 11%，
+     *   而且这不是一次性事故，是【每一位常客、每个兑换周期都在漏】。
+     *   账面上完全看不出异常 —— 计次是真的、订单是真的、金额是真的。
+     *
+     * 而 App 自己一直知道答案：redeem() 里存了 redeemed_serial_id。
+     * 只是从来没拿出来用过。这一步把它用上，
+     * 让匹配串从「唯一判据」降级成「补充判据」
+     * （客人先吃后核销、或核销时没填单号的场景仍然靠它）。
+     *
+     * ── 为什么份数只在 is_redeemed 原本为 0 时才扣 ────────
+     *
+     * 原本就是 1，说明匹配串已经认出来了、份数也已经扣过 —— 再扣就是扣两次。
+     * ★ MySQL 的 UPDATE 赋值是【从左到右】求值的，后面的表达式看得到
+     *   前面已改的值。所以 portions_counted 必须排在 is_redeemed 前面，
+     *   它才读得到【旧的】is_redeemed。（与 applyAllocation 那个坑同源。）
+     *
+     * ⚠️ 一单上核销两张券、而匹配串两张都没认出、且中间没有重新 locate 时，
+     *    这里只扣得掉一份。那时会少扣一份 —— 与修之前的行为一样，不是新增退化；
+     *    重新 locate 时 buildContext 会按券的【张数】一次性对齐。
+     */
+    public function markRedeemedByApp(string $serialId): void
+    {
+        $this->db->exec(
+            'UPDATE pos_order
+                SET portions_counted = GREATEST(0, portions_counted - IF(is_redeemed = 1, 0, 1)),
+                    is_redeemed      = 1,
+                    updated_at       = ?
+              WHERE store_code = ? AND serial_id = ?',
+            [$this->db->now(), $this->storeCode, $serialId]
+        );
+    }
+
+    /** 这一单上，App 自己核销掉了几张券（地面真值，与 POS 折扣行名称无关） */
+    public function appRedeemedCount(string $serialId): int
+    {
+        return (int)$this->db->value(
+            'SELECT COUNT(*) FROM coupon
+              WHERE store_code = ? AND redeemed_serial_id = ? AND status = 2',
+            [$this->storeCode, $serialId]
+        );
+    }
+
     public function markFreeMeal(string $serialId, bool $isFree): void
     {
         $this->db->exec(
@@ -224,6 +277,38 @@ final class OrderRepo
             'SELECT COUNT(*) FROM pos_order WHERE store_code = ? AND business_date = ?',
             [$this->storeCode, $date]
         );
+    }
+
+    /**
+     * 近期【App 自己核销掉的券】里，有多少张所在的订单没被标成核销。
+     *
+     * ★ 守的是与 redeemShareSince 相反的方向。
+     *   那一条防「匹配串太宽」（把普通折扣也算成核销 → 误伤客人）；
+     *   这一条防「匹配串太窄或失配」（一张都认不出 → 免费餐又攒一次 → 餐厅赔钱）。
+     *   同一份自由文本，两个方向的失效 —— 原来只堵了不花钱的那一边。
+     *
+     *   两份数据都在本地库里，不用打 POS。
+     */
+    public function redeemedButUnflagged(string $since): array
+    {
+        /**
+         * ★ 用 INNER JOIN：订单【不在镜像里】不算漏。
+         *   没有订单行就不可能有人在它上面记账，也就不会「又攒一次」。
+         *   （核销时填了一个本地没有的单号，是另一回事，不该混进这条告警里
+         *   —— 混进来只会让它天天叫，然后没人再看。）
+         */
+        $r = $this->db->one(
+            'SELECT COUNT(*) AS total,
+                    SUM(CASE WHEN o.is_redeemed = 1 THEN 0 ELSE 1 END) AS unflagged
+               FROM coupon c
+               JOIN pos_order o
+                 ON o.store_code = c.store_code AND o.serial_id = c.redeemed_serial_id
+              WHERE c.store_code = ? AND c.status = 2
+                AND c.redeemed_serial_id IS NOT NULL
+                AND c.redeemed_at >= ?',
+            [$this->storeCode, $since]
+        );
+        return ['total' => (int)($r['total'] ?? 0), 'unflagged' => (int)($r['unflagged'] ?? 0)];
     }
 
     /**

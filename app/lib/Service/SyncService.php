@@ -314,6 +314,35 @@ final class SyncService
             }
         }
 
+        /**
+         * ── 🔴 D. 反方向：App 核销了券，订单却没被标成核销 ──────
+         *
+         * C 那一条防的是「匹配串太宽」—— 把普通折扣也算成核销，后果是误伤客人。
+         * 这一条防的是**相反的方向**：匹配串太窄或失配，一张都认不出来。
+         *
+         * 后果是餐厅赔钱，而且是【持续渗漏】不是一次性事故：
+         * 用券吃的那一餐没被标记 → 服务员照常记账 → 又攒一次 →
+         * 免费餐自己在为下一顿免费餐攒进度。门槛 10 时变成
+         * 「9 顿付费送 1 顿」，发放量多约 11%，门槛越低比例越大。
+         * 账面上完全看不出异常：计次是真的、订单是真的、金额是真的。
+         *
+         * ★ redeem() 现在会把这件事写回订单，所以正常路径下这个数应当是 0。
+         *   还能出现的只有两种：核销时没带单号（客人先吃、事后补核销），
+         *   或者历史数据。任何一条都值得人看一眼。
+         */
+        $rbSince = date('Y-m-d H:i:s', strtotime('-' . max(1, $days) . ' days'));
+        $rb = $this->orders->redeemedButUnflagged($rbSince);
+        if ($rb['unflagged'] > 0) {
+            $findings[] = ['kind' => 'redeem_unflagged',
+                           'unflagged' => $rb['unflagged'], 'total' => $rb['total']];
+            $this->alerts->raiseOnce('redeem_unflagged', 'config', 'redeem_line_patterns',
+                sprintf('近 %d 天核销了 %d 张免费餐券，其中 %d 张所在的订单【没有被标成核销】—— '
+                      . '那几单会被当成正常消费又攒一次，等于免费餐自己在攒下一顿免费餐。'
+                      . '请核对后台「核销折扣行的名称」是不是与 POS 上的实际叫法对不上',
+                    $days, $rb['total'], $rb['unflagged']),
+                ['severity' => 3, 'detail' => $rb]);
+        }
+
         return ['ok' => true, 'findings' => $findings];
     }
 }
