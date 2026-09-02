@@ -495,6 +495,67 @@ ok(str_contains((string)($j['detail']['hint'] ?? ''), '自动维护'),
     ['key' => 'totally_made_up_key', 'value' => '1'], $cpJar);
 ok(($j['ok'] ?? true) === false, '  └ 没登记过的键也拒（sys_config 不该长出没人认识的行）');
 
+// ── 7f. 改奖励门槛这条路必须真的能走通 ─────────────────
+group('⑬ 改奖励规则不能把后台打挂，也不能静默送钱');
+
+/**
+ * 🔴 这一组存在的理由，是我自己踩过的一次：
+ *
+ *   给 /config/save 加「调低门槛要算出补发张数」的护栏时，写了
+ *   `$app->cfg()->get($key, null)` —— 而 ConfigRepo::get 的第二个参数
+ *   是 string，不可为 null。于是【每一次保存配置都 500】。
+ *
+ *   服务层的探针跑得好好的，因为它没走路由。一走 HTTP 就炸。
+ *   所以这条路必须有 HTTP 层的断言：能不能保存、回不回 will_issue，
+ *   都得真的打一遍接口才算数。
+ */
+$thrOld = null;
+[$st, $raw, $j] = req($BASE . '/cp/api.php/config', 'GET', null, $cpJar);
+foreach (($j['data']['groups'] ?? []) as $grp) {
+    foreach (($grp['items'] ?? []) as $it) {
+        if (($it['key'] ?? '') === 'reward_threshold_visits') { $thrOld = (string)($it['value'] ?? ''); }
+    }
+}
+ok($thrOld !== null && $thrOld !== '', "读到当前门槛：" . (string)$thrOld, brief($st, $raw, $j));
+
+/**
+ * ★ 只【调高】一格再改回来。
+ *   调高不会产生补发，所以这一组不会在测试库里凭空发出券；
+ *   而「保存得了、不 500」才是这一组真正要守的东西。
+ */
+if ($thrOld !== null && $thrOld !== '' && ctype_digit($thrOld)) {
+    $thrUp = (string)((int)$thrOld + 1);
+    [$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
+        ['key' => 'reward_threshold_visits', 'value' => $thrUp], $cpJar);
+    ok(($j['ok'] ?? false) === true,
+       '★★★ 保存奖励门槛不会 500（护栏本身不能把后台打挂）', brief($st, $raw, $j));
+    ok(!array_key_exists('will_issue', $j['data'] ?? []),
+       '  └ 调【高】门槛不会补发，所以不带 will_issue');
+} else {
+    ok(false, '拿不到当前门槛，下面两条跳过');
+}
+
+// 换口径也要保存得了 —— 这条路旧护栏完全看不见
+[$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
+    ['key' => 'reward_mode', 'value' => 'amount'], $cpJar);
+ok(($j['ok'] ?? false) === true, '★★ 换积分口径也保存得了', brief($st, $raw, $j));
+[$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
+    ['key' => 'reward_mode', 'value' => 'visits'], $cpJar);
+ok(($j['ok'] ?? false) === true, '  └ 换回来同样', brief($st, $raw, $j));
+
+// 门槛填 0 要被拦（一个按键回溯补发的那条）
+[$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
+    ['key' => 'reward_threshold_visits', 'value' => '0'], $cpJar);
+ok(($j['ok'] ?? true) === false, '★★ 门槛填 0 被拒', brief($st, $raw, $j));
+ok(str_contains((string)($j['detail']['hint'] ?? ''), '收不回来'),
+   '  └ 并且说清后果：' . mb_substr((string)($j['detail']['hint'] ?? '-'), 0, 30) . '…');
+
+// 还原（拿不到原值时不动它 —— 宁可不还原，也不能写一个空值进去）
+if ($thrOld !== null && $thrOld !== '' && ctype_digit($thrOld)) {
+    req($BASE . '/cp/api.php/config/save', 'POST',
+        ['key' => 'reward_threshold_visits', 'value' => $thrOld], $cpJar);
+}
+
 // ── 8. 清理 ──────────────────────────────────────────────
 foreach ([$padJar, $cpJar, $clerkJar, $clerkPad] as $f) { @unlink($f); }
 

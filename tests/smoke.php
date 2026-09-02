@@ -3932,6 +3932,121 @@ $tlDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id=?", [SMOK
 $tlDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id=?", [SMOKE_STORE, $tlM]);
 $tlDb->exec("DELETE FROM member       WHERE store_code=? AND id=?",        [SMOKE_STORE, $tlM]);
 
+step('㊸ 手工录入的日上限：撤销不能把额度放大，切点要按营业日');
+
+/**
+ * ★ 两个都是真金白银的洞，都在上一轮我自己加的那道「日累计上限」里。
+ *
+ *   ① 撤销把额度算成【负的】。
+ *      撤销会插一条 entry_type=T_REVERSE 的负数流水，而它的 source
+ *      是从原流水复制来的（同样是 MANUAL）、状态也是有效。
+ *      统计已用额度时没按 entry_type 过滤 → 录 300 到顶、撤销之后
+ *      已用额度变成 -300 → 又能再录 600。额度不是还回来，是【翻倍】。
+ *      实测一个班次因此录进 € 600，而上限写的是 € 300。
+ *
+ *   ② 起点用的是日历零点，而这套系统的营业日切点是 02:00。
+ *      晚市 19:30 做到凌晨 02:00 —— 一个班次跨零点，
+ *      零点一过额度就在班次中间被清零重来。
+ */
+$dcApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$dcDb  = $dcApp->localDb();
+foreach (['manual_entry_enabled' => '1', 'manual_entry_limit' => '500.00',
+          'manual_entry_min' => '1.00', 'manual_entry_daily_cap' => '300.00',
+          'points_mode' => 'by_amount', 'points_per_euro' => '1.0',
+          'reward_enabled' => '0'] as $k => $v) { $dcApp->cfg()->set($k, $v); }
+$dcOp  = ['id' => 93, 'name' => '冒烟收银', 'device' => 'SMOKE', 'role' => 1, 'is_manager' => false];
+$dcMgr = ['id' => 93, 'name' => '冒烟收银', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$dcM   = (int)$dcApp->members()->create('TK-00047001-DCA', null, null, null)['id'];
+$dcStart = fn(): string => $dcApp->businessDay()->range(
+    $dcApp->businessDay()->of(date('Y-m-d H:i:s')))[0];
+$dcUsed  = fn(): int => $dcApp->ledger()->manualAmountSince(93, $dcStart());
+
+$dcR1 = $dcApp->points()->manualGrant($dcM, 30000, 'network_error', $dcOp);
+ok($dcR1['ok'] ?? false, '录 300.00 成功（正好到上限）');
+eq(30000, $dcUsed(), '  └ 已用额度 300.00');
+eq('exceeds_manual_daily_cap',
+   (string)($dcApp->points()->manualGrant($dcM, 10000, 'network_error', $dcOp)['error'] ?? ''),
+   '  └ 再录 100.00 被拒');
+
+$dcApp->points()->reverse((int)$dcR1['ledger_id'], '录错了', $dcMgr);
+eq(0, $dcUsed(),
+   '★★★ 撤销之后已用额度回到 0 —— 原来会变成【-300】，等于额度翻倍');
+$dcN = 0;
+for ($i = 0; $i < 5; $i++) {
+    if ($dcApp->points()->manualGrant($dcM, 30000, 'network_error', $dcOp)['ok'] ?? false) { $dcN++; }
+}
+eq(1, $dcN, '★★ 撤销后只还回【那一笔】的额度，不是白给一轮');
+
+/**
+ * ★ 切点必须是营业日的起点，不是日历零点。
+ *   直接钉住「用的是哪个起点」——
+ *   在 00:00–02:00 之外跑时两者恰好相同，只断言数值就测不出来。
+ */
+$dcBiz = $dcStart();
+$dcCut = $dcApp->cfg()->get('business_day_cutoff', '02:00');
+ok(str_ends_with($dcBiz, $dcCut . ':00'),
+   "★★★ 日上限的起点是【营业日起点】{$dcBiz}（切点 {$dcCut}），不是日历零点 —— "
+   . '晚市 19:30 做到凌晨 02:00，一个班次跨零点，按日历切等于在班中把额度清零');
+ok(!str_ends_with($dcBiz, ' 00:00:00') || $dcCut === '00:00',
+   '  └ 除非店家真的把切点设成 00:00，否则起点不会是日历零点');
+
+$dcDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id=?", [SMOKE_STORE, $dcM]);
+$dcDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id=?", [SMOKE_STORE, $dcM]);
+$dcDb->exec("DELETE FROM member       WHERE store_code=? AND id=?",        [SMOKE_STORE, $dcM]);
+
+step('㊹ 回溯补发的护栏要看得见等级，也要罩住每一条路');
+
+/**
+ * ★ 上一轮的护栏钉在两个键上（reward_threshold_visits / _amount 的数值变小），
+ *   而让「应发张数」变多的路远不止那两条：
+ *     · 把口径从「按次数」切到「按金额」—— 另一个门槛早就填在那儿了
+ *     · reward_enabled 从关到开
+ *     · /tiers/save 改等级门槛（那才是真正决定发几张的数）
+ *   实测换口径那条：待补发从 0 跳到 37 张，界面上什么都没有、告警一条没有。
+ *
+ * ★ 而且 pendingAcrossMembers() 原来用 rule(null)（全局门槛），
+ *   看不见等级 —— 挂了低门槛金卡的会员，实际欠 12 张，它算出来是 0。
+ *   护栏拿着一个偏小的数在报警，经理照着它做决定。
+ */
+$tgApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$tgDb  = $tgApp->localDb();
+$tgThrV0 = $tgApp->cfg()->get('reward_threshold_visits', '10');
+$tgMode0 = $tgApp->cfg()->get('reward_mode', 'visits');
+foreach (['reward_enabled' => '1', 'reward_mode' => 'visits',
+          'reward_threshold_visits' => '10'] as $k => $v) { $tgApp->cfg()->set($k, $v); }
+
+$tgM = (int)$tgApp->members()->create('TK-00047002-TGA', null, null, null)['id'];
+$tgDb->exec('UPDATE member SET visit_count = 25, rewards_issued = 2 WHERE store_code=? AND id=?',
+    [SMOKE_STORE, $tgM]);
+$tgApp->cardTiers()->save('smokegold2', '冒烟金卡', 'Oro', 1.0, 9, true, 2, null, null);
+$tgDb->exec("INSERT INTO card (store_code, card_no, serial, batch_no, tier_code, status,
+                               pin_hash, member_id, created_at, updated_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?)",
+    [SMOKE_STORE, 'TK00047002TGA', 470020, 'TG', 'smokegold2', 2, 'x', $tgM,
+     $tgDb->now(), $tgDb->now()]);
+
+$tgReal = $tgApp->rewards()->progressOf(
+    $tgApp->members()->findById($tgM), $tgApp->cardTiers()->forMember($tgM));
+$tgProj = $tgApp->rewards()->pendingAcrossMembers();
+ok($tgProj >= (int)$tgReal['pending'],
+   "★★★ 护栏算出的待补发（{$tgProj} 张）覆盖得住这位金卡会员真实欠的 {$tgReal['pending']} 张 —— "
+   . '原来用全局门槛算，这里是 0，等于看不见分级会员');
+
+$tgBefore = $tgApp->rewards()->pendingAcrossMembers();
+$tgApp->cfg()->set('reward_mode', 'amount');
+$tgAfter = $tgApp->rewards()->pendingAcrossMembers();
+ok($tgAfter !== $tgBefore,
+   "★★ 换口径（按次数 → 按金额）会让待补发变化（{$tgBefore} → {$tgAfter}）—— "
+   . '护栏改成前后各量一次，这条路才罩得住；按键判永远漏');
+$tgApp->cfg()->set('reward_mode', (string)$tgMode0);
+$tgApp->cfg()->set('reward_threshold_visits', (string)$tgThrV0);
+
+$tgDb->exec("DELETE FROM card         WHERE store_code=? AND member_id=?", [SMOKE_STORE, $tgM]);
+$tgDb->exec("DELETE FROM card_tier    WHERE store_code=? AND code='smokegold2'", [SMOKE_STORE]);
+$tgDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id=?", [SMOKE_STORE, $tgM]);
+$tgDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id=?", [SMOKE_STORE, $tgM]);
+$tgDb->exec("DELETE FROM member       WHERE store_code=? AND id=?",        [SMOKE_STORE, $tgM]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(
@@ -3986,6 +4101,37 @@ $visitBad = $db->all(
      HAVING m.visit_count <> COALESCE(SUM(l.counted_visit),0)",
     [SMOKE_STORE]);
 eq([], $visitBad, '★ 每名会员的计次与其流水 counted_visit 合计一致');
+
+/**
+ * ★★★ 钱的总不变量：没有人手里的券比他挣到的多。
+ *
+ *   前面那些断言是「一个场景一条」，漏的永远是没想到的那个组合。
+ *   这一条不看过程，只看结果：跑完全部场景之后，
+ *   【每一位会员】已发券数都不能超过他自己那档门槛算出来的应发数。
+ *
+ *   只要有任何一条路能凭空造券（改门槛、换口径、手工录入刷金额、
+ *   撤销/冲正没收回、并发多发……），不管是不是有人想到过，
+ *   这一条都会红。
+ *
+ *   ★ 按【每位会员自己的等级门槛】算 —— 金卡门槛更低，
+ *     用全局门槛去比会漏掉分级会员那一半。
+ */
+$overIssued = [];
+foreach ($db->all('SELECT id, card_no, visit_count, total_spent, rewards_issued
+                     FROM member WHERE store_code = ?', [SMOKE_STORE]) as $mRow) {
+    $mp = $app->rewards()->progressOf($mRow, $app->cardTiers()->forMember((int)$mRow['id']));
+    if ((int)$mp['issued'] > (int)$mp['earned']) {
+        $overIssued[] = [
+            'card'   => $mRow['card_no'],
+            'issued' => (int)$mp['issued'],
+            'earned' => (int)$mp['earned'],
+            'mode'   => $mp['mode'],
+        ];
+    }
+}
+eq([], $overIssued,
+   '★★★ 没有任何会员的【已发券数】超过他自己那档门槛算出来的应发数 —— '
+   . '这一条不看过程只看结果，任何一条凭空造券的路都会让它变红');
 
 $negBad = $db->all(
     'SELECT card_no, points_balance, visit_count FROM member

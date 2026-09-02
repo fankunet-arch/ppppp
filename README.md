@@ -51,10 +51,10 @@ php bin/why.php --ref E202-7F3A21    # 按界面上的错误代码翻日志拿�
 ## 测试
 
 ```bash
-php tests/run.php                 # 986 项，不需要数据库
-php tests/smoke.php --fresh       # 598 项，需要一个【专用空库】
+php tests/run.php                 # 988 项，不需要数据库
+php tests/smoke.php --fresh       # 608 项，需要一个【专用空库】
 php tests/e2e_pos.php             # 95 项，需要 POS 可达
-php tests/http_sweep.php          # 82 项，对着跑起来的站点打全部接口
+php tests/http_sweep.php          # 89 项，对着跑起来的站点打全部接口
 node tests/browser/*.mjs          # 552 项，真浏览器，仅开发机
 ```
 

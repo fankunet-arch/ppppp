@@ -60,6 +60,43 @@ $warnings = static function () use ($app): array {
     );
 };
 
+/**
+ * 奖励护栏 —— 任何一次可能让「应发券张数」变多的改动，都要留下痕迹。
+ *
+ * ── 为什么不按「改了哪个键」判 ──────────────────────
+ *
+ * 达标判定是自愈式的（应发 = floor(进度 / 门槛) − 已发），所以只要
+ * 应发张数变大，系统就会按【全部历史进度】给每一位会员回溯补发 ——
+ * 而发出去的券收不回来。让它变大的路不止调低门槛那一条：
+ * 换口径、开总开关、改等级门槛，每一条都算。
+ *
+ * 按键判就永远漏；按【结果】判才罩得住，以后加新维度也不用回来改。
+ *
+ * ★ 不拦 —— 店家有权做促销。但要做到两件事：
+ *   ① 把「这一下会补发多少张」算出来回给界面；
+ *   ② 无论界面显不显示，都写一条告警 + 审计，事后对账要找得到。
+ *
+ * @param callable $apply 真正落库的那一步，在它前后各量一次
+ * @return int|null 新增的待补发张数；没有变多就是 null
+ */
+$guardRewardRun = static function (array $op, string $what, string $desc, callable $apply) use ($app): ?int {
+    $before = $app->rewards()->pendingAcrossMembers();
+    $apply();
+    $after  = $app->rewards()->pendingAcrossMembers();
+    if ($after <= $before) {
+        return null;
+    }
+    $delta = $after - $before;
+    $app->alerts()->raise(
+        'reward_backfill_risk',
+        sprintf('%s，全店待补发的免费餐券由 %d 张增加到 %d 张（+%d）—— '
+              . '这些券会在客人下次消费时当场发出，而发出去的券收不回来。操作人：%s（%s）',
+            $desc, $before, $after, $delta, (string)($op['name'] ?? $op['id']), $what),
+        ['severity' => 3, 'ref_type' => 'config', 'ref_id' => $what]
+    );
+    return $delta;
+};
+
 /** 有没有配齐可用的发送渠道。前端据此决定开启实名前要不要先拦一下 */
 $smsReady = static function () use ($app): bool {
     return (bool)$app->messaging()->readyChannels();
@@ -344,7 +381,7 @@ $api->on('GET', '/config', static function () use ($app, $requireManager): void 
     ]);
 });
 
-$api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $warnings): void {
+$api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $warnings, $guardRewardRun): void {
     $op  = $requireAdmin();
     $b   = Api::body();
     $key = Api::str($b, 'key', '') ?: '';
@@ -400,30 +437,34 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $w
      *   ① 把「这一下会补发多少张」算出来回给界面；
      *   ② 无论界面显不显示，都在告警里留一条 —— 事后对账要找得到。
      */
-    $thrKeys = ['reward_threshold_visits', 'reward_threshold_amount'];
-    $before  = in_array($key, $thrKeys, true) ? (float)$app->cfg()->get($key, '0') : null;
+    // ★ 第二个参数是 string，不能传 null（ConfigRepo::get 的签名）
+    $old = $app->cfg()->get($key, '');
 
-    $app->cfg()->set($key, $val);
-
-    $willIssue = null;
-    if ($before !== null && (float)$val > 0 && (float)$val < $before) {
-        $willIssue = $app->rewards()->pendingAcrossMembers();
-        if ($willIssue > 0) {
-            $app->alerts()->raise(
-                'reward_threshold_lowered',
-                sprintf('奖励门槛由 %s 调低到 %s，全店将回溯补发约 %d 张免费餐券 —— '
-                      . '发出去的券收不回来。操作人：%s',
-                    (string)$before, $val, $willIssue, (string)($op['name'] ?? $op['id'])),
-                ['severity' => 3, 'ref_type' => 'config', 'ref_id' => $key]
-            );
-        }
-    }
+    /**
+     * ── 🔴 护栏钉在「结果」上，不钉在「哪几个键」上 ──────────
+     *
+     * 原来这里只认 reward_threshold_visits / reward_threshold_amount
+     * 两个键的数值变小。可让「应发张数」变多的路远不止这两条：
+     *
+     *   · 把口径从「按次数」切到「按金额」—— 另一个门槛早就填在那儿了，
+     *     两个格子本来就在同一页上。实测：待补发从 0 张跳到 37 张，
+     *     界面上什么都没有，告警一条都没有。那位常客下次来吃一顿普通的饭，
+     *     当场发出 23 张免费餐券。
+     *   · reward_enabled 从关到开
+     *   · /tiers/save 改等级门槛（那才是真正决定发几张的数）
+     *
+     * 所以改成：保存前后各算一遍待补发张数，【变多就报警】。
+     * 这样以后再加任何新维度都自动被罩住，不用回来改这里。
+     */
+    $willIssue = $guardRewardRun($op, 'config:' . $key,
+        sprintf('配置 %s 由 %s 改为 %s', $key, $old === '' ? '(空)' : $old, $val),
+        static fn() => $app->cfg()->set($key, $val));
 
     $app->audit()->log('config_save', [
         'target_type' => 'config', 'target_id' => $key,
         'operator_id' => $op['id'], 'operator_name' => $op['name'],
         'detail' => ['value' => $val]
-                  + ($before === null ? [] : ['old' => $before])
+                  + ($old === '' ? [] : ['old' => $old])
                   + ($willIssue === null ? [] : ['will_issue' => $willIssue]),
     ]);
     // 顺带把最新提醒带回去，前端不用为了刷新红条再请求一次
@@ -883,7 +924,7 @@ $api->on('GET', '/tiers', static function () use ($app, $requireManager): void {
     ], $app->cardTiers()->all())]);
 });
 
-$api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin): void {
+$api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin, $guardRewardRun): void {
     $op   = $requireAdmin();
     $b    = Api::body();
     $code = Api::str($b, 'code', '') ?: '';
@@ -895,14 +936,30 @@ $api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin): vo
     // 券有效期同理：留空跟随全局，填 0 表示永久有效
     $cvd = Api::str($b, 'coupon_valid_days', '');
 
-    if (!$app->cardTiers()->save(
-            $code, $name, Api::str($b, 'name_es', ''),
-            (float)($b['points_multiplier'] ?? 1.0),
-            Api::int($b, 'sort_order', 0),
-            (bool)($b['enabled'] ?? true),
-            ($thV === null || trim($thV) === '') ? null : (int)$thV,
-            ($thA === null || trim($thA) === '') ? null : $thA,
-            ($cvd === null || trim($cvd) === '') ? null : (int)$cvd)) {
+    /**
+     * ★ 等级门槛才是【真正决定发几张券】的那个数 ——
+     *   checkAndGrant 用的是 progressOf($m, tiers->forMember($id))。
+     *   原来这条路上一条护栏都没有：把金卡门槛从 10 改成 2，
+     *   实测那位会员当场欠 12 张，而后台什么都没显示、告警一条没有。
+     *   走与 /config/save 同一个护栏。
+     */
+    $saved = false;
+    $willIssue = $guardRewardRun($op, 'tier:' . strtolower(trim($code)),
+        sprintf('卡片等级「%s」的门槛改为 次数=%s / 金额=%s',
+            $code, ($thV === null || trim($thV) === '') ? '跟随全局' : $thV,
+            ($thA === null || trim($thA) === '') ? '跟随全局' : $thA),
+        static function () use ($app, $b, $code, $name, $thV, $thA, $cvd, &$saved): void {
+            $saved = $app->cardTiers()->save(
+                $code, $name, Api::str($b, 'name_es', ''),
+                (float)($b['points_multiplier'] ?? 1.0),
+                Api::int($b, 'sort_order', 0),
+                (bool)($b['enabled'] ?? true),
+                ($thV === null || trim($thV) === '') ? null : (int)$thV,
+                ($thA === null || trim($thA) === '') ? null : $thA,
+                ($cvd === null || trim($cvd) === '') ? null : (int)$cvd);
+        });
+
+    if (!$saved) {
         Api::fail('bad_request', 400, [
             'hint' => '标识只能用小写字母数字下划线（最多 20 位）；名称不能为空；'
                     . '积分倍率需大于 0 且不超过 10；门槛留空表示跟随全局，填了就必须是正数；'
@@ -915,9 +972,10 @@ $api->on('POST', '/tiers/save', static function () use ($app, $requireAdmin): vo
         'detail' => ['name' => $name, 'multiplier' => (float)($b['points_multiplier'] ?? 1.0),
                      'threshold_visits' => $thV, 'threshold_amount' => $thA,
                      'coupon_valid_days' => $cvd,
-                     'enabled' => (bool)($b['enabled'] ?? true)],
+                     'enabled' => (bool)($b['enabled'] ?? true)]
+                  + ($willIssue === null ? [] : ['will_issue' => $willIssue]),
     ]);
-    Api::ok(['saved' => true]);
+    Api::ok(['saved' => true] + ($willIssue === null ? [] : ['will_issue' => $willIssue]));
 });
 
 $api->on('POST', '/tiers/delete', static function () use ($app, $requireAdmin): void {

@@ -743,10 +743,30 @@ final class PointsEngine
              *   ★ 门槛由后台配（min_amount_per_visit），填 0 就是不设 ——
              *     不同门店的套餐价差很大，写死在代码里没法用。
              */
-            if ($prt > 0 && $minPerVisitCents > 0 && $amt < $minPerVisitCents) {
+            /**
+             * ★★ 门槛要【乘以份数】。它的名字就叫「计一次至少要分到多少钱」——
+             *
+             *   不乘的话守的其实是「每一笔分配至少 5 元」，而一笔分配
+             *   在 by_portion 口径下可以买到 N 次（visitsFor 里 by_portion
+             *   直接 return $portions），门槛就被稀释了 N 倍：
+             *
+             *     0.01 元连 1 份  → 拦住了            ✓
+             *     5.00 元连 3 份  → 放行，白得 3 次   🔴
+             *
+             *   实测（门槛 10 次送 1 张、min 5.00）：每趟 5 元拿走三份，
+             *   四趟就是 12 次 —— 一张设计成本 €50 的免费餐券，€20 换到手，
+             *   而真正付了 66.70 的那位客人一次都没记上。全程没有任何告警。
+             *
+             *   ★ 对默认口径【零影响】：once_per_period 与 by_order 下
+             *     一笔分配最多换 1 次（portions_per_person 锁成 1），
+             *     乘不乘结果一样。这一乘只是把 by_portion 拉回这条线上。
+             */
+            if ($prt > 0 && $minPerVisitCents > 0 && $amt < $minPerVisitCents * $prt) {
                 return ['ok' => false, 'error' => 'amount_too_small_for_visit',
                         'sum_amount' => 0, 'sum_portions' => 0,
-                        'detail' => ['min' => Money::toStr($minPerVisitCents),
+                        'detail' => ['min' => Money::toStr($minPerVisitCents * $prt),
+                                     'portions' => $prt,
+                                     'per_visit' => Money::toStr($minPerVisitCents),
                                      'given' => Money::toStr($amt)]];
             }
 
