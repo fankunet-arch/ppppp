@@ -169,13 +169,25 @@ final class LedgerRepo
     }
 
     /** 手工录入的日频次（风控告警用） */
-    public function manualCountToday(int $operatorId): int
+    /**
+     * 同一员工在【当前营业日】内手工录入的笔数。
+     *
+     * ★ 起点由调用方按营业日算好传进来，不在这里用 date('Y-m-d 00:00:00')。
+     *   这套系统的营业日切点是 02:00，晚市 19:30 做到凌晨 02:00 ——
+     *   一个班次是跨零点的。按日历零点切，等于在班次中间把额度清零重来。
+     *
+     * ★ 只数【消费】流水（T_EARN）。撤销会插一条 entry_type=T_REVERSE
+     *   的负数行，而它的 source 是从原流水复制来的（也是 MANUAL）——
+     *   不排除的话，撤销一笔就把已用额度算成负的。
+     */
+    public function manualCountSince(int $operatorId, string $since): int
     {
         return (int)$this->db->value(
             'SELECT COUNT(*) FROM point_ledger
               WHERE store_code = ? AND source = ? AND operator_id = ?
-                AND created_at >= ?',
-            [$this->storeCode, self::SRC_MANUAL, $operatorId, date('Y-m-d 00:00:00')]
+                AND entry_type = ? AND status = ? AND created_at >= ?',
+            [$this->storeCode, self::SRC_MANUAL, $operatorId,
+             self::T_EARN, self::S_ACTIVE, $since]
         );
     }
 
@@ -188,13 +200,34 @@ final class LedgerRepo
      *   笔数没超，告警不响，账面上什么都看不出来。
      *   钱的事要用钱来管。
      */
-    public function manualAmountToday(int $operatorId): int
+    /**
+     * 同一员工在【当前营业日】内手工录入的金额合计（分）。
+     *
+     * ── 🔴 两处都踩过坑，都写在这里 ────────────────────
+     *
+     * ① 起点必须按【营业日】算，不能用 date('Y-m-d 00:00:00')。
+     *    切点是 02:00，晚市 19:30 做到凌晨 02:00 —— 一个班次跨零点。
+     *    按日历切的话，同一个人、同一个班次，零点一过额度就重置：
+     *    上限写 € 300，实测一个班次录进 € 600。
+     *
+     * ② 必须只算【消费】流水（T_EARN）。撤销插入的那一行
+     *    entry_type = T_REVERSE、金额为负，而 source 是从原流水
+     *    复制来的（同样是 MANUAL），状态也是有效。不排除的话：
+     *    录 300 → 已用 300（到顶）→ 撤销 → 已用变成【-300】
+     *    → 又能再录 600。额度不是还回来，是【翻倍】。
+     *    实测一个班次因此录进 € 600，而上限写的是 € 300。
+     *
+     *    排除之后：撤销把原流水标成 REVERSED，那一笔的额度正好还回来一次
+     *    （值也一并没了，clawBackOverIssued 会把券收回），前后是一致的。
+     */
+    public function manualAmountSince(int $operatorId, string $since): int
     {
         return Money::toCents((string)($this->db->value(
             'SELECT COALESCE(SUM(amount), 0) FROM point_ledger
               WHERE store_code = ? AND source = ? AND operator_id = ?
-                AND status = ? AND created_at >= ?',
-            [$this->storeCode, self::SRC_MANUAL, $operatorId, self::S_ACTIVE, date('Y-m-d 00:00:00')]
+                AND entry_type = ? AND status = ? AND created_at >= ?',
+            [$this->storeCode, self::SRC_MANUAL, $operatorId,
+             self::T_EARN, self::S_ACTIVE, $since]
         ) ?? '0'));
     }
 
@@ -210,9 +243,11 @@ final class LedgerRepo
     public function manualAmountByMember(int $memberId): int
     {
         return Money::toCents((string)($this->db->value(
+            // 同上：只算消费流水，撤销那条负数行的 source 也是 MANUAL
             'SELECT COALESCE(SUM(amount), 0) FROM point_ledger
-              WHERE store_code = ? AND member_id = ? AND source = ? AND status = ?',
-            [$this->storeCode, $memberId, self::SRC_MANUAL, self::S_ACTIVE]
+              WHERE store_code = ? AND member_id = ? AND source = ?
+                AND entry_type = ? AND status = ?',
+            [$this->storeCode, $memberId, self::SRC_MANUAL, self::T_EARN, self::S_ACTIVE]
         ) ?? '0'));
     }
 

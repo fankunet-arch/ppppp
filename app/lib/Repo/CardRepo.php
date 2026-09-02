@@ -165,6 +165,18 @@ final class CardRepo
         $out   = [];
 
         $this->db->transaction(function () use ($batchNo, $count, $now, $start, $validTo, $tierCode, &$out): void {
+            /**
+             * ★ 每次进来先清空 —— 这个闭包是【可能被重放的】。
+             *
+             *   LocalDb::transaction() 遇到死锁/锁等待超时会整笔回滚后重放。
+             *   库里的行跟着回滚了，但 $out 是按引用捕获的【库外状态】，
+             *   回滚不掉。不清的话重放一次就多一份，
+             *   发卡批次的返回列表（要拿去打印卡片与 PIN）会出现重复。
+             *
+             *   这是「闭包里带外部可变状态」这一类问题的唯一一处 ——
+             *   全仓库其余事务闭包都只按值捕获、只写库。加新的时候要守住这条。
+             */
+            $out = [];
             for ($i = 0; $i < $count; $i++) {
                 $serial = $start + $i;
                 // 后缀随机，理论上可能与同一顺序号的历史值重复，但顺序号本身

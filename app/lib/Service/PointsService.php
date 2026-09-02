@@ -923,6 +923,19 @@ final class PointsService
             : ['counts_visit' => true, 'reason' => null];
     }
 
+    /**
+     * 当前营业日的起点（本地时间）。
+     *
+     * 手工录入的日限额/日频次都按它切 —— 见 manualAmountSince 的说明。
+     * 复用 BusinessDay 而不是另写一遍：那里已经处理了夏令时那天
+     * 02:00 不存在的情况，这套系统里也只该有一个「一天从几点开始」。
+     */
+    private function businessDayStart(): string
+    {
+        $now = date('Y-m-d H:i:s');
+        return $this->bizDay->range($this->bizDay->of($now))[0];
+    }
+
     /** 这张卡在这一顿（同一营业日 + 同一餐期）里是不是已经记过次数了 */
     private function countedThisSitting(int $memberId, string $refEndTime): bool
     {
@@ -1538,7 +1551,15 @@ final class PointsService
         $dayCap = Money::toCents($this->cfg->get('manual_entry_daily_cap', '0'));
         $opIdPre = (int)($operator['id'] ?? 0);
         if ($dayCap > 0 && $opIdPre > 0) {
-            $usedToday = $this->ledger->manualAmountToday($opIdPre);
+            /**
+             * ★ 起点按【营业日】，不是日历零点。
+             *   切点 02:00，晚市 19:30 做到凌晨 02:00 —— 一个班次跨零点。
+             *   按日历切等于在班次中间把额度清零：实测上限写 € 300，
+             *   同一个人同一个班次录进了 € 600。
+             *   这套系统里 business_date、餐期、告警统计全走营业日，
+             *   不该只有这道上限自己搞一套「一天从几点开始」。
+             */
+            $usedToday = $this->ledger->manualAmountSince($opIdPre, $this->businessDayStart());
             if ($usedToday + $amountCents > $dayCap) {
                 return ['ok' => false, 'error' => 'exceeds_manual_daily_cap',
                         'detail' => ['cap' => Money::toStr($dayCap),
@@ -1628,7 +1649,7 @@ final class PointsService
 
             // 频次风控
             $opId = (int)($operator['id'] ?? 0);
-            $cnt  = $this->ledger->manualCountToday($opId);
+            $cnt  = $this->ledger->manualCountSince($opId, $this->businessDayStart());
             $thr  = $this->cfg->int('manual_entry_daily_alert', 5);
             if ($opId > 0 && $cnt > $thr) {
                 $this->alerts->raise(

@@ -247,3 +247,60 @@ $r = PE::validateAllocations([
     ['member_id' => 2, 'amount_cents' => 1,    'portions' => 1],
 ], $T, 0, $P, 0, 0);
 T::true($r['ok'], '门槛填 0 时退回旧行为（只要求「有钱」）');
+
+T::group('计次成本的【性质】—— 穷举，而不是逐个场景');
+
+/**
+ * ★ 这一组和上面那些逐条断言不一样：它不枚举玩法，而是钉住一条【性质】。
+ *
+ *   起因是一个真实的漏洞：门槛判据写成 `$amt < $min` 而不是 `$amt < $min * $prt`，
+ *   于是「0.01 换 1 次」拦住了，「5.00 换 3 次」放行 ——
+ *   同一条规则，换个数字就绕过去了。逐个场景写断言永远追不上，
+ *   因为漏的正是没想到的那个组合。
+ *
+ *   改成穷举一条性质：**任何一笔能通过校验的分配，
+ *   它每换到一次计次所付的钱，都不能低于门槛。**
+ *   只要这条恒成立，无论有没有人想到某种新玩法，都绕不过去。
+ */
+$MIN = 500;
+$bad = null; $checked = 0;
+for ($amt = 0; $amt <= 8000; $amt += 37) {
+    for ($prt = 0; $prt <= 6; $prt++) {
+        $checked++;
+        $r = PE::validateAllocations(
+            [['member_id' => 1, 'amount_cents' => $amt, 'portions' => $prt]],
+            100000, 0, 20, 0, $MIN);
+        if (!($r['ok'] ?? false) || $prt === 0) {
+            continue;                       // 被拒的、以及不计次的，都不在这条性质的范围内
+        }
+        // 通过了校验 且 真的换到了次数 → 每次的成本必须够门槛
+        if (intdiv($amt, $prt) < $MIN) {
+            $bad = "金额 {$amt} 分 / {$prt} 份 → 每次只花了 " . intdiv($amt, $prt) . " 分";
+            break 2;
+        }
+    }
+}
+T::eq(null, $bad,
+    "★★★ 穷举 {$checked} 种（金额 × 份数）组合：凡是通过校验并换到计次的，"
+    . '每一次的成本都 ≥ 门槛' . ($bad === null ? '' : "（反例：{$bad}）"));
+
+/**
+ * ★ 反向也要钉：门槛不能把【正常生意】挡在外面。
+ *   只要每次的钱够门槛，就必须放行 —— 否则这道闸门会变成柜台上的路障。
+ */
+$blocked = null; $checked2 = 0;
+for ($prt = 1; $prt <= 6; $prt++) {
+    for ($per = $MIN; $per <= $MIN + 2000; $per += 113) {
+        $checked2++;
+        $r = PE::validateAllocations(
+            [['member_id' => 1, 'amount_cents' => $per * $prt, 'portions' => $prt]],
+            1000000, 0, 20, 0, $MIN);
+        if (!($r['ok'] ?? false)) {
+            $blocked = "每次 {$per} 分 × {$prt} 份被拒了";
+            break 2;
+        }
+    }
+}
+T::eq(null, $blocked,
+    "★★ 反向穷举 {$checked2} 种：每次都够门槛的分配【一律放行】"
+    . ($blocked === null ? '' : "（反例：{$blocked}）"));

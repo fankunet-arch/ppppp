@@ -704,28 +704,66 @@ final class RewardService
      *   问题在于它原来是【静默】的：后台点一下保存，提示「已保存」，
      *   几十顿饭就送出去了，没有任何地方说过一句。
      *
-     * ⚠️ 这是个【估算】：按全局门槛算，不逐个套用卡片等级的门槛
-     *   （分级会员的实际张数可能更多）。用途是给人一个量级，
-     *   不是精确账 —— 精确数在真正发券时由 checkAndGrant 逐人算。
+     * ⚠️ 一位会员挂多张卡时 LEFT JOIN 会出现多行，那时这个数会偏大。
+     *   实际是一人一卡（换卡走 replaceCard，旧卡置为作废），
+     *   偏大也只会让告警更保守，不会漏报。
      */
     public function pendingAcrossMembers(): int
     {
-        $r = $this->rule(null);
-        if (!$r['enabled']) {
+        $global = $this->rule(null);
+        if (!$global['enabled']) {
             return 0;
         }
-        if ($r['mode'] === 'amount') {
-            $sql = 'SELECT COALESCE(SUM(GREATEST(0,
-                        FLOOR(total_spent * 100 / ?) - rewards_issued)), 0)
-                      FROM member WHERE store_code = ?';
-            $thr = max(1, $r['threshold_cents']);
-        } else {
-            $sql = 'SELECT COALESCE(SUM(GREATEST(0,
-                        FLOOR(visit_count / ?) - rewards_issued)), 0)
-                      FROM member WHERE store_code = ?';
-            $thr = max(1, $r['threshold_visits']);
+
+        /**
+         * ★★ 必须【按会员各自的等级】算。
+         *
+         *   原来这里是 rule(null) —— 全局规则，不看任何人的等级。
+         *   而真正发几张券用的是 progressOf($m, tiers->forMember($id))，
+         *   也就是【这张卡的等级门槛】。两个数不是一回事：
+         *
+         *     金卡门槛 2 次的会员，攒了 15 次、已发 3 张 → 实际欠 12 张
+         *     而按全局门槛（10 次）算出来是 0 张
+         *
+         *   于是护栏拿着一个偏小的数在报警，经理照着它做决定。
+         *   /tiers/save 改等级门槛时更是完全看不见。
+         *
+         * ★ 不逐个 forMember() 查库（那是每位会员一次查询）——
+         *   等级表很小，一次读进来，会员连着卡的等级码一次读出来，
+         *   在内存里配对。
+         */
+        $tiers = [];
+        foreach ($this->tiers->all() as $t) {
+            $tiers[(string)$t['code']] = $t;
         }
-        return (int)$this->db->value($sql, [$thr, $this->storeCode]);
+
+        $rows = $this->db->all(
+            'SELECT m.visit_count, m.total_spent, m.rewards_issued, c.tier_code
+               FROM member m
+               LEFT JOIN card c ON c.store_code = m.store_code AND c.member_id = m.id
+              WHERE m.store_code = ?',
+            [$this->storeCode]
+        );
+
+        $pending = 0;
+        foreach ($rows as $row) {
+            $code = $row['tier_code'] ?? null;
+            $tier = ($code !== null && isset($tiers[$code])) ? [
+                'code'             => $code,
+                'threshold_visits' => $tiers[$code]['threshold_visits'],
+                'threshold_amount' => $tiers[$code]['threshold_amount'],
+            ] : null;
+            $r = $this->rule($tier);
+            if (!$r['enabled']) {
+                continue;
+            }
+            $progress = $r['mode'] === 'amount'
+                ? Money::toCents((string)($row['total_spent'] ?? '0'))
+                : (int)($row['visit_count'] ?? 0);
+            $thr = max(1, $r['mode'] === 'amount' ? $r['threshold_cents'] : $r['threshold_visits']);
+            $pending += max(0, intdiv($progress, $thr) - (int)($row['rewards_issued'] ?? 0));
+        }
+        return $pending;
     }
 
     /** 后台统计 */
