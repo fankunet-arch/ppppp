@@ -52,7 +52,7 @@ php bin/why.php --ref E202-7F3A21    # 按界面上的错误代码翻日志拿�
 
 ```bash
 php tests/run.php                 # 988 项，不需要数据库
-php tests/smoke.php --fresh       # 608 项，需要一个【专用空库】
+php tests/smoke.php --fresh       # 622 项，需要一个【专用空库】
 php tests/e2e_pos.php             # 95 项，需要 POS 可达
 php tests/http_sweep.php          # 89 项，对着跑起来的站点打全部接口
 node tests/browser/*.mjs          # 552 项，真浏览器，仅开发机
@@ -76,3 +76,4 @@ node tests/browser/*.mjs          # 552 项，真浏览器，仅开发机
 | [05 合规与 Wallet](./docs/05-合规与Wallet.md) | GDPR / LOPDGDD |
 | [06 部署手册](./docs/06-部署手册.md) | 安装、后台配置、故障速查、错误代码表 |
 | [07 环境配置手册](./docs/07-环境配置手册.md) | 🔴 装机先看这份 |
+| [13 典型场景与已知陷阱](./docs/13-典型场景与已知陷阱.md) | 🔴 改奖励/计次/撤销前看这份：柜台场景、设计取舍、踩过的坑按类型归档、自检清单 |

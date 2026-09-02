@@ -4047,6 +4047,138 @@ $tgDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id=?", [SMOK
 $tgDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id=?", [SMOKE_STORE, $tgM]);
 $tgDb->exec("DELETE FROM member       WHERE store_code=? AND id=?",        [SMOKE_STORE, $tgM]);
 
+step('㊺ 录错卡凑满门槛：及时撤销 / 券已被吃掉 / 作废的券会不会复活');
+
+/**
+ * ★ 这是柜台上最真实的一幕：
+ *   客人已经攒到 9 次，服务员拿错卡把别桌的账记到他名下 —— 正好凑成 10 次，
+ *   系统当场发了一张免费餐券。经理随后发现。
+ *
+ *   两种情况的正确结局是【不一样】的，必须分开钉住：
+ *
+ *   A 券还没用掉 → 券收回、已发计数退回。客人后来自己真的吃到第 10 次时，
+ *     必须【照常拿到】那张券 —— 上一轮的坑就是这里永远算出 0，客人白白少一张。
+ *
+ *   B 券已经吃掉了 → 那顿饭收不回来。已发计数【不退】（客人确实拿到了那份奖励），
+ *     挂告警让经理知道。客人后来真的吃到第 10 次时【不再发】——
+ *     10 次真实消费换到 1 顿免费餐，账是平的。
+ *
+ *   ★ 还要钉住「幽灵恢复」：作废掉的券不能在后续消费中自己活过来，
+ *     也不能被经理 force 核销掉。
+ */
+$ghApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$ghDb  = $ghApp->localDb();
+foreach (['late_grant_minutes' => '0', 'max_grants_per_period' => '0',
+          'visit_count_mode' => 'by_order', 'points_mode' => 'by_amount',
+          'reward_enabled' => '1', 'reward_mode' => 'visits',
+          'reward_auto_grant' => '1'] as $k => $v) { $ghApp->cfg()->set($k, $v); }
+$ghThr0 = $ghApp->cfg()->get('reward_threshold_visits', '10');
+$ghApp->cfg()->set('reward_threshold_visits', '10');
+
+$ghPos = new FakePosSource();
+$ghPos->now = date('Y-m-d H:i:s');
+for ($i = 0; $i < 6; $i++) {
+    $oh = 450000 + $i;
+    $ghPos->addHead([
+        'serial_id' => sprintf('45%08d', $i), 'order_head_id' => $oh, 'check_id' => 1,
+        'table_name' => 'GH' . $i, 'eat_type' => 0, 'customer_num' => 2,
+        'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+        'order_end_time' => date('Y-m-d H:i:s', strtotime($ghPos->now) - 3000 + $i * 120),
+    ]);
+    $ghPos->addDetail($oh, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+}
+$ghApp->setPosSource($ghPos);
+for ($i = 0; $i < 6; $i++) { $ghApp->points()->locate('GH' . $i, 7200); }
+
+$ghOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$ghActive = fn(int $m): int => (int)$ghDb->value(
+    'SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1', [SMOKE_STORE, $m]);
+$ghAt9 = function (string $card) use ($ghApp, $ghDb): int {
+    $m = (int)$ghApp->members()->create($card, null, null, null)['id'];
+    // 直接置成 9 次 —— 这一段测的是「第 10 次那一下」，不是怎么攒到 9 次
+    $ghDb->exec('UPDATE member SET visit_count = 9, rewards_issued = 0 WHERE store_code=? AND id=?',
+        [SMOKE_STORE, $m]);
+    return $m;
+};
+
+// ── A：及时撤销 ──
+$ghA = $ghAt9('TK-00045001-GHA');
+$ra  = $ghApp->points()->grant('4500000000',
+    [['member_id' => $ghA, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $ghOp);
+$ghApp->rewards()->checkAndGrant($ghA, $ghOp);
+eq(10, (int)$ghApp->members()->findById($ghA)['visit_count'], 'A：录错卡把他凑成了 10 次');
+eq(1, $ghActive($ghA), '  └ 当场发出 1 张免费餐券');
+
+$ghApp->points()->reverse((int)$ra['entries'][0]['ledger_id'], '录错卡号', $ghOp);
+eq(9, (int)$ghApp->members()->findById($ghA)['visit_count'], 'A：撤销后计次退回 9');
+eq(0, $ghActive($ghA), '  └ 那张券被收回（不再可用）');
+eq(0, (int)$ghApp->members()->findById($ghA)['rewards_issued'], '  └ 已发计数也退回 0');
+
+$ghApp->points()->grant('4500000001',
+    [['member_id' => $ghA, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $ghOp);
+$ga = $ghApp->rewards()->checkAndGrant($ghA, $ghOp);
+eq(1, (int)($ga['granted'] ?? 0),
+   '★★★ A：客人后来自己真的吃到第 10 次 → 【照常发券】。'
+   . '这里曾经永远算出 0，客人白白少一张，而进度条上写着「还差 10 次」看不出任何异常');
+eq(1, $ghActive($ghA), '  └ 手上正好 1 张可用券');
+
+// ── B：券已经被吃掉了才撤销 ──
+$ghB = $ghAt9('TK-00045002-GHB');
+$rb  = $ghApp->points()->grant('4500000002',
+    [['member_id' => $ghB, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $ghOp);
+$ghApp->rewards()->checkAndGrant($ghB, $ghOp);
+$ghCid = (int)$ghDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? ORDER BY id DESC LIMIT 1',
+    [SMOKE_STORE, $ghB]);
+// 客人把券吃掉了（直接置为已核销：这一段测的是「吃掉之后撤销会怎样」）
+$ghDb->exec('UPDATE coupon SET status = 2, redeemed_at = ? WHERE id = ?', [$ghDb->now(), $ghCid]);
+
+$ghAl0 = (int)$ghDb->value(
+    "SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type='reward_on_reversed_grant'", [SMOKE_STORE]);
+$ghApp->points()->reverse((int)$rb['entries'][0]['ledger_id'], '录错卡号（券已被吃）', $ghOp);
+
+eq(2, (int)$ghDb->value('SELECT status FROM coupon WHERE id=?', [$ghCid]),
+   '★★ B：已经吃掉的那张券【状态不动】—— 那顿饭收不回来');
+eq(1, (int)$ghApp->members()->findById($ghB)['rewards_issued'],
+   '  └ 已发计数【不退】：客人确实拿到了那份奖励，退了他会再拿一张');
+eq($ghAl0 + 1, (int)$ghDb->value(
+        "SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type='reward_on_reversed_grant'", [SMOKE_STORE]),
+   '★★★ B：挂了告警 —— 这是一份发错的账换来的免费餐，经理必须知道');
+
+$ghApp->points()->grant('4500000003',
+    [['member_id' => $ghB, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $ghOp);
+$gb = $ghApp->rewards()->checkAndGrant($ghB, $ghOp);
+eq(0, (int)($gb['granted'] ?? 0),
+   '★★★ B：客人真吃到第 10 次时【不再发】—— 10 次真实消费换到 1 顿免费餐，账是平的');
+eq(10, (int)$ghApp->members()->findById($ghB)['visit_count'], '  └ 计次确实是 10');
+
+// ── 幽灵恢复 ──
+$ghVoid0 = (int)$ghDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND status=4', [SMOKE_STORE]);
+for ($i = 4; $i < 6; $i++) {
+    $ghApp->points()->grant(sprintf('45%08d', $i),
+        [['member_id' => $ghA, 'amount_cents' => 4780, 'portions' => 2]],
+        Vip\PointsEngine::MODE_SPLIT, $ghOp);
+    $ghApp->rewards()->checkAndGrant($ghA, $ghOp);
+}
+eq($ghVoid0, (int)$ghDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND status=4', [SMOKE_STORE]),
+   '★★★ 作废的券【不会复活】—— 后续消费只会发新的，不会把作废那张翻回可用');
+$ghDead = (int)$ghDb->value('SELECT id FROM coupon WHERE store_code=? AND status=4 LIMIT 1', [SMOKE_STORE]);
+if ($ghDead > 0) {
+    $rr = $ghApp->rewards()->redeem($ghDead, '4500000005', $ghOp, null, ['reason' => '试试作废的券']);
+    eq('coupon_not_active', (string)($rr['error'] ?? ''),
+       '★★ 作废的券连经理 force 都核销不掉（状态检查在 force 之前）');
+}
+
+$ghApp->cfg()->set('reward_threshold_visits', (string)$ghThr0);
+$ghIds = implode(',', [$ghA, $ghB]);
+$ghDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$ghIds})", [SMOKE_STORE]);
+$ghDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$ghIds})", [SMOKE_STORE]);
+$ghDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$ghIds})", [SMOKE_STORE]);
+$ghDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '45%'", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(
