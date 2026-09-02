@@ -217,6 +217,24 @@ final class PointsService
         //   与服务员手工标记的 is_free_meal 分开存，审计时能区分判定来源。
         $isRedeemed = (bool)$analysis['is_redeemed'];
 
+        /**
+         * ★ App 自己核销掉的券，是比匹配串【更硬】的证据。
+         *
+         *   上面那一行只是拿 redeem_line_patterns 去猜 POS 折扣行的名字，
+         *   而名字是会变的。但「哪一张券核销在哪一单」App 是确知的
+         *   （redeem() 存了 redeemed_serial_id）—— 那才是地面真值。
+         *
+         *   ★ 只【加】不【减】：匹配串认出来的照旧算数，
+         *     这里补的是它没认出来的那一半。
+         *     漏认的后果是免费餐又攒一次（每 9 顿付费就送一顿）；
+         *     多认的后果是误伤正常客人 —— 两个方向都要守，
+         *     但这一处只补漏认，不碰多认那一边（那一边由匹配串防呆 + 比例告警管）。
+         */
+        $appRedeemed = $this->orders->appRedeemedCount((string)$o['serial_id']);
+        if ($appRedeemed > 0) {
+            $isRedeemed = true;
+        }
+
         // 「免费餐的额外消费是否计入」—— 后台开关 free_meal_extra_earns
         //   0（默认）核销/免费餐那一单整单不计分不计次
         //   1        套餐部分不计分，但酒水甜点等【额外消费】照常计分
@@ -239,6 +257,15 @@ final class PointsService
          * 宁可少给也不能多给 —— 多给等于白送一顿饭。
          */
         $portionsRedeemed = $analysis['portions_redeemed'];   // int|null
+        /**
+         * ★ 抵掉几份：取「匹配串反推出来的」与「App 自己核销的张数」中较大的一个。
+         *   一张券 = 一份免费套餐，所以张数就是份数的下限。
+         *   反推不出来（null）时保持 null —— 那是「保守口径：整单不计次」，
+         *   比这里的下限更严，不能被削弱。
+         */
+        if ($appRedeemed > 0 && $portionsRedeemed !== null) {
+            $portionsRedeemed = max($portionsRedeemed, $appRedeemed);
+        }
         $fullyRedeemed    = $isRedeemed
             && ($portionsRedeemed === null || $portionsRedeemed >= $analysis['portions_counted']);
         $isFreeish        = $isFree || $fullyRedeemed;

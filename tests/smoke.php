@@ -4179,6 +4179,139 @@ $ghDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$ghI
 $ghDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$ghIds})", [SMOKE_STORE]);
 $ghDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '45%'", [SMOKE_STORE]);
 
+step('㊻ 用券吃的那一餐，不能又攒一次（不靠猜 POS 折扣行的名字）');
+
+/**
+ * ★ 这一条守的位置和前面所有防线都不一样：
+ *   前面守的是「谁在造券」，这一条守的是【造出来的券花掉了有没有被记账】。
+ *
+ *   「这一餐是不是用券吃的」原来【唯一】的判据，是拿 redeem_line_patterns
+ *   去匹配 POS 折扣行的名称 —— 一份后台可改的自由文本，而名称是会变的
+ *   （实测 Dto. -20% 已换成 -15%）。对不上的时候：
+ *
+ *     免费餐那一单 is_redeemed = 0 → 服务员照常记账 → 【又攒一次】
+ *     → 免费餐自己在为下一顿免费餐攒进度
+ *     → 门槛 10 时变成「9 顿付费送 1 顿」，发放量多约 11%
+ *
+ *   而且不是一次性事故，是【每位常客、每个兑换周期都在漏】，
+ *   账面上完全看不出异常：计次是真的、订单是真的、金额是真的。
+ *
+ *   App 自己一直知道答案（redeem() 存了 redeemed_serial_id），只是没拿出来用。
+ */
+$rzApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$rzDb  = $rzApp->localDb();
+foreach (['late_grant_minutes' => '0', 'max_grants_per_period' => '0',
+          'visit_count_mode' => 'by_order', 'points_mode' => 'by_amount',
+          'free_meal_extra_earns' => '0', 'reward_enabled' => '1',
+          'reward_mode' => 'visits', 'reward_auto_grant' => '1',
+          'redeem_line_patterns' => 'TARJETA 10+1,10+1'] as $k => $v) { $rzApp->cfg()->set($k, $v); }
+$rzThr0 = $rzApp->cfg()->get('reward_threshold_visits', '10');
+$rzApp->cfg()->set('reward_threshold_visits', '3');
+
+$rzPos = new FakePosSource();
+$rzPos->now = date('Y-m-d H:i:s');
+/** @param ?string $disc 折扣行名称；null = 普通单 */
+$rzMk = function (string $tbl, int $ohid, int $ago, ?string $disc, int $qty) use ($rzPos): void {
+    $amt = number_format(23.90 * $qty, 2, '.', '');
+    $rzPos->addHead([
+        'serial_id' => (string)(43000000 + $ohid), 'order_head_id' => $ohid, 'check_id' => 1,
+        'table_name' => $tbl, 'eat_type' => 0, 'customer_num' => $qty,
+        'original_amount' => $amt, 'should_amount' => $amt, 'actual_amount' => $amt,
+        'order_end_time' => date('Y-m-d H:i:s', strtotime($rzPos->now) - $ago),
+    ]);
+    $lines = [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', $amt, $qty)];
+    if ($disc !== null) { $lines[] = FakePosSource::line(-2, $disc, '-23.90', '-23.90', 1); }
+    $rzPos->addDetail($ohid, 1, $lines);
+};
+// 三位会员各用一张攒次单 —— 共用一张的话额度会被第一位分光，
+// 后面两位的 grant 静默失败，测出来的就不是这一段想测的东西
+$rzMk('RZ0', 430100, 3000, null, 2);
+$rzMk('RZ4', 430500, 2900, null, 2);
+$rzMk('RZ5', 430600, 2800, null, 2);
+$rzMk('RZ1', 430200,  900, 'MENU CLIENTE GRATIS', 1);         // 免费餐，折扣行名字【对不上】
+$rzMk('RZ2', 430300,  800, 'TARJETA 10+1',        1);         // 免费餐，名字对得上（对照）
+$rzMk('RZ3', 430400,  700, 'TARJETA 10+1',        4);         // ★ 混合单：4 份只免 1 份
+$rzApp->setPosSource($rzPos);
+foreach (['RZ0', 'RZ1', 'RZ2', 'RZ3', 'RZ4', 'RZ5'] as $t) { $rzApp->points()->locate($t, 7200); }
+
+$rzOp = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$rzRun = function (string $card, string $earnSerial, string $freeSerial) use ($rzApp, $rzDb, $rzOp): array {
+    $m = (int)$rzApp->members()->create($card, null, null, null)['id'];
+    $rzDb->exec('UPDATE member SET visit_count = 2, rewards_issued = 0 WHERE store_code=? AND id=?',
+        [SMOKE_STORE, $m]);
+    $rzApp->points()->grant($earnSerial,
+        [['member_id' => $m, 'amount_cents' => 4780, 'portions' => 1]],
+        Vip\PointsEngine::MODE_SPLIT, $rzOp);
+    $rzApp->rewards()->checkAndGrant($m, $rzOp);
+    $cid = (int)$rzDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? ORDER BY id DESC LIMIT 1',
+        [SMOKE_STORE, $m]);
+    // 客人拿这张券吃免费餐（核销时带上那一单的单号 —— Pad 就是这么做的）
+    $rzApp->rewards()->redeem($cid, $freeSerial, $rzOp, null, ['reason' => '冒烟跳过 PIN']);
+    // 服务员照常拿卡记这一单
+    $g = $rzApp->points()->grant($freeSerial,
+        [['member_id' => $m, 'amount_cents' => 2390, 'portions' => 1]],
+        Vip\PointsEngine::MODE_SPLIT, $rzOp);
+    $o = $rzDb->one('SELECT is_redeemed, portions_counted FROM pos_order WHERE store_code=? AND serial_id=?',
+        [SMOKE_STORE, $freeSerial]);
+    return ['mid' => $m, 'grant' => $g, 'order' => $o,
+            'visits' => (int)$rzApp->members()->findById($m)['visit_count']];
+};
+
+// ── ① 折扣行名字对不上 ──
+$rz1 = $rzRun('TK-00043001-RZA', '43430100', '43430200');
+eq(1, (int)$rz1['order']['is_redeemed'],
+   '★★★ ① 折扣行名字对不上，但 App 自己核销过 → 这一单照样标成核销');
+eq(0, (int)$rz1['order']['portions_counted'],
+   '  └ 计次份数也扣到 0 —— 只标 is_redeemed 不扣份数的话，它会变成「混合单」照样计次');
+eq('redeemed', (string)($rz1['grant']['error'] ?? ''), '  └ 服务员再记这一单被拒');
+eq(3, $rz1['visits'],
+   '★★★ 免费餐【没有又攒一次】。漏认时这里会变成 4 —— 免费餐自己在攒下一顿免费餐');
+
+// ── ② 对照：名字对得上 ──
+$rz2 = $rzRun('TK-00043002-RZB', '43430500', '43430300');
+eq('redeemed', (string)($rz2['grant']['error'] ?? ''), '② 对照组（名字对得上）同样被拒');
+eq(3, $rz2['visits'], '  └ 计次同样停在 3 —— 两条路结果一致');
+
+// ── ③ 混合单不能被误伤 ──
+/**
+ * ★ 4 人同桌、1 人用券、其余 3 人照付 —— 那 3 位【必须照常计次】。
+ *   把 is_redeemed 写回去时如果顺手把份数清零，就会把这 3 位一起吃掉，
+ *   那是 docs/03 §5.5 专门修过的「静默少给」。这一条守着不许退回去。
+ */
+$rzM3 = (int)$rzApp->members()->create('TK-00043003-RZC', null, null, null)['id'];
+$rzDb->exec('UPDATE member SET visit_count = 2, rewards_issued = 0 WHERE store_code=? AND id=?',
+    [SMOKE_STORE, $rzM3]);
+$rzApp->points()->grant('43430600',
+    [['member_id' => $rzM3, 'amount_cents' => 4780, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $rzOp);
+$rzApp->rewards()->checkAndGrant($rzM3, $rzOp);
+$rzC3 = (int)$rzDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? ORDER BY id DESC LIMIT 1',
+    [SMOKE_STORE, $rzM3]);
+$rzApp->rewards()->redeem($rzC3, '43430400', $rzOp, null, ['reason' => '冒烟跳过 PIN']);
+$rzO3 = $rzDb->one('SELECT is_redeemed, portions_counted FROM pos_order WHERE store_code=? AND serial_id=?',
+    [SMOKE_STORE, '43430400']);
+eq(1, (int)$rzO3['is_redeemed'], '③ 混合单也标成核销');
+ok((int)$rzO3['portions_counted'] >= 3,
+   "★★★ 但净计次份数仍有 {$rzO3['portions_counted']} 份 —— 那 3 位付了钱的客人【照常计次】。"
+   . '顺手把份数清零就会把他们一起吃掉，那是 §5.5 修过的「静默少给」');
+
+// ── ④ 对账告警：守的是「认不出」这个方向 ──
+/**
+ * 现有的 redeem_rate_high 防的是「匹配串太宽」（误伤客人）；
+ * 这一条防【相反】的方向（认不出 → 餐厅赔钱）。同一份自由文本，两个方向。
+ */
+$rzUn = $rzApp->orders()->redeemedButUnflagged(date('Y-m-d H:i:s', strtotime('-7 days')));
+eq(0, $rzUn['unflagged'],
+   '★★ 核销过的券，所在订单【全部】都标上了核销 —— 对账查询本身也在这里钉住');
+ok($rzUn['total'] >= 3, "  └ 这一段确实核销了 {$rzUn['total']} 张（不是因为没数据才为 0）");
+
+$rzApp->cfg()->set('reward_threshold_visits', (string)$rzThr0);
+$rzIds = implode(',', [$rz1['mid'], $rz2['mid'], $rzM3]);
+$rzDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$rzIds})", [SMOKE_STORE]);
+$rzDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$rzIds})", [SMOKE_STORE]);
+$rzDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$rzIds})", [SMOKE_STORE]);
+$rzDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '4343%'", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

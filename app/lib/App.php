@@ -262,7 +262,7 @@ final class App
         return $this->once('rewards', fn() => new RewardService(
             $this->localDb(), $this->storeCode(), $this->cfg(),
             $this->members(), $this->audit(), $this->cards(), $this->cardTiers(),
-            $this->ledger(), $this->alerts(),
+            $this->ledger(), $this->alerts(), $this->orders(),
         ));
     }
 

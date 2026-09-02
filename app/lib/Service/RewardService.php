@@ -52,6 +52,8 @@ final class RewardService
          */
         private \Vip\Repo\LedgerRepo $ledger,
         private \Vip\Repo\AlertRepo  $alerts,
+        /** 核销成功时把「这一单是用券吃的」写回订单镜像 —— 见 redeem() */
+        private \Vip\Repo\OrderRepo  $orders,
     ) {
     }
 
@@ -537,6 +539,23 @@ final class RewardService
                   WHERE id = ?',
                 [self::ST_REDEEMED, $this->db->now(), $serialId, $operator['id'] ?? null, $couponId]
             );
+
+            /**
+             * ★ 把「这一单是用券吃的」写回订单镜像 —— 这是 App 的地面真值。
+             *
+             *   原来这件事只写在券上（redeemed_serial_id），订单那一侧
+             *   仍然靠匹配 POS 折扣行的名字去猜。名字对不上时，
+             *   免费餐那一单会被当成正常一单【又攒一次】——
+             *   门槛 10 时变成「9 顿付费送 1 顿」，发放量多约 11%，
+             *   而且全程零告警（见 OrderRepo::markRedeemedByApp 的说明）。
+             *
+             *   ★ 必须在同一笔事务里：券已核销而订单没标记，就又回到那个状态。
+             *   ★ 没带单号时（客人先吃、事后补核销）跳过 —— 那时确实不知道是哪一单，
+             *     只能继续靠匹配串，兜底由 checkIntegrity 的对账告警负责。
+             */
+            if ($serialId !== null && trim($serialId) !== '') {
+                $this->orders->markRedeemedByApp($serialId);
+            }
             $this->audit->log($forced ? 'coupon_redeem_forced' : 'coupon_redeem', [
                 'target_type'   => 'coupon', 'target_id' => (string)$couponId,
                 'operator_id'   => $operator['id']   ?? null,
