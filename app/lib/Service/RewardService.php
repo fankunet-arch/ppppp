@@ -894,6 +894,132 @@ final class RewardService
      *   实际是一人一卡（换卡走 replaceCard，旧卡置为作废），
      *   偏大也只会让告警更保守，不会漏报。
      */
+    /**
+     * 「待发」队列 —— 谁攒够了、还欠他几张。
+     *
+     * ── 🔴 影子模式原来只有一半（审计 F8） ───────────────────
+     *
+     * docs/13 §6 建议上线第一个月把 reward_auto_grant 关掉：
+     * 「达标的客人进后台【待发】队列，由经理逐张确认后发出」。
+     * checkAndGrant 那一侧也确实写着「只提示不发，后台可手工发」。
+     *
+     * 但后台【没有这个队列】。/coupons 只列已经发出去的券，
+     * pendingAcrossMembers() 只回一个总数，没有名单。
+     * 于是关掉自动发放之后，经理看得到「欠 7 张」，
+     * 却查不出是哪 7 位客人 —— 只能一张卡一张卡去搜。
+     * 建议的上线方式实际上没法执行，最后必然是把自动发放打开硬上。
+     *
+     * ★ 与 pendingAcrossMembers 同一套算法（按各人自己那档门槛），
+     *   两处必须给出同一个数，否则「总数 7、名单 5 行」谁也不敢信。
+     *
+     * @return array<int,array{member_id:int,card_no:?string,tier_code:?string,
+     *                         pending:int,progress:int,threshold:int,mode:string}>
+     */
+    public function pendingList(int $limit = 200): array
+    {
+        $global = $this->rule(null);
+        if (!$global['enabled']) {
+            return [];
+        }
+        $tiers = [];
+        foreach ($this->tiers->all() as $t) {
+            $tiers[(string)$t['code']] = $t;
+        }
+
+        $rows = $this->db->all(
+            'SELECT m.id, m.card_no, m.visit_count, m.total_spent, m.rewards_issued,
+                    m.updated_at, c.tier_code
+               FROM member m
+               LEFT JOIN card c ON c.store_code = m.store_code AND c.member_id = m.id
+              WHERE m.store_code = ?',
+            [$this->storeCode]
+        );
+
+        $out = [];
+        foreach ($rows as $row) {
+            $code = $row['tier_code'] ?? null;
+            $tier = ($code !== null && isset($tiers[$code])) ? [
+                'code'             => $code,
+                'threshold_visits' => $tiers[$code]['threshold_visits'],
+                'threshold_amount' => $tiers[$code]['threshold_amount'],
+            ] : null;
+            $p = $this->progressOf($row, $tier);
+            if ($p['pending'] <= 0) {
+                continue;
+            }
+            $out[] = [
+                'member_id' => (int)$row['id'],
+                'card_no'   => $row['card_no'] ?? null,
+                'tier_code' => $code,
+                'pending'   => (int)$p['pending'],
+                'progress'  => (int)$p['progress'],
+                'threshold' => (int)$p['threshold'],
+                'mode'      => (string)$p['mode'],
+                'text'      => (string)$p['text'],
+                'updated_at'=> $row['updated_at'] ?? null,
+            ];
+        }
+        // 欠得最多的排最前 —— 那几位是最可能出问题、也最该先看一眼的
+        usort($out, static fn(array $a, array $b): int => $b['pending'] <=> $a['pending']);
+        return array_slice($out, 0, max(1, min($limit, 500)));
+    }
+
+    /**
+     * 经理在「待发」队列上按下确认 —— 把这位客人欠的券发出来。
+     *
+     * 与 checkAndGrant 的唯一区别是【不看 auto_grant 开关】：
+     * 关掉自动发放本来就是为了「由人确认」，这里就是那个确认动作。
+     * 其余（行锁、按各人门槛算、rewards_issued 幂等、券上定格门槛）
+     * 完全走同一条路 —— 两条路对同一件事必须给出同一个结果。
+     */
+    public function issuePending(int $memberId, array $operator = []): array
+    {
+        $tier = $this->tiers->forMember($memberId);
+        $r    = $this->rule($tier);
+        if (!$r['enabled']) {
+            return ['ok' => false, 'error' => 'reward_disabled'];
+        }
+
+        return $this->db->transaction(function () use ($memberId, $tier, $r, $operator): array {
+            $m = $this->members->lockById($memberId);
+            if ($m === null) {
+                return ['ok' => false, 'error' => 'member_not_found'];
+            }
+            $p = $this->progressOf($m, $tier);
+            if ($p['pending'] <= 0) {
+                return ['ok' => false, 'error' => 'nothing_pending'];
+            }
+
+            $out = [];
+            for ($i = 0; $i < $p['pending']; $i++) {
+                $out[] = $this->issue(
+                    $memberId,
+                    $r['mode'] === 'amount' ? self::SRC_AMOUNT : self::SRC_VISITS,
+                    $p['progress'],
+                    $r['valid_days'],
+                    null,
+                    $operator,
+                    $tier['code'] ?? null,
+                    $p['threshold']
+                );
+            }
+            $this->db->exec(
+                'UPDATE member SET rewards_issued = rewards_issued + ?, updated_at = ?
+                  WHERE store_code = ? AND id = ?',
+                [count($out), $this->db->now(), $this->storeCode, $memberId]
+            );
+            $this->audit->log('coupon_grant', [
+                'target_type'   => 'member', 'target_id' => (string)$memberId,
+                'operator_id'   => $operator['id']   ?? null,
+                'operator_name' => $operator['name'] ?? null,
+                'detail' => ['from' => 'pending_queue', 'count' => count($out),
+                             'progress' => $p['progress'], 'threshold' => $p['threshold'],
+                             'codes' => array_map(static fn(array $c): string => (string)$c['code'], $out)],
+            ]);
+            return ['ok' => true, 'granted' => count($out), 'coupons' => $out];
+        });
+    }
+
     public function pendingAcrossMembers(): int
     {
         $global = $this->rule(null);

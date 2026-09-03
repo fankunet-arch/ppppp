@@ -135,6 +135,11 @@ vip_no_store();
     <h3>奖励券</h3>
     <div id="coupon-rule" class="rule-banner"></div>
     <div id="coupon-stats" class="stats"></div>
+    <!--
+      「待发」队列 —— 关掉自动发放（影子模式，docs/13 §6）时经理在这里逐个确认。
+      自动发放开着时通常是空的；不空就说明有券该发没发出去，本身就该看一眼。
+    -->
+    <div id="coupon-pending"></div>
     <details class="add-box">
       <summary>手工发一张券（补偿 / 投诉处理）</summary>
       <div class="row">

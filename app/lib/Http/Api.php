@@ -67,6 +67,9 @@ final class Api
         'not_dine_in'            => '外带订单不参与积分',
         'free_meal'              => '该订单已标记为免费餐，不积分',
         'redeemed'               => '该订单已使用十送一核销，本餐不计次不积分',
+        // 「待发」队列的两条（后台，见 RewardService::issuePending）
+        'nothing_pending'        => '这位客人当前没有待发的券',
+        'reward_disabled'        => '奖励功能已关闭，发不了券',
         'bad_invoice'            => '小票号无效，请核对 Factura Simplificada',
         'pin_too_short'          => 'PIN 太短，至少 6 位',
         'pin_unchanged'          => '新 PIN 不能与旧 PIN 相同',
@@ -165,6 +168,8 @@ final class Api
         'not_dine_in'            => 'Los pedidos para llevar no acumulan puntos',
         'free_meal'              => 'Este ticket está marcado como comida gratuita, no acumula puntos',
         'redeemed'              => 'Este ticket ya se usó para canjear el 10+1: no cuenta visita ni puntos',
+        'nothing_pending'        => 'Este socio no tiene vales pendientes',
+        'reward_disabled'        => 'La función de recompensas está desactivada',
         'bad_invoice'            => 'Número de ticket no válido, compruebe la Factura Simplificada',
         'pin_too_short'          => 'El PIN es demasiado corto, mínimo 6 dígitos',
         'pin_unchanged'          => 'El PIN nuevo no puede ser igual al anterior',

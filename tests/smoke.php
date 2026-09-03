@@ -4528,6 +4528,143 @@ $fxDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$fxI
 $fxDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$fxIds})", [SMOKE_STORE]);
 $fxDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '44000000%'", [SMOKE_STORE]);
 
+step('㊽ 餐期空档 / 手工录入 / 待发队列 / 中途核销（审计 F6–F9）');
+
+$pxApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$pxDb  = $pxApp->localDb();
+$pxOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+
+// ── F6：餐期之间的空档不能把一整天塌成一顿 ──────────────────
+/**
+ * 出厂餐期 11:00–18:00 与 19:30–02:00，中间 18:00–19:30 是空档。
+ * 原来「落在空档」退回按营业日比 —— 中午 13:00 那顿和傍晚 19:00 那顿
+ * 被判成同一顿，客人第二次白来。
+ * 但一律判「不是同一顿」也不行：18:10 和 19:20 都在同一个空档里。
+ * 所以空档也编格子。这一组用的是纯函数，不落库、不看当前时钟。
+ */
+$pxMp = $pxApp->mealPeriods();
+$pxBd = $pxApp->businessDay();
+$pxD  = date('Y-m-d');
+$pxD1 = date('Y-m-d', strtotime($pxD . ' +1 day'));
+ok(count($pxMp->all()) >= 2, 'F6 前提：配了至少两个餐期（' . count($pxMp->all()) . ' 个）');
+ok($pxMp->sameSitting("{$pxD} 13:00:00", "{$pxD} 13:40:00", $pxBd),
+   '  └ 午市两单 = 同一顿');
+ok(!$pxMp->sameSitting("{$pxD} 13:00:00", "{$pxD} 19:00:00", $pxBd),
+   '★★★ F6 午市 13:00 与空档里的 19:00【不是同一顿】—— 原来退回按营业日比，'
+ . '判成同一顿，客人傍晚这一趟一次都记不上，而 18:00–19:30 这个空档是店家自己配出来的');
+ok($pxMp->sameSitting("{$pxD} 18:10:00", "{$pxD} 19:20:00", $pxBd),
+   '★★ 但同一个空档里的两单仍算同一顿 —— 一律判「不同顿」会开一个重复计次的口子');
+ok(!$pxMp->sameSitting("{$pxD} 19:00:00", "{$pxD} 20:00:00", $pxBd),
+   '  └ 空档与晚市也不是同一顿');
+ok($pxMp->sameSitting("{$pxD} 21:00:00", "{$pxD1} 00:30:00", $pxBd),
+   '  └ 晚市跨零点仍是同一顿（营业日 02:00 才翻页）');
+ok($pxMp->couldBeSameSitting("{$pxD} 19:29:00", "{$pxD} 19:31:00", $pxBd),
+   '★★ 合并口径更宽：19:29 那桌（空档）与 19:31 那桌（晚市）放行 —— '
+ . '按风控那个严口径会把同行分桌硬拆开，而挡「捡小票」的承重墙是 merge_span_minutes');
+
+// ── F7：手工录入也要查一次达标 ───────────────────────────
+$pxCfg0 = [];
+foreach (['reward_mode' => 'amount', 'reward_threshold_amount' => '60.00',
+          'reward_enabled' => '1', 'reward_auto_grant' => '1',
+          'manual_entry_enabled' => '1', 'manual_entry_min' => '1.00',
+          'manual_entry_daily_cap' => '1000.00'] as $k => $v) {
+    $pxCfg0[$k] = $pxApp->cfg()->get($k, '');
+    $pxApp->cfg()->set($k, $v);
+}
+$px7 = (int)$pxApp->members()->create('TK-00046001-PXA', null, null, null)['id'];
+$px7r = $pxApp->points()->manualGrant($px7, 7000, 'system_not_found',
+    ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'approved_by' => 1]);
+ok($px7r['ok'] ?? false, 'F7 手工录入 € 70.00 成功');
+$px7g = $pxApp->rewards()->checkAndGrant($px7, ['id' => 1, 'name' => '冒烟']);
+eq(1, (int)$px7g['granted'],
+   '★★★ F7 手工录入跨过门槛后【拿得到券】—— manualGrant 会把 total_spent 加上去，'
+ . '却从来没调过 checkAndGrant，于是客人站在柜台前等着的那张券不发；'
+ . '而手工录入正是 POS 查不到单时的降级路径，出岔子的当天最容易走到它');
+ok((int)$pxDb->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=?',
+                     [SMOKE_STORE, 'reward_from_manual_entry']) > 0,
+   '  └ 同时留下 reward_from_manual_entry 告警（这条护栏本来就是为这条路写的，之前根本没被触发过）');
+
+// ── F8：影子模式的「待发」队列 ────────────────────────────
+$pxApp->cfg()->set('reward_mode', 'visits');
+$pxApp->cfg()->set('reward_auto_grant', '0');
+$px8thr = $pxApp->cfg()->get('reward_threshold_visits', '10');
+$pxApp->cfg()->set('reward_threshold_visits', '3');
+$px8a = (int)$pxApp->members()->create('TK-00046002-PXB', null, null, null)['id'];
+$px8b = (int)$pxApp->members()->create('TK-00046003-PXC', null, null, null)['id'];
+$pxDb->exec('UPDATE member SET visit_count=7, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $px8a]);
+$pxDb->exec('UPDATE member SET visit_count=3, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $px8b]);
+$px8g = $pxApp->rewards()->checkAndGrant($px8a, ['id' => 1, 'name' => '冒烟']);
+eq(0, (int)$px8g['granted'], 'F8 关掉自动发放后不自动发');
+eq(2, (int)$px8g['pending'], '  └ 但报出欠 2 张');
+$px8list = $pxApp->rewards()->pendingList();
+$px8mine = array_values(array_filter($px8list,
+    static fn(array $r): bool => in_array($r['member_id'], [$px8a, $px8b], true)));
+eq(2, count($px8mine),
+   '★★★ F8 「待发」队列列得出【名单】—— docs/13 §6 建议上线首月关掉自动发放、'
+ . '由经理逐位确认，而后台原来只有一个总数没有名单，经理看得到「欠 N 张」却查不出是谁，'
+ . '那条上线建议实际上执行不了');
+$px8by = array_column($px8mine, 'pending', 'member_id');
+eq(2, (int)($px8by[$px8a] ?? 0), '  └ 名单里带着各自的欠数：7 次 / 门槛 3 → 欠 2 张');
+eq(1, (int)($px8by[$px8b] ?? 0), '  └ 3 次 / 门槛 3 → 欠 1 张');
+eq(array_sum(array_column($pxApp->rewards()->pendingList(500), 'pending')),
+   (int)$pxApp->rewards()->pendingAcrossMembers(),
+   '★★ 名单合计 == pendingAcrossMembers() —— 两处必须同一套算法，'
+ . '否则「总数 7、名单 5 行」谁也不敢信，而后台护栏正是拿那个总数在报警');
+$px8i = $pxApp->rewards()->issuePending($px8a, ['id' => 1, 'name' => '冒烟']);
+ok($px8i['ok'] ?? false, '  └ 经理确认后发得出来（issuePending 不看 auto_grant —— 关掉它就是为了由人确认）');
+eq(2, (int)$px8i['granted'], '  └ 一次把欠的 2 张都发了');
+eq('nothing_pending', $pxApp->rewards()->issuePending($px8a, ['id' => 1, 'name' => '冒烟'])['error'] ?? '',
+   '★★ 再点一次不会重复发 —— 幂等仍然靠 rewards_issued，与自动那条路同一套');
+$pxApp->cfg()->set('reward_auto_grant', '1');
+
+// ── F9：中途核销把同桌的客人挤出这张单 ─────────────────────
+$px9Pos = new FakePosSource();
+$px9Pos->now = date('Y-m-d H:i:s');
+$px9Pos->addHead(['serial_id' => '4600000004', 'order_head_id' => 460004, 'check_id' => 1,
+    'table_name' => 'PX9', 'eat_type' => 0, 'customer_num' => 4,
+    'original_amount' => '95.60', 'should_amount' => '95.60', 'actual_amount' => '95.60',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($px9Pos->now) - 600)]);
+$px9Pos->addDetail(460004, 1,
+    [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '95.60', 4)]);
+$pxApp->setPosSource($px9Pos);
+$pxApp->cfg()->set('free_meal_extra_earns', '1');
+$pxApp->points()->locate('PX9', 3600);
+
+$px9 = [];
+foreach (range(1, 4) as $i) {
+    $px9[] = (int)$pxApp->members()->create(sprintf('TK-0004601%d-PX%d', $i, $i), null, null, null)['id'];
+}
+$pxDb->exec('UPDATE member SET visit_count=3, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $px9[0]]);
+$pxApp->rewards()->checkAndGrant($px9[0], ['id' => 1, 'name' => '冒烟']);
+$px9c = (int)$pxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                            ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $px9[0]]);
+// 服务员已经按 AA 排好 4 位，其中一位当场掏出券核销
+$pxApp->rewards()->redeem($px9c, '4600000004', $pxOp, null, ['reason' => '冒烟']);
+eq(3, (int)$pxDb->value('SELECT portions_counted FROM pos_order WHERE store_code=? AND serial_id=?',
+                        [SMOKE_STORE, '4600000004']),
+   'F9 核销后订单净份数减到 3');
+$px9sp = Vip\PointsEngine::splitEvenly(9560, 3, 4);
+$px9al = [];
+foreach ($px9 as $i => $id) { $px9al[] = ['member_id' => $id] + $px9sp[$i]; }
+$px9r = $pxApp->points()->grant('4600000004', $px9al, Vip\PointsEngine::MODE_SPLIT, $pxOp);
+ok($px9r['ok'] ?? false,
+   '★★★ F9 4 位一起提交仍然通得过 —— 座位数原来直接取净份数（3），'
+ . '中途核销一下就把第 4 位挤出去，提示「付费套餐份数不够记这么多位客人」，'
+ . '与实情无关也不告诉收银员该怎么办，而客人们就站在柜台前'
+ . ($px9r['ok'] ?? false ? '' : '：' . ($px9r['error'] ?? '?')));
+eq(4, count($px9r['entries'] ?? []), '  └ 四位都记上了（用券那位 0 元 0 份，仍然在这张单上）');
+
+$pxApp->cfg()->set('reward_threshold_visits', (string)$px8thr);
+foreach ($pxCfg0 as $k => $v) { $pxApp->cfg()->set($k, $v); }
+$pxIds = implode(',', array_merge([$px7, $px8a, $px8b], $px9));
+$pxDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$pxIds})", [SMOKE_STORE]);
+$pxDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$pxIds})", [SMOKE_STORE]);
+$pxDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pxIds})", [SMOKE_STORE]);
+$pxDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '46000000%'", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

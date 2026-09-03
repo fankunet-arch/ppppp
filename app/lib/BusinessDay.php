@@ -156,4 +156,10 @@ final class BusinessDay
     {
         return $this->of(date('Y-m-d H:i:s'));
     }
+
+    /** 切点本身（'HH:MM'）。MealPeriod 要拿它把一天摊成一条不跨零点的轴 */
+    public function cutoff(): string
+    {
+        return $this->cutoff;
+    }
 }

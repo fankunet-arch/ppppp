@@ -92,14 +92,103 @@ final class MealPeriod
      */
     public function sameSitting(string $endA, string $endB, BusinessDay $bd): bool
     {
+        if ($bd->of($endA) !== $bd->of($endB)) {
+            return false;   // 不同营业日一定不是同一顿，配没配餐期都成立
+        }
+        if ($this->all() === []) {
+            // 压根没配餐期：只剩营业日这一个口径
+            return true;
+        }
+        return $this->bucketOf($endA, $bd) === $this->bucketOf($endB, $bd);
+    }
+
+    /**
+     * 合并口径 —— 比风控口径宽：只有【明确分属两个不同餐期】才算不同顿。
+     *
+     * ── 🔴 为什么不能和风控用同一个判据 ────────────────────
+     *
+     * 两者方向相反：
+     *   风控：判成同一顿 = 【不给】计次 → 拿不准时要放宽（判不同顿）
+     *   合并：判成同一顿 = 【允许】合并 → 拿不准时也要放宽（判同一顿）
+     *
+     * 同行分桌的两桌，一桌 19:29 结账（落在 18:00–19:30 空档）、
+     * 一桌 19:31 结账（晚市）—— 按风控那个严格口径是两格，合并会被拒，
+     * 而客人们正站在柜台前等着把三桌的分记到一张卡上。
+     *
+     * 挡「攒一把小票一起来兑」的承重墙是 merge_span_minutes（出厂 60 分钟），
+     * 不是这一条：真正的午晚两餐至少隔着 90 分钟的空档，跨度那一关就过不去。
+     */
+    public function couldBeSameSitting(string $endA, string $endB, BusinessDay $bd): bool
+    {
+        if ($bd->of($endA) !== $bd->of($endB)) {
+            return false;
+        }
         $pa = $this->of($endA);
         $pb = $this->of($endB);
-        if ($pa === null || $pb === null) {
-            // 没配餐期时退回「同一营业日」这个更粗的口径，而不是一律判否 ——
-            // 判否会让合并功能在没配餐期的店里完全不能用
-            return $bd->of($endA) === $bd->of($endB);
+        // 有一方落在空档里 → 判不出，交给跨度那一关
+        return $pa === null || $pb === null || $pa['id'] === $pb['id'];
+    }
+
+    /**
+     * 这个时刻落在「哪一格」里 —— 餐期是格子，餐期之间的空档也是格子。
+     *
+     * ── 🔴 为什么空档也要有自己的格子 ──────────────────────
+     *
+     * 出厂餐期 11:00–18:00 与 19:30–02:00，中间 18:00–19:30 是空档。
+     * 原来「落在空档」和「落在另一个餐期」被当成同一件事处理（退回
+     * 按营业日比），于是中午 13:00 那顿和傍晚 19:00 那顿被判成同一顿，
+     * 客人第二次白来。
+     *
+     * 但反过来一律判「不是同一顿」也不行：18:10 和 19:20 都在同一个空档里，
+     * 那显然是同一顿饭的两张单，放行等于开了个重复计次的口子。
+     * 店家只配一个餐期时这个口子还会变得很大。
+     *
+     * 所以给空档也编上格子：同一个空档里的两笔算同一顿，
+     * 跨格子的（餐期↔空档、空档↔另一个空档）算不同顿。
+     *
+     * ── 怎么摊平跨零点 ──────────────────────────────────
+     *
+     * 以【营业日切点】为原点把一天拉成一条 0–1440 的直线：
+     * 切点 02:00 时，晚市 19:30–02:00 变成 [1050, 1440)，
+     * 午市 11:00–18:00 变成 [540, 960)，两个空档是 [0,540) 与 [960,1050)。
+     * 这条轴上没有跨零点，也就没有「00:30 算哪天」的歧义 ——
+     * 那件事已经由外层的营业日比较管掉了。
+     *
+     * @return string 稳定的格子标识（'p:<餐期id>' 或 'gap:<起>-<止>'）
+     */
+    private function bucketOf(string $endTime, BusinessDay $bd): string
+    {
+        $hm = self::minutes(substr($endTime, 11, 5));
+        if ($hm === null) {
+            return 'bad';
         }
-        return $pa['id'] === $pb['id'] && $bd->of($endA) === $bd->of($endB);
+        foreach ($this->all() as $p) {
+            if (self::covers($p, $hm)) {
+                return 'p:' . $p['id'];
+            }
+        }
+
+        // 落在空档里 —— 找出它两侧的边界，同一个空档的两笔会得到同一对边界
+        $cut  = self::minutes(substr($bd->cutoff() . ':00', 0, 5)) ?? 120;
+        $axis = static fn(int $m): int => ($m - $cut + 1440) % 1440;
+
+        $lo = 0; $hi = 1440;                       // 空档在轴上的 [起, 止)
+        $x  = $axis($hm);
+        foreach ($this->all() as $p) {
+            $s = self::minutes($p['start']);
+            $e = self::minutes($p['end']);
+            if ($s === null || $e === null) {
+                continue;
+            }
+            $ps = $axis($s);
+            $pe = $axis($e);
+            if ($pe <= $ps) {
+                $pe += 1440;                       // 餐期在轴上恰好收尾于终点
+            }
+            if ($pe <= $x && $pe > $lo) { $lo = $pe; }   // 最近的左边界
+            if ($ps >  $x && $ps < $hi) { $hi = $ps; }   // 最近的右边界
+        }
+        return 'gap:' . $lo . '-' . $hi;
     }
 
     /** 'HH:MM' → 当天第几分钟；格式不对返回 null */

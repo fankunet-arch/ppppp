@@ -648,7 +648,27 @@ final class PointsService
              *   Pad 上「+ 添加会员」按钮到数就变灰、AA 人数框也封了顶，
              *   但那是给正常操作省事的；这一层才是真的锁。
              */
-            $seatCap = max(1, $totalPort);
+            /**
+             * ── 🔴 用券吃的那几位也要留座（审计 F9） ────────────────
+             *
+             * portions_counted 是【净】份数：券抵掉的那几份已经被扣掉了。
+             * 拿它直接当座位数，会把「用券的那位客人」挤出这张单：
+             *
+             *   4 人桌，服务员按 AA 排好 4 位 → 其中一位当场核销了一张券
+             *   → markRedeemedByApp 把净份数减到 3
+             *   → 提交时 4 > 3 → too_many_members，整笔被拒
+             *   而客人们就站在柜台前，收银员看到的提示是
+             *   「这张单的付费套餐份数不够记这么多位客人」—— 与实情无关，
+             *   也不告诉他该怎么办。
+             *
+             * 券本身就是「这个人在这儿吃了饭」最硬的凭据，比份数还硬。
+             * 所以座位数要把券抵掉的份数加回来。
+             *
+             * ★ 只加回座位，不加回可分金额与可计次份数 —— 那两样仍然按净额走，
+             *   用券那位照样是 0 元 0 次（免费餐不攒进度，见 §6）。
+             *   这里放开的只是「他有没有资格出现在这张单上」。
+             */
+            $seatCap = max(1, $totalPort + $this->orders->appRedeemedCount($serialId));
             $seats   = $already;
             foreach ($allocations as $a) {
                 $seats[(int)($a['member_id'] ?? 0)] = true;
@@ -1135,7 +1155,15 @@ final class PointsService
         }
         $ref = reset($times);
         foreach ($times as $sid => $t) {
-            if (!$this->periods->sameSitting($t, $ref, $this->bizDay)) {
+            /**
+             * ★ 合并用的是【更宽的】那个口径（couldBeSameSitting，见 F6 的说明）。
+             *
+             *   有一桌落在餐期空档里（比如 19:29 那桌）就放行 ——
+             *   按风控那个严格口径拦下来，等于把同行分桌的两桌硬拆开，
+             *   而客人正站在柜台前。捡小票那一类由下面的
+             *   merge_span_minutes（出厂 60 分钟）挡，那才是承重墙。
+             */
+            if (!$this->periods->couldBeSameSitting($t, $ref, $this->bizDay)) {
                 return ['ok' => false, 'error' => 'merge_not_same_sitting',
                         'detail' => ['serial_id' => $sid]];
             }
