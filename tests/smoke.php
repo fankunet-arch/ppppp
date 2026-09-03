@@ -4312,6 +4312,222 @@ $rzDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$rzI
 $rzDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$rzIds})", [SMOKE_STORE]);
 $rzDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '4343%'", [SMOKE_STORE]);
 
+step('㊼ 两次操作【之间】才发作的那一类（审计 F1–F5）');
+
+/**
+ * ── 🔴 为什么单独开一段 ────────────────────────────────────
+ *
+ * 上面 630 多条断言全绿的同时，审计仍然查出 5 条 P0。原因不是漏测了
+ * 某个场景，而是【测法本身有盲区】：既有断言几乎都在「一次操作之内」
+ * 验结果 —— 记一笔、看看对不对；退一笔、看看退干净没有。
+ *
+ * 而这 5 条错在【两次操作之间】：
+ *   · 再查一次单（locate 把比对基准冲掉了）
+ *   · 隔一天（值比对这辈子只跑一次）
+ *   · 换个口径（改 reward_mode 之后拿旧券的进度跟新进度比）
+ *   · 颠倒顺序（先记账后核销，而不是先核销后记账）
+ *   · 换个时钟（营业日 02:00 翻页，日历日 00:00 翻页）
+ *
+ * 所以这一段的每一条都【至少做两件事，中间插一件别的】。
+ */
+$fxApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$fxDb  = $fxApp->localDb();
+$fxOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$fxCfg0 = [];
+foreach (['late_grant_minutes' => '0', 'max_grants_per_period' => '0',
+          'visit_count_mode' => 'by_order', 'points_mode' => 'by_amount',
+          'points_per_euro' => '1.0', 'min_amount_per_visit' => '0',
+          'free_meal_extra_earns' => '0', 'reward_enabled' => '1',
+          'reward_mode' => 'visits', 'reward_threshold_visits' => '3',
+          'reward_auto_grant' => '1', 'verify_protect_days' => '30',
+          'verify_recheck_hours' => '168',
+          'business_day_cutoff' => '02:00'] as $k => $v) {
+    $fxCfg0[$k] = $fxApp->cfg()->get($k, '');
+    $fxApp->cfg()->set($k, $v);
+}
+
+/** 造一张 POS 单 */
+$fxMkPos = function (array $specs) use (&$fxApp): FakePosSource {
+    $pos = new FakePosSource();
+    $pos->now = date('Y-m-d H:i:s');
+    foreach ($specs as $sp) {
+        $pos->addHead([
+            'serial_id' => $sp['ser'], 'order_head_id' => $sp['oh'], 'check_id' => 1,
+            'table_name' => $sp['tbl'], 'eat_type' => 0, 'customer_num' => 2,
+            'original_amount' => $sp['amt'], 'should_amount' => $sp['amt'],
+            'actual_amount' => $sp['amt'],
+            'order_end_time' => date('Y-m-d H:i:s', strtotime($pos->now) - 600),
+        ]);
+        $pos->addDetail($sp['oh'], 1,
+            [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', $sp['amt'], $sp['qty'])]);
+    }
+    return $pos;
+};
+$fxSetAmt = function (FakePosSource $pos, string $ser, string $amt): void {
+    foreach ($pos->heads as $i => $h) {
+        if ($h['serial_id'] === $ser) {
+            $pos->heads[$i]['original_amount'] = $amt;
+            $pos->heads[$i]['should_amount']   = $amt;
+            $pos->heads[$i]['actual_amount']   = $amt;
+        }
+    }
+};
+/** 把时钟往前推 N 天（只动 last_verified_at，模拟「下一轮复查」） */
+$fxAge = function (string $ser, int $days) use ($fxDb): void {
+    $fxDb->exec('UPDATE pos_order SET last_verified_at = DATE_SUB(NOW(), INTERVAL ? DAY)
+                  WHERE store_code = ? AND serial_id = ?', [$days, SMOKE_STORE, $ser]);
+};
+
+// ── F1：保护期内要【反复】比对，不是一生只比一次 ───────────────
+$f1Pos = $fxMkPos([['ser' => '4400000001', 'oh' => 440001, 'tbl' => 'FX1', 'amt' => '50.00', 'qty' => 2]]);
+$fxApp->setPosSource($f1Pos);
+$fxApp->points()->locate('FX1', 3600);
+$f1M = (int)$fxApp->members()->create('TK-00044001-FXA', null, null, null)['id'];
+$fxApp->points()->grant('4400000001',
+    [['member_id' => $f1M, 'amount_cents' => 5000, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $fxOp);
+$f1R1 = $fxApp->reconcile()->verifyAmounts();
+ok((int)$f1R1['checked'] >= 1, 'F1 第 1 晚比对到这一单');
+eq(1, (int)$fxDb->value('SELECT verify_status FROM pos_order WHERE store_code=? AND serial_id=?',
+                        [SMOKE_STORE, '4400000001']),
+   '  └ 金额没变，判一致（verify_status=1）');
+
+// 第 2 天 POS 上把这单改小 —— 实测 2.9% 的订单在结账之后被改过
+$fxSetAmt($f1Pos, '4400000001', '10.00');
+$fxAge('4400000001', 8);                      // 复查间隔 168 小时后
+$f1R2 = $fxApp->reconcile()->verifyAmounts();
+ok((int)$f1R2['checked'] >= 1,
+   '★★★ F1 判过「一致」的单【还会再比】—— 原来 pendingVerify 只取 verify_status=0，'
+ . '而全仓库没有一处把它改回 0，等于每张单一生只比一次，这条防线整条是空的');
+eq(1, (int)$f1R2['changed'], '  └ 抓到了改单');
+eq(10, (int)$fxApp->members()->findById($f1M)['points_balance'],
+   '  └ 积分从 50 退到 10（原来一分都不退）');
+
+// ── F2：再 locate 一次就把比对基准冲掉了 ──────────────────────
+$f2Pos = $fxMkPos([['ser' => '4400000002', 'oh' => 440002, 'tbl' => 'FX2', 'amt' => '71.70', 'qty' => 3]]);
+$fxApp->setPosSource($f2Pos);
+$fxApp->points()->locate('FX2', 3600);
+$f2M = (int)$fxApp->members()->create('TK-00044002-FXB', null, null, null)['id'];
+$fxApp->points()->grant('4400000002',
+    [['member_id' => $f2M, 'amount_cents' => 7170, 'portions' => 3]],
+    Vip\PointsEngine::MODE_SPLIT, $fxOp);
+$fxSetAmt($f2Pos, '4400000002', '0.00');
+// ★ 关键的那「一件别的事」：收银员为同桌下一位客人再查一次单。
+//   每天都在发生，而它会把 should/actual/total 三列全刷成 POS 的新值。
+$fxApp->points()->locate('FX2', 3600);
+$f2R = $fxApp->reconcile()->verifyAmounts();
+eq(1, (int)$f2R['changed'],
+   '★★★ F2 发分后再 locate 一次，值比对照样抓得到 —— 基准存在 verify_base_*，'
+ . '不再是被 locate/同步反复重写的 should/actual/total');
+eq(0, (int)$fxApp->members()->findById($f2M)['points_balance'], '  └ 整单归零，分退干净');
+$f2O = $fxDb->one('SELECT total_amount, allocated_amount, verify_base_at
+                     FROM pos_order WHERE store_code = ? AND serial_id = ?',
+                  [SMOKE_STORE, '4400000002']);
+ok((float)$f2O['allocated_amount'] <= (float)$f2O['total_amount'],
+   '★★★ 「已分配额 ≤ 可积分总额」这条不变量没被破 —— 修之前是 71.70 挂在一张 0 元的单上');
+ok($f2O['verify_base_at'] !== null, '  └ 基准已定格（verify_base_at 非空）');
+
+// 基准列不会被 locate / 同步覆盖 —— 这一条直接钉住 upsert 的列清单
+$f2Base = $fxDb->value('SELECT verify_base_should FROM pos_order WHERE store_code=? AND serial_id=?',
+                       [SMOKE_STORE, '4400000001']);
+$fxApp->points()->locate('FX1', 3600);
+eq($f2Base,
+   $fxDb->value('SELECT verify_base_should FROM pos_order WHERE store_code=? AND serial_id=?',
+                [SMOKE_STORE, '4400000001']),
+   '★★ 再 locate 一次，verify_base_should 纹丝不动（它不在 upsert 的列清单里）');
+
+// ── F3：换发券口径之后撤销，把客人手上的老券全作废 ────────────
+$fxApp->cfg()->set('reward_mode', 'amount');
+$fxApp->cfg()->set('reward_threshold_amount', '60.00');
+$f3M = (int)$fxApp->members()->create('TK-00044003-FXC', null, null, null)['id'];
+$fxDb->exec('UPDATE member SET total_spent = 180.00, rewards_issued = 0
+              WHERE store_code = ? AND id = ?', [SMOKE_STORE, $f3M]);
+$fxApp->rewards()->checkAndGrant($f3M, $fxOp);
+$f3N = (int)$fxDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                         [SMOKE_STORE, $f3M]);
+eq(3, $f3N, 'F3 按金额口径发出 3 张券（进度定格成 18000 分）');
+
+// 店家改口径：改成按次数。老券的 progress_at_grant 还是 18000，新进度是 0 次。
+$fxApp->cfg()->set('reward_mode', 'visits');
+$fxApp->rewards()->clawBackOverIssued($f3M, $fxOp, '冒烟：换口径后的一次撤销');
+eq(3, (int)$fxDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                        [SMOKE_STORE, $f3M]),
+   '★★★ F3 换口径后撤销，客人手上 3 张券【一张都没少】—— 原来 18000 > 0 恒成立，'
+ . '一次撤销就把老券全作废，客人拿来吃饭被告知「无效」，店里查不出原因');
+$fxApp->cfg()->set('reward_mode', 'visits');
+$fxApp->cfg()->set('reward_threshold_visits', '3');
+
+// ── F4：先记账、后核销 → 免费那一餐又攒一次 ────────────────────
+$f4Pos = $fxMkPos([['ser' => '4400000004', 'oh' => 440004, 'tbl' => 'FX4', 'amt' => '23.90', 'qty' => 1]]);
+$fxApp->setPosSource($f4Pos);
+$fxApp->points()->locate('FX4', 3600);
+$f4M = (int)$fxApp->members()->create('TK-00044004-FXD', null, null, null)['id'];
+$fxDb->exec('UPDATE member SET visit_count = 3, rewards_issued = 0
+              WHERE store_code = ? AND id = ?', [SMOKE_STORE, $f4M]);
+$fxApp->rewards()->checkAndGrant($f4M, $fxOp);
+$f4C = (int)$fxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                           ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $f4M]);
+ok($f4C > 0, 'F4 满 3 次发出 1 张券');
+// 前台的真实顺序：先按 AA 把这桌记完，客人才想起来「我有张券」
+$fxApp->points()->grant('4400000004',
+    [['member_id' => $f4M, 'amount_cents' => 2390, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $fxOp);
+eq(4, (int)$fxApp->members()->findById($f4M)['visit_count'], '  └ 记完账计次 4');
+$f4R = $fxApp->rewards()->redeem($f4C, '4400000004', $fxOp, null, ['reason' => '冒烟']);
+ok($f4R['ok'], '  └ 核销成功');
+eq(3, (int)$fxApp->members()->findById($f4M)['visit_count'],
+   '★★★ F4 记完账才核销，那一次【退回来了】—— 原来停在 4，'
+ . '免费餐自己在攒下一顿免费餐，而 redeem_unflagged 告警抓不到（订单确实标了核销）');
+eq(1, (int)$f4R['visits_clawed_back'], '  └ 退了 1 次，且流水里如实记着');
+eq(-1, (int)$fxDb->value('SELECT COALESCE(SUM(counted_visit),0) FROM point_ledger
+                           WHERE store_code=? AND serial_id=? AND entry_type=?',
+                         [SMOKE_STORE, '4400000004', Vip\Repo\LedgerRepo::T_REVERSE]),
+   '  └ 是另插一条负数流水，不是偷偷改 member 表');
+// 幂等：同一单再核销一张券，不能把同一次再退一遍
+$fxDb->exec('UPDATE member SET visit_count = 6, rewards_issued = 0
+              WHERE store_code = ? AND id = ?', [SMOKE_STORE, $f4M]);
+$fxApp->rewards()->checkAndGrant($f4M, $fxOp);
+$f4C2 = (int)$fxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                            ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $f4M]);
+$f4V0 = (int)$fxApp->members()->findById($f4M)['visit_count'];
+$fxApp->rewards()->redeem($f4C2, '4400000004', $fxOp, null, ['reason' => '冒烟']);
+eq($f4V0, (int)$fxApp->members()->findById($f4M)['visit_count'],
+   '★★ 同一单再核销一张券，次数【不再动】—— 判据是「这位客人在这一单上现存的净次数」，'
+ . '不是原流水上那个数，否则会把同一次退两遍、把客人扣穿');
+
+// ── F5：券与卡按【营业日】判过期，不是日历日 ───────────────────
+// 用切点模拟：把切点设成晚于「此刻」，营业日就退到昨天 ——
+// 与真实的「晚市 00:30、切点 02:00」完全同构。
+$fxApp->cfg()->set('business_day_cutoff', date('H:i', strtotime('+2 hours')));
+// ★ 换过配置就得像真实请求那样重新装配一次 —— App::businessDay() 是 once() 缓存的。
+//   （RewardService 那一侧不缓存实例，故意的，见 todayBiz() 的说明。）
+$f5App = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$f5Y = date('Y-m-d', strtotime('-1 day'));
+eq($f5Y, $f5App->businessDay()->today(), 'F5 切点前：营业日仍是昨天（日历日已经是今天了）');
+
+$f5M = (int)$f5App->members()->create('TK-00044005-FXE', null, null, null)['id'];
+$fxDb->exec('UPDATE member SET visit_count = 3, rewards_issued = 0
+              WHERE store_code = ? AND id = ?', [SMOKE_STORE, $f5M]);
+$f5App->rewards()->checkAndGrant($f5M, $fxOp);
+$f5C = (int)$fxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                           ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $f5M]);
+$fxDb->exec('UPDATE coupon SET valid_to = ? WHERE id = ?', [$f5Y, $f5C]);
+eq(0, $f5App->rewards()->expireStale(),
+   '★★★ F5 有效期 = 当前营业日的券，expireStale 不能把它扫死 —— 原来用 date(\'Y-m-d\')，'
+ . '半夜那一轮会把「今天到期」的券整批判成过期，客人第二天中午拿来已经没了');
+$f5R = $f5App->rewards()->redeem($f5C, null, $fxOp, null, ['reason' => '冒烟']);
+ok($f5R['ok'], '  └ 而且核销得掉（原来当场返回 coupon_expired，并把券【写库】置成已过期，再也回不来）');
+ok(!Vip\Repo\CardRepo::isExpired(['valid_to' => $f5Y]),
+   '★★ 实体卡同理 —— 卡面印着 12-31，客人跨年夜 00:30 还坐在桌上，卡不能在他面前作废');
+$fxApp->cfg()->set('business_day_cutoff', '02:00');
+
+foreach ($fxCfg0 as $k => $v) { $fxApp->cfg()->set($k, $v); }
+$fxIds = implode(',', [$f1M, $f2M, $f3M, $f4M, $f5M]);
+$fxDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$fxIds})", [SMOKE_STORE]);
+$fxDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$fxIds})", [SMOKE_STORE]);
+$fxDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$fxIds})", [SMOKE_STORE]);
+$fxDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '44000000%'", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

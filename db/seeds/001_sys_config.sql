@@ -58,6 +58,9 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 意味着漏掉一天也能自动补齐。
 (@store,'verify_protect_days','30',@now),
   -- 值比对保护期
+  -- 保护期内同一张单多久复查一次。只比一次的话，POS 结账之后改的那 2.9%
+  -- 永远抓不到（审计 F1）。7 天一轮：稳态每晚约 500 单，只回读金额不读明细。
+(@store,'verify_recheck_hours','168',@now),
 (@store,'sync_batch_size','100',@now),
   -- 每批 LIMIT，铁律上限 100
 (@store,'sync_batch_sleep_ms','2000',@now),

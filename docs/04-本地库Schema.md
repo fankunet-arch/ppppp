@@ -53,12 +53,26 @@ CREATE TABLE `pos_order` (
   `verify_status`     TINYINT      NOT NULL DEFAULT 0 COMMENT '0=保护期内 1=已核对一致 2=已冲正 3=待人工复核',
   `last_verified_at`  DATETIME     DEFAULT NULL       COMMENT '最近一次值比对时间',
 
+  -- ★ 值比对的【基准】必须有自己的列（015）。
+  --   should/actual/total 那三列是「主库当前值的镜像」，
+  --   buildContext（收银员每次 locate）和 storeOrder（每轮同步）都在刷它们；
+  --   拿它们当基准就是拿新值跟新值比，永远判「一致」——
+  --   实测 71.70 的单发满分、POS 改成 0.00、再 locate 一次，
+  --   值比对 changed=0，积分照旧，镜像变成 total=0.00 / allocated=71.70。
+  --   下面这三列【只有发分与冲正两条路会写】，同步与 locate 碰不到。
+  `verify_base_should` DECIMAL(11,2) DEFAULT NULL COMMENT '发分时刻的应收额；值比对基准，同步/locate 不得覆盖',
+  `verify_base_actual` DECIMAL(11,2) DEFAULT NULL COMMENT '发分时刻的收款额；同上',
+  `verify_base_at`     DATETIME      DEFAULT NULL COMMENT '基准定格于何时；NULL=还没发过分',
+
   `created_at`        DATETIME     NOT NULL,
   `updated_at`        DATETIME     NOT NULL,
 
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_business` (`store_code`,`serial_id`),          -- ★ 幂等主键
   KEY `idx_verify`  (`verify_status`,`order_end_time`),          -- 值比对任务扫描
+  -- 值比对在保护期内要【反复跑】（015）：判据是 last_verified_at 够久没动过，
+  -- 不是 verify_status = 0。只比一次的话，POS 结账后才改的那 2.9% 永远抓不到。
+  KEY `idx_recheck` (`store_code`,`last_verified_at`),
   KEY `idx_table`   (`store_code`,`table_name`,`order_end_time`),
   KEY `idx_bizdate` (`store_code`,`business_date`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

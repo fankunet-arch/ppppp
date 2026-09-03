@@ -140,7 +140,7 @@ final class CardRepo
             if ($d === false || $d->format('Y-m-d') !== $validTo) {
                 throw new \InvalidArgumentException('有效期格式应为 YYYY-MM-DD');
             }
-            if ($d->format('Y-m-d') <= date('Y-m-d')) {
+            if ($d->format('Y-m-d') <= \Vip\BusinessDay::todayDefault()) {
                 // 印一批一发就过期的卡，只会在柜台上制造混乱
                 throw new \InvalidArgumentException('有效期必须晚于今天');
             }
@@ -250,11 +250,18 @@ final class CardRepo
 
     // ── 有效期 ──────────────────────────────────────────────
 
-    /** 该卡是否已过有效期（valid_to 为空视为不设有效期） */
+    /**
+     * 该卡是否已过有效期（valid_to 为空视为不设有效期）。
+     *
+     * ★ 默认的「今天」是【营业日】的今天，不是 date('Y-m-d')。
+     *   卡面印着 2027-12-31，客人跨年夜 00:30 还坐在桌上 ——
+     *   那一餐属于 12-31 这个营业日，卡不能在他面前当场作废。
+     *   （同一口径见 BusinessDay::today() 与 RewardService::todayBiz()。）
+     */
     public static function isExpired(array $card, ?string $today = null): bool
     {
         $v = $card['valid_to'] ?? null;
-        return $v !== null && (string)$v < ($today ?? date('Y-m-d'));
+        return $v !== null && (string)$v < ($today ?? \Vip\BusinessDay::todayDefault());
     }
 
     /** 距到期还有几天；不设有效期返回 null，已过期返回负数 */
@@ -264,7 +271,7 @@ final class CardRepo
         if ($v === null) {
             return null;
         }
-        $a = new \DateTimeImmutable($today ?? date('Y-m-d'));
+        $a = new \DateTimeImmutable($today ?? \Vip\BusinessDay::todayDefault());
         $b = new \DateTimeImmutable((string)$v);
         return (int)$a->diff($b)->format('%r%a');
     }
@@ -286,7 +293,7 @@ final class CardRepo
         }
         $cut = (new \DateTimeImmutable((string)$v))
             ->modify('+' . $graceMonths . ' months')->format('Y-m-d');
-        return ($today ?? date('Y-m-d')) > $cut;
+        return ($today ?? \Vip\BusinessDay::todayDefault()) > $cut;
     }
 
     // ── 激活与作废 ──────────────────────────────────────────

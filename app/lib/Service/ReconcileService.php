@@ -60,6 +60,12 @@ final class ReconcileService
      *
      * 开销：主键单点查（idx_headcheck），比扫 138 万行的 idx_return_time
      * 轻得多。保护期 30 天 × 日均 95.6 单 ≈ 2,870 单，分 29 批约 1 分钟跑完。
+     *
+     * ★ 保护期内每张单会被反复比（verify_recheck_hours，默认 7 天一轮），
+     *   不是一生只比一次 —— POS 的改单实测 2.9% 发生在结账之后，
+     *   其中 1,144 单晚于结账 30 分钟以上，只比一次等于这条防线是空的
+     *   （审计 F1，见 OrderRepo::pendingVerify）。
+     *   稳态下每轮只是一次金额回读 + 整数比较，不读明细。
      */
     public function verifyAmounts(?callable $log = null): array
     {
@@ -69,11 +75,14 @@ final class ReconcileService
         $batchSize   = min($this->cfg->int('sync_batch_size', 100), 100);
         $sleepMs     = $this->cfg->int('sync_batch_sleep_ms', 2000);
         $maxBatches  = $this->cfg->int('sync_max_batches', 200);
+        // 同一张单多久复查一次。调小 → 抓改单更快、压主库更重；
+        // 调到 0 会被 pendingVerify 夹到 1 小时（不允许每轮都全量重扫）
+        $recheckHrs  = $this->cfg->int('verify_recheck_hours', 168);
 
         $checked = 0; $changed = 0; $batches = 0;
 
         while ($batches < $maxBatches) {
-            $page = $this->orders->pendingVerify($protectDays, $batchSize);
+            $page = $this->orders->pendingVerify($protectDays, $batchSize, 0, $recheckHrs);
             if (!$page) {
                 break;
             }
@@ -133,12 +142,57 @@ final class ReconcileService
             return false;
         }
 
-        $oldShould = Money::toCents((string)$o['should_amount']);
-        $oldActual = Money::toCents((string)$o['actual_amount']);
+        /**
+         * ── 🔴 基准只认 verify_base_*，不认 should/actual ─────────
+         *
+         * should_amount / actual_amount 是【主库当前值的镜像】，
+         * buildContext（每次 locate）与 storeOrder（每轮同步）都在刷它。
+         * 拿它当基准就是拿新值跟新值比：永远相等，永远判「一致」——
+         * 「值比对冲正」整条防线是空的（审计 F2，实测见 initVerifyBase）。
+         *
+         * verify_base_* 只有发分与冲正两条路会写，同步与 locate 碰不到。
+         * 本次迁移之前的老数据为 NULL，回落到镜像值（＝修之前的行为），
+         * 由下面那道不变量兜底。
+         */
+        $oldShould = $o['verify_base_should'] !== null
+            ? Money::toCents((string)$o['verify_base_should'])
+            : Money::toCents((string)$o['should_amount']);
+        $oldActual = $o['verify_base_actual'] !== null
+            ? Money::toCents((string)$o['verify_base_actual'])
+            : Money::toCents((string)$o['actual_amount']);
 
-        if ($nowShould === $oldShould && $nowActual === $oldActual) {
+        /**
+         * ── 独立于任何基准的一道网 ──────────────────────────
+         *
+         * 「已分配额不能超过这一单可能值的钱」是不需要参照物的事实。
+         * 而重算出来的可积分总额只会【小于等于】LEAST(应收, 收款)
+         * ——排除项、免税折算都只往下减，不会往上加。
+         *
+         * 所以只要 allocated > LEAST(nowShould, nowActual)，
+         * 这一单就一定超分了，不管基准是什么、有没有被谁刷过。
+         *
+         * 这道网存在的意义是：基准那条线【已经错过一次了】。
+         * 再给它配一个不依赖它的判据，下次基准若又被谁写坏，
+         * 钱还能追回来（docs/13 §3.1）。
+         */
+        $allocated = Money::toCents((string)$o['allocated_amount']);
+        $ceiling   = min($nowShould, $nowActual);
+        $overAlloc = $allocated > $ceiling;
+
+        if ($nowShould === $oldShould && $nowActual === $oldActual && !$overAlloc) {
+            // 基准没变过就顺手补一份（老数据首次比对时定格），下一轮才有得比
+            if ($o['verify_base_at'] === null) {
+                $this->orders->resyncVerifyBase($serial, $nowShould, $nowActual);
+            }
             $this->orders->markVerified($serial, 1);
             return false;
+        }
+        if ($overAlloc && $nowShould === $oldShould && $nowActual === $oldActual) {
+            // 金额没变却超分了 —— 基准或镜像被写坏过，记一条，照样往下冲正
+            $this->alerts->raiseOnce('over_allocated', 'order', $serial,
+                sprintf('订单 %s 金额未变，但已分配 € %s 超过可积分上限 € %s，按当前金额冲正',
+                    $serial, Money::toStr($allocated), Money::toStr($ceiling)),
+                ['severity' => 2]);
         }
 
         /**
@@ -183,19 +237,56 @@ final class ReconcileService
         $taxCents = $this->cfg->get('points_include_tax', '1') === '1' ? 0 : $nowTax;
         $newTotal = PE::pointsBaseCents($nowShould, $nowActual, $nowOriginal,
                                         $analysis['excluded_cents'], $taxCents);
+        // ★ 镜像里的可积分总额。它同样是 buildContext 每次 locate 都会重写的列，
+        //   所以【只配当告警文案】，不配当判据（下面那段说明）。
         $oldTotal = Money::toCents((string)$o['total_amount']);
 
-        if ($newTotal >= $oldTotal) {
-            // 金额变大：不自动补分，避免被利用；记告警等人工判断
+        /**
+         * ── 🔴 判「要不要退」只看不变量：已分配 > 新总额 ────────────
+         *
+         * 原来的判据是 `newTotal >= oldTotal`（金额变大就不补分）。
+         * 而 oldTotal 取自 total_amount —— 这是 F2 的另一半：
+         * 那一列和 should/actual 一样由 buildContext 每次 locate 重写。
+         *
+         * 实测：71.70 的单发满分 → POS 改成 0.00 → 收银员再 locate 一次
+         *      （给同桌第二位客人查单，每天都在发生）→ 镜像 total 被刷成 0.00
+         *      → newTotal(0) >= oldTotal(0) 成立 → 走进「金额变大，不补分」
+         *      → 挂成人工待办、一分钱没退，
+         *        而 allocated 71.70 就挂在一张 0 元的单上。
+         *
+         * 「已分配额不能超过这一单的可积分总额」是不需要参照物的事实，
+         * 拿它当判据，谁刷过镜像都不影响结论。
+         */
+        if ($allocated > $newTotal) {
+            $this->applyShrink($serial, $oldTotal, $newTotal, $nowShould, $nowActual);
+            return true;
+        }
+
+        if ($newTotal > $oldTotal) {
+            // 金额变大且没超分：不自动补分，避免被利用；记告警等人工判断
             $this->alerts->raiseOnce('amount_changed', 'order', $serial,
                 sprintf('订单 %s 金额由 € %s 变为 € %s（变大），不自动补分，请人工复核',
                     $serial, Money::toStr($oldTotal), Money::toStr($newTotal)),
                 ['severity' => 2, 'detail' => ['old' => Money::toStr($oldTotal), 'new' => Money::toStr($newTotal)]]);
+            // 变大不冲正，但基准要跟上 —— 否则下一轮复查还会再读一遍明细，
+            // 每晚给 POS 主机做一次无用功，并把同一条告警重推一遍。
+            $this->orders->resyncVerifyBase($serial, $nowShould, $nowActual);
             $this->orders->markVerified($serial, 3);
             return true;
         }
 
-        $this->applyShrink($serial, $oldTotal, $newTotal);
+        /**
+         * 金额变小但没超分（多人单里只记了一部分）—— 没有钱要退，
+         * 但镜像的可积分总额必须跟上：否则同桌下一位来记账时，
+         * 「还剩多少可分」还是按旧的大数算，等于把已经不存在的钱又分出去。
+         */
+        $this->orders->setTotalAmount($serial, $newTotal);
+        $this->orders->resyncVerifyBase($serial, $nowShould, $nowActual);
+        $this->orders->markVerified($serial, 1);
+        $this->alerts->raiseOnce('amount_changed', 'order', $serial,
+            sprintf('订单 %s 金额由 € %s 变为 € %s，已分配 € %s 未超出新总额，无需冲正',
+                $serial, Money::toStr($oldTotal), Money::toStr($newTotal), Money::toStr($allocated)),
+            ['severity' => 1]);
         return true;
     }
 
@@ -216,22 +307,32 @@ final class ReconcileService
      * 冲正积分向上取整（对商家有利）。若会员积分不足，允许负余额并标记，
      * 不阻断、也不静默丢弃，下次消费优先抵扣。docs/03 §6.4
      */
-    private function applyShrink(string $serial, int $oldTotal, int $newTotal): void
+    private function applyShrink(string $serial, int $oldTotal, int $newTotal,
+                                int $nowShould, int $nowActual): void
     {
-        $this->db->transaction(function () use ($serial, $oldTotal, $newTotal): void {
+        $this->db->transaction(function () use ($serial, $oldTotal, $newTotal,
+                                                $nowShould, $nowActual): void {
             $order = $this->orders->lockBySerial($serial);
             if ($order === null) {
+                // ★ 一定要留下 markVerified —— verifyAmounts() 的 while 循环
+                //   不翻页，靠 last_verified_at 推进。这里静默 return 会死循环。
+                $this->orders->markVerified($serial, 3);
                 return;
             }
+            /**
+             * ★ 冲正完成后基准要跟着挪到【刚回读到的值】。
+             *   不挪的话下一轮复查还会看到「基准 ≠ 当前」，
+             *   于是每一晚都去读一遍明细重算 —— 结果永远是
+             *   excess ≤ 0（已经退过了），白白压 POS 主机。
+             *   放在事务里、且不管走哪个分支都要做，所以搁在最前面。
+             */
+            $this->orders->resyncVerifyBase($serial, $nowShould, $nowActual);
             $allocated = Money::toCents((string)$order['allocated_amount']);
 
             // ① 只退「已分配额超出新总额」的部分
             $excess = $allocated - $newTotal;
             if ($excess <= 0) {
-                $this->db->exec(
-                    'UPDATE pos_order SET total_amount = ?, updated_at = ? WHERE id = ?',
-                    [Money::toStr($newTotal), $this->db->now(), $order['id']]
-                );
+                $this->orders->setTotalAmount($serial, $newTotal);
                 $this->orders->markVerified($serial, 1);
                 $this->alerts->raiseOnce('amount_changed', 'order', $serial,
                     sprintf('订单 %s 金额由 € %s 变为 € %s，但已分配 € %s 未超出新总额，无需冲正',
@@ -382,10 +483,7 @@ final class ReconcileService
             }
 
             $this->orders->applyAllocation($serial, -$totalBack, 0);
-            $this->db->exec(
-                'UPDATE pos_order SET total_amount = ?, updated_at = ? WHERE id = ?',
-                [Money::toStr($newTotal), $this->db->now(), $order['id']]
-            );
+            $this->orders->setTotalAmount($serial, $newTotal);
             $this->orders->markVerified($serial, 2);
 
             $this->audit->log('point_reverse', [

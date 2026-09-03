@@ -104,7 +104,25 @@ final class App
 
     public function cfg(): ConfigRepo
     {
-        return $this->once('cfg', fn() => new ConfigRepo($this->localDb(), $this->storeCode()));
+        return $this->once('cfg', function (): ConfigRepo {
+            $cfg = new ConfigRepo($this->localDb(), $this->storeCode());
+            /**
+             * ★ 顺手把营业日切点登记成进程默认值。
+             *
+             *   BusinessDay 的静态助手（供 CardRepo::isExpired 这类静态方法用）
+             *   拿不到配置。放在 cfg() 里而不是 businessDay() 里，是因为
+             *   businessDay() 是懒加载的 —— 一条只查卡、不碰营业日的请求
+             *   永远不会调用它，那时静态默认值就还是出厂的 '02:00'，
+             *   而店里若把切点调成了 03:00，卡的过期判定就会比券早一小时。
+             *   任何读配置的路径都必过 cfg()，登记在这里才不会漏。
+             *
+             *   ★ 登记的是【取值方式】而不是取好的值 —— cfg() 只构造一次，
+             *     那一刻读到的切点可能还没写入（测试）或事后被改过（后台保存）。
+             */
+            \Vip\BusinessDay::setDefaultCutoffResolver(
+                static fn(): string => $cfg->get('business_day_cutoff', '02:00'));
+            return $cfg;
+        });
     }
 
     public function orders(): OrderRepo
@@ -216,7 +234,10 @@ final class App
 
     public function businessDay(): BusinessDay
     {
-        return $this->once('bizDay', fn() => new BusinessDay($this->cfg()->get('business_day_cutoff', '02:00')));
+        return $this->once('bizDay', function (): BusinessDay {
+            // ★ cfg() 会顺手登记静态助手用的切点解析器（见上），两边口径一致。
+            return new BusinessDay($this->cfg()->get('business_day_cutoff', '02:00'));
+        });
     }
 
     /** 餐期归属 —— 风控按「同一餐期」限次时用（docs/03 §12） */

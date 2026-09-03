@@ -451,13 +451,36 @@ final class RewardService
         );
     }
 
+    /**
+     * 「今天」= 营业日的今天，不是日历日的今天。
+     *
+     * ── 🔴 券的死活只认这一个口径 ─────────────────────────
+     *
+     * 营业日 02:00 才翻页（BusinessDay::today()）。用 date('Y-m-d') 判过期，
+     * 晚市 00:00–02:00 这两小时里会把【当天仍然有效】的券判成过期，
+     * 而且是【写库】的——status 一置成 3 就再也回不来，客人当场丢券。
+     *
+     * 这两小时不是边角料：跨年夜、周五周六的最后一桌都落在里面。
+     */
+    private function todayBiz(): string
+    {
+        /**
+         * ★ 不缓存 BusinessDay 实例 —— 缓存的是【切点这个配置值】，
+         *   而它是后台可改的。ConfigRepo 自己有内存缓存且在 set() 时失效，
+         *   所以每次现取既便宜又不会过期；存一个实例反而会让本服务
+         *   与 BusinessDay::todayDefault()（卡那一侧）说两套话。
+         */
+        return (new \Vip\BusinessDay($this->cfg->get('business_day_cutoff', '02:00')))->today();
+    }
+
     /** 过期券置状态。每次查券时顺手做，不必单开定时任务 */
     public function expireStale(): int
     {
         return $this->db->exec(
             'UPDATE coupon SET status = ?
               WHERE store_code = ? AND status = ? AND valid_to IS NOT NULL AND valid_to < ?',
-            [self::ST_EXPIRED, $this->storeCode, self::ST_ACTIVE, date('Y-m-d')]
+            // ★ 营业日，不是日历日 —— 见 todayBiz()
+            [self::ST_EXPIRED, $this->storeCode, self::ST_ACTIVE, $this->todayBiz()]
         );
     }
 
@@ -503,7 +526,9 @@ final class RewardService
             if ((int)$c['status'] !== self::ST_ACTIVE) {
                 return ['ok' => false, 'error' => 'coupon_not_active'];
             }
-            if ($c['valid_to'] !== null && (string)$c['valid_to'] < date('Y-m-d')) {
+            // ★ 营业日，不是日历日。00:30 拿券来核销时 date('Y-m-d') 已经是
+            //   第二天了，会把当晚仍然有效的券当场判死并写库（见 todayBiz()）。
+            if ($c['valid_to'] !== null && (string)$c['valid_to'] < $this->todayBiz()) {
                 $this->db->exec('UPDATE coupon SET status = ? WHERE id = ?', [self::ST_EXPIRED, $couponId]);
                 return ['ok' => false, 'error' => 'coupon_expired'];
             }
@@ -553,8 +578,12 @@ final class RewardService
              *   ★ 没带单号时（客人先吃、事后补核销）跳过 —— 那时确实不知道是哪一单，
              *     只能继续靠匹配串，兜底由 checkIntegrity 的对账告警负责。
              */
+            $visitsBack = 0;
             if ($serialId !== null && trim($serialId) !== '') {
                 $this->orders->markRedeemedByApp($serialId);
+                // ★ 顺序不能反：先把镜像标好（份数已减 1），
+                //   下面才按【减完之后】的份数判该退几次。
+                $visitsBack = $this->clawBackVisitOnRedeem($serialId, (int)$c['member_id'], $c['code']);
             }
             $this->audit->log($forced ? 'coupon_redeem_forced' : 'coupon_redeem', [
                 'target_type'   => 'coupon', 'target_id' => (string)$couponId,
@@ -562,12 +591,115 @@ final class RewardService
                 'operator_name' => $operator['name'] ?? null,
                 'detail' => ['code' => $c['code'], 'member_id' => (int)$c['member_id'],
                              'serial_id' => $serialId]
+                          + ($visitsBack > 0 ? ['visits_clawed_back' => $visitsBack] : [])
                           + ($forced ? ['forced' => true,
                                         'reason' => (string)$override['reason']] : []),
             ]);
             return ['ok' => true, 'code' => $c['code'], 'member_id' => (int)$c['member_id'],
+                    'visits_clawed_back' => $visitsBack,
                     'forced' => $forced];
         });
+    }
+
+    /**
+     * 先记账、后核销 —— 把那一餐【已经记进去的次数】退回来。
+     *
+     * ── 🔴 这条路原来是空的（审计 F4） ────────────────────
+     *
+     * 系统一直假设「核销发生在记账之前」：locate 时订单已经带着核销标记，
+     * buildContext 据此把免费那一份从 portions_counted 里剔掉，
+     * 于是那一餐自然不计次。
+     *
+     * 但前台的真实顺序常常是反的 —— 服务员先按 AA 把这一桌记完，
+     * 客人才想起来「我有张券」。此时：
+     *   · 次数【已经写进 point_ledger 和 member.visit_count 了】
+     *   · markRedeemedByApp() 只改订单镜像的 portions_counted，
+     *     动不了已经落库的流水
+     * 结果：免费那一餐自己又攒了一次。门槛 10 时变成「9 顿付费送 1 顿」。
+     *
+     * 实测（scratchpad/p0.php F4）：发券后计次 3 → 记账 → 4 → 核销 → 还是 4。
+     * 而且 checkIntegrity 的 redeem_unflagged 告警【抓不到】——
+     * 订单确实标了 is_redeemed，账面上一切正常。
+     *
+     * ── 退几次：看【券的持有人自己】那一份，不看整单 ────────
+     *
+     * 一开始我按订单镜像的剩余份数判，结果混合桌上一次也退不掉：
+     * 4 人桌记了 1 份给他，核销后订单还剩 3 份 > 0 → 判成「别人还在吃」→ 退 0。
+     * 可那 3 份是【另外三个人】的，与他无关 —— 他自己那一份就是免费的。
+     *
+     * 正确的轴是这位客人自己：
+     *   一张券 = 一份免费套餐，$freed = 他在这一单上已核销的券数
+     *   按份计次(by_portion) → 每免一份就少一次，退 min($freed, 现存次数)
+     *   其它口径            → 他记的份数全被券盖住了才退（那一餐他没花钱），
+     *                         还剩自费的份数就不退（他确实来吃了）
+     *
+     * ── 幂等 ───────────────────────────────────────────
+     *
+     * 退次数是【另插一条负数流水】，原流水不动。所以判据必须是
+     * 「这位客人在这一单上现存的净次数」（把之前退过的负数行也加进来），
+     * 不能是原流水上的 counted_visit —— 否则一单核销两张券时，
+     * 第二次核销会把同一次再退一遍，把客人的次数扣成负的。
+     *
+     * ── 为什么只退次数，不退积分 ────────────────────────
+     *
+     * 次数是 App 自己的地面真值：券核销在哪一单，App 一清二楚。
+     * 而积分来自【金额】，金额的权威在 POS —— 收银员在 POS 上加那条
+     * 折扣行之后，夜间值比对会回读到缩水的金额并按同一套算法冲正
+     * （ReconcileService::applyShrink）。在这里凭空猜一个「免费那份值多少钱」
+     * 去扣分，等于给同一件事造第二套算法，两边迟早对不上
+     * （docs/13 §3.5「前后说两套话」）。
+     *
+     * @return int 实际退回的次数
+     */
+    private function clawBackVisitOnRedeem(string $serialId, int $memberId, string $code): int
+    {
+        $net = 0; $portions = 0; $anchor = null;
+        foreach ($this->ledger->activeBySerial($serialId) as $e) {
+            if ((int)$e['member_id'] !== $memberId) {
+                continue;
+            }
+            // 净次数：原流水的正数 + 以前退过的负数
+            $net += (int)$e['counted_visit'];
+            if ((int)$e['entry_type'] === \Vip\Repo\LedgerRepo::T_EARN) {
+                $portions += (int)$e['portions_counted'];
+                $anchor  ??= (int)$e['id'];
+            }
+        }
+        if ($net <= 0 || $anchor === null) {
+            // 还没记账（正常顺序），或这一单的次数已经退干净了
+            return 0;
+        }
+
+        // 这位客人在这一单上一共核销了几张券（含刚刚这一张 —— 同一笔事务里已写库）
+        $freed = (int)$this->db->value(
+            'SELECT COUNT(*) FROM coupon
+              WHERE store_code = ? AND member_id = ? AND redeemed_serial_id = ? AND status = ?',
+            [$this->storeCode, $memberId, $serialId, self::ST_REDEEMED]
+        );
+        if ($freed <= 0) {
+            return 0;
+        }
+
+        $take = $this->cfg->get('visit_count_mode', 'once_per_period') === 'by_portion'
+            ? min($freed, $net)
+            : ($portions <= $freed ? $net : 0);
+        if ($take <= 0) {
+            return 0;
+        }
+
+        $this->members->lockById($memberId);
+        $this->ledger->insert([
+            'member_id'     => $memberId,
+            'serial_id'     => $serialId,
+            'entry_type'    => \Vip\Repo\LedgerRepo::T_REVERSE,
+            'amount_cents'  => 0,
+            'points'        => 0,
+            'counted_visit' => -$take,
+            'reverses_id'   => $anchor,
+            'reason'        => sprintf('券 %s 核销在本单上，免费那一餐不计次', $code),
+        ]);
+        $this->members->applyDelta($memberId, 0, -$take, 0);
+        return $take;
     }
 
     /** 作废一张券（发错了、客人投诉撤销等） */
@@ -661,12 +793,31 @@ final class RewardService
          * 那是补偿、投诉处理发出去的，与计次进度无关
          * （grantManual 本来也不加 rewards_issued，见 §5.2）。
          */
+        /**
+         * ── 🔴 只跟【同一个口径】发出来的券比进度 ──────────────
+         *
+         * progress_at_grant 是个【不带单位】的整数：按次数发券时它是
+         * 「第几次」，按金额发券时它是「累计多少分」。两者差三个数量级。
+         *
+         * 店家把 reward_mode 从 amount 改成 visits 之后，
+         * 客人手上那些老券的 progress_at_grant 还是 18000（=180 €），
+         * 而新口径下的 $p['progress'] 是 3（次）。
+         * `18000 > 3` 恒真 → 一次撤销就把【客人手上所有老券】全作废。
+         *
+         * 实测：按金额发出 3 张券，改成按次数后撤销一单 —— 3 张全变状态 4。
+         * 客人拿着券来吃饭，系统说「这张券无效」，而店里查不出为什么。
+         *
+         * source 本来就记着是哪个口径发的（checkAndGrant 按 mode 写入），
+         * 只跟当前口径的那一批比就行。另一个口径的券不动 ——
+         * 它是按当时的规则挣到的，新规则没有资格判它。
+         */
+        $srcNow = $p['mode'] === 'amount' ? self::SRC_AMOUNT : self::SRC_VISITS;
         $stale = $this->db->all(
             'SELECT id, code, status FROM coupon
-              WHERE store_code = ? AND member_id = ? AND source IN (?, ?)
+              WHERE store_code = ? AND member_id = ? AND source = ?
                 AND progress_at_grant > ?
               ORDER BY progress_at_grant DESC, id DESC LIMIT 50',
-            [$this->storeCode, $memberId, self::SRC_VISITS, self::SRC_AMOUNT, (int)$p['progress']]
+            [$this->storeCode, $memberId, $srcNow, (int)$p['progress']]
         );
 
         /**
@@ -704,7 +855,23 @@ final class RewardService
             );
         }
 
-        return ['voided' => count($codes), 'unrecoverable' => $over - count($codes), 'codes' => $codes];
+        /**
+         * ── unrecoverable：只数【同口径、发于已退掉那段进度、且已经吃掉】的 ──
+         *
+         * 原来是 `$over - count($codes)` —— 差额里可能混进
+         * 「换过发券口径」造成的账面差（issued 是两个口径累计的，
+         * earned 只按当前口径算）。那种差额收不回来也不该报警：
+         * 没有人多吃一顿饭，只是两把尺子量出来的数不一样。
+         *
+         * 真正要报警的是这一件事：有张券发在【后来被退掉的那段进度上】，
+         * 而客人已经把它吃了 —— 店里实打实亏一顿饭。
+         */
+        $eaten = count(array_filter(
+            $stale, static fn(array $c): bool => (int)$c['status'] === self::ST_REDEEMED));
+
+        return ['voided'        => count($codes),
+                'unrecoverable' => max(0, min($over - count($codes), $eaten)),
+                'codes'         => $codes];
         // unrecoverable > 0 ＝ 有券【发于已被退掉的那段进度】却已经吃掉了：
         // 白送了一顿饭，rewards_issued 也就不减（客人确实拿到了那份奖励）
     }

@@ -400,6 +400,12 @@ final class ConfigSchema
             'label' => '值比对保护期',
             'desc'  => '发分后多少天内持续回读 POS 金额，发现改单就冲正',
         ],
+        'verify_recheck_hours' => [
+            'group' => 'sync', 'type' => 'positive_int', 'unit' => '小时', 'advanced' => true,
+            'label' => '值比对复查间隔',
+            'desc'  => '保护期内同一张单多久再比一次。POS 的改单大多发生在结账很久之后，'
+                     . '只比一次等于没比。调小抓得更快、也更压主库；出厂 168（7 天）',
+        ],
         'meal_item_alert_price' => [
             'group' => 'sync', 'type' => 'decimal', 'unit' => '€', 'advanced' => true,
             'label' => '新菜品告警价格线',

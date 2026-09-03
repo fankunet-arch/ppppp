@@ -802,6 +802,18 @@ final class PointsService
             }
 
             $this->orders->applyAllocation($serialId, $sumAmount, $sumPortions);
+            /**
+             * ★ 定格值比对的基准 —— 就是【此刻】POS 说这一单值多少钱。
+             *
+             *   必须单独存一份：should_amount / actual_amount 那两列
+             *   是主库当前值的镜像，收银员再 locate 一次就被刷掉，
+             *   夜间值比对于是拿新值跟新值比，永远判「一致」
+             *   （审计 F2，见 OrderRepo::initVerifyBase 的实测数据）。
+             *
+             *   只写第一次（方法内自带 verify_base_at IS NULL 条件）：
+             *   AA 分几次记，基准要停在第一笔那一刻。
+             */
+            $this->orders->initVerifyBase($serialId);
 
             $this->audit->log('point_grant', [
                 'target_type'   => 'order',
