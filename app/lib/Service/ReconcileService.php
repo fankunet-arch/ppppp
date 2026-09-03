@@ -80,12 +80,34 @@ final class ReconcileService
         $recheckHrs  = $this->cfg->int('verify_recheck_hours', 168);
 
         $checked = 0; $changed = 0; $batches = 0;
+        $lastHead = null;
 
         while ($batches < $maxBatches) {
             $page = $this->orders->pendingVerify($protectDays, $batchSize, 0, $recheckHrs);
             if (!$page) {
                 break;
             }
+            /**
+             * ── 🔴 防打转 ────────────────────────────────────
+             *
+             * 这个循环【不翻页】：靠 verifyOne 里的 markVerified 更新
+             * last_verified_at，把已比过的挤出结果集来推进。
+             * 也就是说「有没有进展」这件事，依赖的是被调用方的副作用。
+             *
+             * 眼下每条返回路径都确实落了 markVerified（也有断言钉着），
+             * 但这条链一旦哪天断在某个新分支上，表现是【整晚死循环打主库】——
+             * 而这台机器性能极度受限。所以再加一道不依赖那个副作用的判据：
+             * 同一批的头一张单没变，就是没推进，立刻停并报警。
+             */
+            if ($lastHead !== null && $lastHead === (string)$page[0]['serial_id']) {
+                $this->alerts->raiseOnce('verify_stuck', 'order', $lastHead,
+                    sprintf('值比对在订单 %s 上打转（该单比过之后仍被重复取出），已中止本轮。'
+                          . '多半是某条返回路径漏了 markVerified', $lastHead),
+                    ['severity' => 3]);
+                $log('值比对在 ' . $lastHead . ' 上打转，已中止');
+                break;
+            }
+            $lastHead = (string)$page[0]['serial_id'];
             $batches++;
 
             foreach ($page as $o) {

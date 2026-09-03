@@ -1034,3 +1034,88 @@ T::true($missing === [],
           . (count($missing) > 12 ? ' …共 ' . count($missing) . ' 处' : '')
           . "\n      —— 加了迁移就要同步更 docs/04，否则下一个人照着文档建表会建错"
         : ''));
+
+// ════════════════════════════════════════════════════════════
+T::group('★ App 自己管的那几列，同步/locate 不许碰（审计 F2 的根因）');
+
+/**
+ * ── 🔴 为什么要在这里钉一道 ────────────────────────────────
+ *
+ * F2 那条 P0 的根因不是算法错，是【一列被两个主人写】：
+ * 「发分时的金额快照」和「主库当前值的镜像」共用了 should/actual/total
+ * 三列，而后者由 buildContext（收银员每次 locate）与 storeOrder
+ * （每轮同步）不停刷。于是值比对拿新值跟新值比，永远判「一致」——
+ * 整条防线是空的，且账面上完全看不出异常。
+ *
+ * 修法是把基准拆成独立的 verify_base_* 三列。但那个修法的正确性
+ * 【完全取决于这三列不出现在 upsert 的列清单里】—— 而那是一份
+ * 手写的字符串数组，下一个人加列时顺手写进去，一个报错都不会有，
+ * 防线又悄悄变空。
+ *
+ * 所以这条断言钉的是【列名】，不是方法名（docs/13 §4「两次操作之间」）。
+ * 同样归 App 所有、绝不能被主库镜像覆盖的还有：已分配额、已分配份数、
+ * 核对状态与核对时间。
+ */
+$orderRepoSrc = (string)file_get_contents(__DIR__ . '/../../app/lib/Repo/OrderRepo.php');
+$upsertStart  = strpos($orderRepoSrc, 'public function upsert');
+T::true($upsertStart !== false, 'OrderRepo::upsert() 找得到');
+
+// 只看 upsert 这一个方法体（到下一个 public function 为止）
+$nextFn      = strpos($orderRepoSrc, "\n    public function", (int)$upsertStart + 10);
+$upsertBody  = substr($orderRepoSrc, (int)$upsertStart,
+    ($nextFn === false ? strlen($orderRepoSrc) : $nextFn) - (int)$upsertStart);
+// 注释里提到列名是允许的（那正是解释「为什么不能写」的地方）
+$upsertCode  = preg_replace('#/\*.*?\*/#s', ' ', $upsertBody) ?? $upsertBody;
+$upsertCode  = preg_replace('#^\s*(//|\*).*$#m', '', $upsertCode) ?? $upsertCode;
+
+$appOwned = [
+    'verify_base_should' => '值比对的基准（应收）—— 被刷掉就等于没有值比对',
+    'verify_base_actual' => '值比对的基准（收款）—— 同上',
+    'verify_base_at'     => '基准定格时刻',
+    'allocated_amount'   => '已分配金额 —— 被刷成 0 等于同一单可以再分一遍',
+    'allocated_portions' => '已分配份数 —— 同上',
+    'verify_status'      => '核对状态 —— 被刷回 0 会让同一单反复冲正',
+    'last_verified_at'   => '最近核对时刻 —— 值比对靠它排队',
+];
+$leaked = [];
+foreach ($appOwned as $col => $why) {
+    if (str_contains($upsertCode, $col)) {
+        $leaked[] = "{$col}（{$why}）";
+    }
+}
+T::true($leaked === [],
+    '★★★ upsert() 的列清单里没有任何一列是 App 自己管的'
+    . ($leaked
+        ? "\n      混进去了：" . implode("\n      ", $leaked)
+          . "\n      —— 这几列由发分/冲正两条路写，一旦被主库镜像覆盖，"
+          . "\n         值比对会拿新值跟新值比，永远判「一致」（审计 F2）"
+        : ''));
+
+/** 反过来也钉一下：POS 直接给的那几列【必须】在里面，否则镜像永远是旧的 */
+$mustMirror = ['should_amount', 'actual_amount', 'tax_amount', 'order_end_time', 'business_date'];
+$absent = [];
+foreach ($mustMirror as $col) {
+    if (!str_contains($upsertCode, $col)) { $absent[] = $col; }
+}
+T::true($absent === [],
+    '  └ 而 POS 直接给的那几列确实在里面（' . implode('、', $mustMirror) . '）'
+    . ($absent ? '，缺：' . implode('、', $absent) : ''));
+
+/** verify_base_* 只许这两个方法写 —— 再加一条按列名的全局扫描 */
+$appFiles = [];
+$it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator(__DIR__ . '/../../app'));
+foreach ($it as $f) {
+    if ($f->isFile() && $f->getExtension() === 'php') { $appFiles[] = $f->getPathname(); }
+}
+$badWriters = [];
+foreach ($appFiles as $f) {
+    $src = (string)file_get_contents($f);
+    // 找「SET ... verify_base_xxx =」这种写入形态
+    if (preg_match('/\bverify_base_(?:should|actual|at)\s*=/', $src)
+        && !str_ends_with($f, 'Repo/OrderRepo.php')) {
+        $badWriters[] = basename($f);
+    }
+}
+T::true($badWriters === [],
+    '  └ 全仓库只有 OrderRepo 写得了 verify_base_*（其余都只读）'
+    . ($badWriters ? '，越界的：' . implode('、', $badWriters) : ''));

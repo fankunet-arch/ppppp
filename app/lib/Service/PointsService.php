@@ -1375,7 +1375,8 @@ final class PointsService
             if ($maxDay <= 0 && $maxSpan <= 0) {
                 return;
             }
-            [$from, $to] = $this->bizDay->range($this->bizDay->of(date('Y-m-d H:i:s')));
+            $bizDate = $this->bizDay->of(date('Y-m-d H:i:s'));
+            [$from, $to] = $this->bizDay->range($bizDate);
 
             foreach (array_unique(array_filter($memberIds)) as $mid) {
                 $rows = $this->ledger->earnedInRange((int)$mid, $from, $to);
@@ -1388,8 +1389,16 @@ final class PointsService
                 $n = count($ops);
                 $card = $this->members->findById((int)$mid)['card_no'] ?? ('#' . $mid);
 
+                /**
+                 * ★ 去重键要带上【营业日】（与审计 F13 同一类）。
+                 *
+                 *   这两条说的是「这张卡【今天】怎么了」—— 一天一件事。
+                 *   而 raiseOnce 只按 (类型, member) 去重的话：今天这条
+                 *   经理没来得及处理，明天同一张卡再犯就【一条都不推】。
+                 *   越是天天出问题的那张卡，越是从第二天起彻底静音。
+                 */
                 if ($maxDay > 0 && $n > $maxDay) {
-                    $this->alerts->raiseOnce('grant_many_per_day', 'member', (string)$mid,
+                    $this->alerts->raiseOnce('grant_many_per_day', 'member', $mid . '@' . $bizDate,
                         sprintf('卡 %s 今天已记账 %d 次（阈值 %d）——「同行分桌」算 1 次，'
                               . '所以这是 %d 次分开的操作，值得核一下是不是同一位客人的消费',
                                 $card, $n, $maxDay, $n),
@@ -1401,7 +1410,7 @@ final class PointsService
                     $stamps = array_map(static fn(array $r): int => (int)strtotime((string)$r['order_end_time']), $rows);
                     $spanH  = (max($stamps) - min($stamps)) / 3600;
                     if ($spanH > $maxSpan) {
-                        $this->alerts->raiseOnce('grant_span_wide', 'member', (string)$mid,
+                        $this->alerts->raiseOnce('grant_span_wide', 'member', $mid . '@' . $bizDate,
                             sprintf('卡 %s 今天记的几单，结账时间跨了 %.1f 小时（阈值 %d）——'
                                   . '同一顿饭不会跨这么久，像是攒了一把小票一起来兑',
                                     $card, $spanH, $maxSpan),

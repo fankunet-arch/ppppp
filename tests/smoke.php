@@ -4749,6 +4749,26 @@ ok(str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Service/Reconci
 ok(str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Service/PointsService.php'),
                 "'reward_on_reversed_grant', 'member', \$orig['member_id'] . '#' . \$ledgerId"),
    '  └ 撤销那条带上了流水号（同一位客人被撤第二笔时不会被吞）');
+/**
+ * ★ 自查时按同一个方法把所有 raiseOnce 过了一遍，又抓出两条：
+ *   grant_many_per_day / grant_span_wide 说的是「这张卡【今天】怎么了」，
+ *   而去重键只有会员 —— 今天那条经理没处理完，明天同一张卡再犯就一条都不推。
+ *   越是天天出问题的那张卡，越是从第二天起彻底静音。
+ */
+$pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
+            [SMOKE_STORE, 'grant_many_per_day']);
+$pyApp->alerts()->raiseOnce('grant_many_per_day', 'member', '888@2026-01-01', '一月一日记太多次');
+$pyApp->alerts()->raiseOnce('grant_many_per_day', 'member', '888@2026-01-02', '一月二日又记太多次');
+$pyApp->alerts()->raiseOnce('grant_many_per_day', 'member', '888@2026-01-01', '一月一日重复推送');
+eq(2, (int)$pyDb->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=? AND status=0',
+                        [SMOKE_STORE, 'grant_many_per_day']),
+   '★★ 同一张卡连着两天记太多次 → 两条告警（去重键带了营业日）');
+$pySrc = (string)file_get_contents(__DIR__ . '/../app/lib/Service/PointsService.php');
+ok(str_contains($pySrc, "'grant_many_per_day', 'member', \$mid . '@' . \$bizDate")
+   && str_contains($pySrc, "'grant_span_wide', 'member', \$mid . '@' . \$bizDate"),
+   '  └ 两条按天的风控告警都带上了营业日');
+$pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
+            [SMOKE_STORE, 'grant_many_per_day']);
 $pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
             [SMOKE_STORE, 'reward_on_shrunk_order']);
 
@@ -4835,6 +4855,17 @@ $bad = $db->all(
       WHERE o.store_code = ? AND o.allocated_amount > o.total_amount',
     [SMOKE_STORE]);
 eq([], $bad, '★ 没有任何订单的已分配额超过可积分总额');
+
+/**
+ * ★ 值比对那个 while 循环【不翻页】：靠 markVerified 更新 last_verified_at
+ *   把已比过的挤出结果集来推进 —— 也就是说「有没有进展」依赖被调用方的副作用。
+ *   verify_stuck 是那条不依赖副作用的兜底判据。它一响就说明有返回路径
+ *   漏了 markVerified，而表现会是【整晚死循环打主库】，
+ *   而那台机器性能极度受限。
+ */
+eq(0, (int)$db->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=?',
+                      [SMOKE_STORE, 'verify_stuck']),
+   '★ 整轮跑完，值比对一次都没打转（verify_stuck 没响）');
 
 $mismatch = $db->all(
     'SELECT o.serial_id, o.allocated_amount,
