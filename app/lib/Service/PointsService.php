@@ -1491,6 +1491,36 @@ final class PointsService
             $points = (int)$orig['points'];
             $visits = (int)$orig['counted_visit'];
 
+            /**
+             * ── 🔴 先扣掉【已经补偿过】的部分，否则同一次退两遍 ──────
+             *
+             * 「先记账、后核销」时 clawBackVisitOnRedeem() 已经另插了一条
+             * 「免费那一餐不计次」的负数流水（reverses_id 指向这一笔），
+             * 而原流水本身不动（账本是追加式的）。
+             * 于是 $orig['counted_visit'] 已经不是「现在还欠客人几次」。
+             *
+             * 实测三步全是柜台日常动作：
+             *     ① 服务员先按 AA 记账          会员 0 → 1
+             *     ② 客人事后拿出券，核销到这一单 会员 1 → 0（对的）
+             *     ③ 经理发现记错卡，撤销那一笔  会员 0 → -1  🔴
+             * 客人凭空少一次，下一顿免费餐要多来一趟；
+             * 而进度条会写「还差 4 次」——比门槛本身还大。
+             *
+             * ★ 判据必须与 clawBackVisitOnRedeem 一致：看【还剩多少没退】，
+             *   不是【当初记了多少】。那边守住了「一单两张券」，
+             *   这边没守住「核销之后再撤销」—— 同一个形状隔了一个函数
+             *   （docs/13 §3.1）。
+             *
+             * ★ 补偿流水也要一并标记成已冲正：留着有效的话，
+             *   「有效流水的计次合计」会和会员表对不上。
+             */
+            $comps = $this->ledger->activeCompensationsOf($ledgerId);
+            foreach ($comps as $c) {
+                $amt    += Money::toCents((string)$c['amount']);      // 补偿是负数
+                $points += (int)$c['points'];
+                $visits += (int)$c['counted_visit'];
+            }
+
             $this->members->lockById((int)$orig['member_id']);
 
             $revId = $this->ledger->insert([
@@ -1510,6 +1540,11 @@ final class PointsService
             ]);
 
             $this->ledger->markReversed($ledgerId, $revId);
+            // 补偿流水随原流水一起退出有效集 —— 它的使命（把那一次退掉）
+            // 已经被并进上面这条冲正里了，留着就会被重复计入
+            foreach ($comps as $c) {
+                $this->ledger->markReversed((int)$c['id'], $revId);
+            }
 
             // 允许负余额并标记，不阻断撤销；下次消费优先抵扣
             $this->members->applyDelta((int)$orig['member_id'], -$points, -$visits, -$amt);

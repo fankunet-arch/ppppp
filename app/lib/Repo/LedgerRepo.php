@@ -139,6 +139,42 @@ final class LedgerRepo
         );
     }
 
+    /**
+     * 已经针对某一笔流水做过、且仍然有效的【补偿流水】。
+     *
+     * ── 🔴 撤销一笔时，必须先看它已经被补偿掉多少 ────────────
+     *
+     * 「先记账、后核销」时，clawBackVisitOnRedeem() 会另插一条
+     * 「免费那一餐不计次」的负数流水，reverses_id 指向原流水，
+     * 但【原流水本身不动】（账本是追加式的，不改历史行）。
+     *
+     * 于是原流水上那个 counted_visit 已经不代表「现在还欠客人几次」了。
+     * 谁再照着它退一次，就是把同一次退两遍 —— 实测客人计次被扣穿：
+     *
+     *     ① 记账      #109 +1 有效
+     *     ② 核销      #110 -1 有效（reverses_id=109），会员 1 → 0
+     *     ③ 撤销 #109 #112 -1 有效 —— 又退了一次，会员 0 → -1  🔴
+     *
+     * 而这个形状有【两处】踩：手工撤销（reverseInTx）与值比对整单归零
+     * （ReconcileService::applyShrink）。两处都要先问一句
+     * 「这一笔还剩多少没退」，而不是「这一笔当初记了多少」。
+     *
+     * ★ clawBackVisitOnRedeem 自己是按「这位客人在这一单上现存的净次数」
+     *   算的，所以一单核销两张券不会退两遍 —— 但那条判据没被另外两处共用，
+     *   正是 docs/13 §3.1「修了那一处、没修那一类」。
+     *
+     * 命中 idx_reverse (reverses_id)。
+     */
+    public function activeCompensationsOf(int $ledgerId): array
+    {
+        return $this->db->all(
+            'SELECT id, amount, points, counted_visit
+               FROM point_ledger
+              WHERE store_code = ? AND reverses_id = ? AND status = ?',
+            [$this->storeCode, $ledgerId, self::S_ACTIVE]
+        );
+    }
+
     public function findById(int $id): ?array
     {
         return $this->db->one(

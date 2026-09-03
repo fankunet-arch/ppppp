@@ -425,7 +425,24 @@ final class ReconcileService
                  *   （多人单里退掉一人的量）不算 —— 那顿饭还是发生了，
                  *   他也确实在场，判不出该不该收回，就不收。
                  */
-                $backVisits = $newTotal === 0 ? (int)$e['counted_visit'] : 0;
+                /**
+                 * ★ 用【还剩多少没退】，不是【当初记了多少】。
+                 *
+                 *   「先记账、后核销」时 clawBackVisitOnRedeem() 已经另插了
+                 *   一条「免费那一餐不计次」的负数流水（reverses_id 指向这一笔），
+                 *   而原流水本身不动。照着 $e['counted_visit'] 再退一次，
+                 *   就是把同一次退两遍 —— 实测：记账 → 核销 → POS 整单作废，
+                 *   客人的计次被扣穿。
+                 *
+                 *   与 PointsService::reverseInTx 完全同一个形状、同一套判据：
+                 *   一处修了另一处没修，正是 docs/13 §3.1 那一类。
+                 */
+                $comps      = $this->ledger->activeCompensationsOf((int)$e['id']);
+                $netVisits  = (int)$e['counted_visit'];
+                foreach ($comps as $c) {
+                    $netVisits += (int)$c['counted_visit'];
+                }
+                $backVisits = $newTotal === 0 ? max(0, $netVisits) : 0;
 
                 $this->members->lockById((int)$e['member_id']);
                 $refundId = $this->ledger->insert([
@@ -459,6 +476,11 @@ final class ReconcileService
                  */
                 if ($newTotal === 0) {
                     $this->ledger->markReversed((int)$e['id'], $refundId);
+                    // 补偿流水随原流水一起退出有效集 —— 它要退的那一次
+                    // 已经并进上面这条冲正里了，留着会被重复计入
+                    foreach ($comps as $c) {
+                        $this->ledger->markReversed((int)$c['id'], $refundId);
+                    }
                 }
             }
 

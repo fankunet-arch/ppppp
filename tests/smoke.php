@@ -4511,6 +4511,118 @@ eq($f4V0, (int)$fxApp->members()->findById($f4M)['visit_count'],
    '★★ 同一单再核销一张券，次数【不再动】—— 判据是「这位客人在这一单上现存的净次数」，'
  . '不是原流水上那个数，否则会把同一次退两遍、把客人扣穿');
 
+/**
+ * ── 🔴 F4 的下一步：核销之后【再撤销】，不能把同一次退两遍（R-01）──
+ *
+ * 上面把「一单核销两张券」的幂等钉死了，但那条链只走到核销为止。
+ * 而柜台上的三步都是日常动作：
+ *   ① 服务员先按 AA 记账
+ *   ② 客人事后拿出券，核销到这一单上（计次被正确退掉）
+ *   ③ 经理发现这张单记错了卡，撤销那一笔
+ * 走完之后客人的计次被扣穿 —— 因为补偿流水没有把原流水标掉，
+ * reverseInTx 照着原流水上那个「计次 1」又退了一次。
+ *
+ * ★ 而 clawBackVisitOnRedeem 自己的注释里就写着这句话
+ *   （「否则会把客人的次数扣成负的」）—— 它为「一单两张券」守住了，
+ *   撤销那条路没守。同一个形状隔了一个函数，docs/13 §3.1 那一类。
+ *
+ * ★ 同一形状踩了【两处】：手工撤销与值比对整单归零，下面各钉一条。
+ */
+$f4v0 = (int)$fxApp->members()->findById($f4M)['visit_count'];
+$f4Lid = (int)$fxDb->value(
+    'SELECT id FROM point_ledger WHERE store_code=? AND member_id=? AND serial_id=?
+       AND entry_type=? AND status=? ORDER BY id LIMIT 1',
+    [SMOKE_STORE, $f4M, '4400000004', Vip\Repo\LedgerRepo::T_EARN, Vip\Repo\LedgerRepo::S_ACTIVE]);
+ok($f4Lid > 0, '  └ 前提：那笔原始记账流水还在有效集里');
+$fxApp->points()->reverse($f4Lid, '经理发现这张单记错了卡', $fxOp);
+eq($f4v0, (int)$fxApp->members()->findById($f4M)['visit_count'],
+   '★★★ R-01 核销之后再撤销，计次【一次都不再动】—— 那一次已经被券退掉了，'
+ . '照着原流水上的数字再退一遍就是把客人扣穿：实测计次变成 -1，'
+ . '而进度条会写「还差 4 次」，比门槛本身还大');
+eq(0, (int)$fxDb->value(
+        'SELECT COUNT(*) FROM (SELECT 1 FROM point_ledger
+           WHERE store_code=? AND member_id=? AND serial_id=?
+           GROUP BY member_id, serial_id HAVING SUM(counted_visit) < 0) x',
+        [SMOKE_STORE, $f4M, '4400000004']),
+   '  └ 这一单在这位客人名下的净计次没有变成负数');
+
+// 同一形状的第二处：值比对整单归零
+$f4bPos = new FakePosSource();
+$f4bPos->now = date('Y-m-d H:i:s');
+$f4bPos->addHead(['serial_id' => '4400000006', 'order_head_id' => 440006, 'check_id' => 1,
+    'table_name' => 'FX6', 'eat_type' => 0, 'customer_num' => 1,
+    'original_amount' => '23.90', 'should_amount' => '23.90', 'actual_amount' => '23.90',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($f4bPos->now) - 600)]);
+$f4bPos->addDetail(440006, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '23.90', 1)]);
+$fxApp->setPosSource($f4bPos);
+$fxApp->points()->locate('FX6', 3600);
+$f4bM = (int)$fxApp->members()->create('TK-00044006-FXF', null, null, null)['id'];
+$fxDb->exec('UPDATE member SET visit_count=2, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $f4bM]);
+$fxApp->points()->grant('4400000006',
+    [['member_id' => $f4bM, 'amount_cents' => 2390, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $fxOp);
+$fxApp->rewards()->checkAndGrant($f4bM, $fxOp);
+$f4bC = (int)$fxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                            ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $f4bM]);
+$fxApp->rewards()->redeem($f4bC, '4400000006', $fxOp, null, ['reason' => '冒烟']);
+$f4bv0 = (int)$fxApp->members()->findById($f4bM)['visit_count'];
+// POS 侧整单作废
+foreach ($f4bPos->heads as $i => $h) {
+    if ($h['serial_id'] === '4400000006') {
+        $f4bPos->heads[$i]['original_amount'] = '0.00';
+        $f4bPos->heads[$i]['should_amount']   = '0.00';
+        $f4bPos->heads[$i]['actual_amount']   = '0.00';
+    }
+}
+$fxApp->orders()->markVerified('4400000006', 0);
+$fxApp->reconcile()->verifyAmounts();
+eq($f4bv0, (int)$fxApp->members()->findById($f4bM)['visit_count'],
+   '★★★ 同一形状的第二处：核销之后【POS 整单作废】，计次同样不再动 —— '
+ . 'applyShrink 也是照着原流水上的 counted_visit 退，与 reverseInTx 一模一样的错。'
+ . '审计只点了撤销那一条，这一条是同类里没被点到的那个');
+
+/**
+ * ★ 顺带钉住一条【本来就有】的退过头（不是这次改动带来的，但同一个修法一起关掉了）：
+ *   先缩水冲正、再手工撤销 —— 冲正已经退过的那部分会被再退一遍。
+ *   实测 100.00 的单缩到 75.00 之后再撤销，会员余额变成 -25 分 / -€25.00。
+ *   这是【钱】的路径，比计次更直接。
+ */
+$f4cPos = new FakePosSource();
+$f4cPos->now = date('Y-m-d H:i:s');
+$f4cPos->addHead(['serial_id' => '4400000007', 'order_head_id' => 440007, 'check_id' => 1,
+    'table_name' => 'FX7', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '100.00', 'should_amount' => '100.00', 'actual_amount' => '100.00',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($f4cPos->now) - 600)]);
+$f4cPos->addDetail(440007, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '50.00', '100.00', 2)]);
+$fxApp->setPosSource($f4cPos);
+$fxApp->points()->locate('FX7', 3600);
+$f4cM = (int)$fxApp->members()->create('TK-00044007-FXG', null, null, null)['id'];
+$fxApp->points()->grant('4400000007',
+    [['member_id' => $f4cM, 'amount_cents' => 10000, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $fxOp);
+foreach ($f4cPos->heads as $i => $h) {
+    if ($h['serial_id'] === '4400000007') {
+        $f4cPos->heads[$i]['original_amount'] = '75.00';
+        $f4cPos->heads[$i]['should_amount']   = '75.00';
+        $f4cPos->heads[$i]['actual_amount']   = '75.00';
+    }
+}
+$fxApp->orders()->markVerified('4400000007', 0);
+$fxApp->reconcile()->verifyAmounts();
+$f4cLid = (int)$fxDb->value(
+    'SELECT id FROM point_ledger WHERE store_code=? AND member_id=? AND entry_type=? AND status=? LIMIT 1',
+    [SMOKE_STORE, $f4cM, Vip\Repo\LedgerRepo::T_EARN, Vip\Repo\LedgerRepo::S_ACTIVE]);
+if ($f4cLid > 0) {
+    $fxApp->points()->reverse($f4cLid, '经理再撤销这一笔', $fxOp);
+}
+$f4cAfter = $fxApp->members()->findById($f4cM);
+eq(0, (int)$f4cAfter['points_balance'],
+   '★★ 先缩水冲正、再手工撤销 → 积分正好归零（原来会退成 -25：'
+ . '冲正已经退掉的那 25 分，撤销时照着原流水又退了一遍）');
+ok(abs((float)$f4cAfter['total_spent']) < 0.005,
+   '  └ 消费额同样归零，不是负数');
+
 // ── F5：券与卡按【营业日】判过期，不是日历日 ───────────────────
 // 用切点模拟：把切点设成晚于「此刻」，营业日就退到昨天 ——
 // 与真实的「晚市 00:30、切点 02:00」完全同构。
@@ -4543,6 +4655,10 @@ $fxDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$fxI
 $fxDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$fxIds})", [SMOKE_STORE]);
 $fxDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$fxIds})", [SMOKE_STORE]);
 $fxDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '44000000%'", [SMOKE_STORE]);
+$fxExtra = implode(',', [$f4bM, $f4cM]);
+$fxDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$fxExtra})", [SMOKE_STORE]);
+$fxDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$fxExtra})", [SMOKE_STORE]);
+$fxDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$fxExtra})", [SMOKE_STORE]);
 
 step('㊽ 餐期空档 / 手工录入 / 待发队列 / 中途核销（审计 F6–F9）');
 
@@ -5012,6 +5128,41 @@ $visitBad = $db->all(
      HAVING m.visit_count <> COALESCE(SUM(l.counted_visit),0)",
     [SMOKE_STORE]);
 eq([], $visitBad, '★ 每名会员的计次与其流水 counted_visit 合计一致');
+
+/**
+ * ── 🔴 上面那条【结构上照不到重复退】────────────────────────
+ *
+ * 它按【全部】流水求和，而每一次 applyDelta 都配一行流水 ——
+ * 退两遍就是两行，会员表也跟着变两次，两边永远相等。
+ * R-01（核销之后再撤销，同一次被退两遍）全程没让它变红。
+ *
+ * 真正照得到的是这一条：【一张单在一位客人名下的净计次不能为负】。
+ * 一顿饭最多贡献它记的那几次，退回去最多归零，不可能倒欠。
+ * 任何一条「照着原流水上的数字再退一遍」的路都会让它立刻变红，
+ * 不管那条路是手工撤销、值比对、还是将来新加的第三条。
+ */
+$visitNeg = $db->all(
+    'SELECT member_id, serial_id, SUM(counted_visit) AS n
+       FROM point_ledger
+      WHERE store_code = ? AND serial_id IS NOT NULL
+      GROUP BY member_id, serial_id
+     HAVING SUM(counted_visit) < 0',
+    [SMOKE_STORE]);
+eq([], $visitNeg,
+   '★★★ 没有任何「一张单在一位客人名下的净计次为负」—— 一顿饭退回去最多归零，'
+ . '不可能倒欠。这一条不看过程只看结果，任何一条重复退计次的路都会让它变红'
+ . '（上面那条按全部流水求和，退两遍时两边一起变，结构上照不到）');
+
+/** 金额同理：一张单在一位客人名下的净消费额也不能为负 */
+$amtNeg = $db->all(
+    'SELECT member_id, serial_id, SUM(amount) AS a
+       FROM point_ledger
+      WHERE store_code = ? AND serial_id IS NOT NULL
+      GROUP BY member_id, serial_id
+     HAVING SUM(amount) < -0.004',
+    [SMOKE_STORE]);
+eq([], $amtNeg,
+   '  └ 净消费额同样不为负 —— 「先缩水冲正、再手工撤销」原来会退成 -25.00');
 
 /**
  * ★★★ 钱的总不变量：没有人手里的券比他挣到的多。
