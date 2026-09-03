@@ -31,6 +31,25 @@ final class AlertRepo
     }
 
     /** 同一目标同一类型已有未处理告警时不重复插入，避免刷屏 */
+    /**
+     * 同一件事只推一条 —— 但「同一件事」的定义在 refId 里，务必写全。
+     *
+     * ── 🔴 refId 粒度不对 = 后面的损失全被吞掉（审计 F13） ──────
+     *
+     * 去重键是 (alert_type, ref_type, ref_id, status=0)。
+     * 「白送了一顿饭」这类告警原来只按【会员】去重：
+     *
+     *     raiseOnce('reward_on_shrunk_order', 'member', $memberId, …)
+     *
+     * 于是同一位常客身上第二次、第三次发生同样的事，
+     * 只要第一条还没被处理掉（status 仍是 0），后面的一条都不推。
+     * 而每一条都是实打实的一顿免费餐 —— 越是反复出问题的那位客人，
+     * 越会被吞得干净。
+     *
+     * ★ 规则：refId 要能唯一标识【这一次事故】，不是【这个人】。
+     *   跟订单有关的一律带上 serial_id，跟流水有关的带上流水号。
+     *   「这个人今天记太多次了」那种确实该按人去重的，才只写人。
+     */
     public function raiseOnce(string $type, string $refType, string $refId, string $message, array $opt = []): void
     {
         $exists = $this->db->value(

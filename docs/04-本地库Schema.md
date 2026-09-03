@@ -188,7 +188,11 @@ CREATE TABLE `point_ledger` (
   KEY `idx_order`   (`store_code`,`serial_id`),
   KEY `idx_reverse` (`reverses_id`),
   KEY `idx_review`  (`store_code`,`review_status`,`created_at`),  -- 待复核队列
-  KEY `idx_group`   (`store_code`,`grant_group`)                  -- 整组撤销 / 风控计数
+  KEY `idx_group`   (`store_code`,`grant_group`),                 -- 整组撤销 / 风控计数
+  -- 手工录入的日额度上限要用 SELECT … FOR UPDATE 把「这个操作员今天那一段」
+  -- 锁住（读一下再写，中间没锁就等于没上限）。没有这个索引就是全表扫，
+  -- 锁的是整张流水表 —— 一个手工录入把全店记账都堵住。（016）
+  KEY `idx_operator` (`store_code`,`operator_id`,`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 

@@ -716,6 +716,9 @@ async function doReverse(ledgerId) {
     value: T('reverse.default'), okText: T('reverse.ok'), danger: true,
   });
   if (reason === null) return;
+  // ★ 撤销必须写原因（服务端也拦，这里只是让服务员立刻看见，不用等一个来回）。
+  //   客人事后来问「我上周那顿怎么没了」，审计日志里得答得上来。
+  if (!reason.trim()) { toast(T('reverse.needReason'), 'err'); return; }
   try {
     await api('/points/reverse', { ledger_id: ledgerId, reason });
     toast(T('reverse.done'), 'ok');

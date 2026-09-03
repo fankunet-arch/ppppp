@@ -474,7 +474,9 @@ final class ReconcileService
                      * 消费换的 —— 店里实打实亏了一顿，必须有人知道。
                      */
                     $this->alerts->raiseOnce(
-                        'reward_on_shrunk_order', 'member', (string)$mid,
+                        // ★ 去重键要带上订单号：只按会员去重的话，同一位客人
+                        //   身上第二次白送的那顿饭会被当成重复告警吞掉（F13）
+                        'reward_on_shrunk_order', 'member', $mid . '@' . $serial,
                         sprintf('订单 %s 金额缩水后，由它带出的 %d 张免费餐券【已经被核销】，收不回来了。'
                               . '请人工核对这位客人的奖励进度', $serial, (int)$claw['unrecoverable']),
                         ['severity' => 2, 'detail' => ['serial_id' => $serial,

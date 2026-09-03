@@ -173,6 +173,7 @@
     'reverse.ask':        { zh: '撤销原因（会记入审计日志）',
                             es: 'Motivo de la anulación (queda registrado)' },
     'reverse.default':    { zh: '客人要求改记', es: 'El cliente pide corregirlo' },
+    'reverse.needReason': { zh: '请写明撤销原因', es: 'Indique el motivo de la anulación' },
     'reverse.ok':         { zh: '确认撤销',    es: 'Anular' },
     'reverse.done':       { zh: '已撤销，可重新记账', es: 'Anulado, puede volver a asignarlo' },
     'freeMeal.btn':       { zh: '标记为免费餐（10送1 核销）',

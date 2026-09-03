@@ -220,14 +220,40 @@ final class LedgerRepo
      *    排除之后：撤销把原流水标成 REVERSED，那一笔的额度正好还回来一次
      *    （值也一并没了，clawBackOverIssued 会把券收回），前后是一致的。
      */
-    public function manualAmountSince(int $operatorId, string $since): int
+    /**
+     * 这位操作员从 $since 起手工录进去多少钱（分）。
+     *
+     * @param bool $forUpdate 是否把这段区间【锁住】。
+     *
+     * ── 🔴 判日额度时必须锁（审计 F14） ─────────────────────
+     *
+     * 日额度是「读一下再写」：读出今天用了多少，判没超，才写。
+     * 中间没有锁就等于没上限 —— 四台 Pad 同时提交各自读到「今天用了 0」，
+     * 各自放行，€ 300 的上限被撑成 € 600。
+     * 与 checkAndGrant 那次「四个进程发出四张券」完全同形。
+     *
+     * FOR UPDATE 在 InnoDB 里对【扫过的索引区间】上 next-key 锁，
+     * 后来的 INSERT 落进这段区间就得排队 —— 这正是要的语义：
+     * 「我刚量过的这一段，谁也别往里加东西」。
+     *
+     * ★ 必须走 idx_operator (store_code, operator_id, created_at)（迁移 016）。
+     *   没有索引就是全表扫，锁的是整张流水表 ——
+     *   一个手工录入把全店记账都堵住。
+     *
+     * ★ 为什么不锁 operator 那一行（第一版方案）：那要求 operator 表里
+     *   确实有这一行才锁得住，而「碰巧存在」不是可以拿来守钱的性质。
+     *   冒烟测试里那个合成操作员没有对应行，上限当场被撑破 € 360/€ 300，
+     *   而代码看上去完全正确。锁数据本身就没有这个前提。
+     */
+    public function manualAmountSince(int $operatorId, string $since, bool $forUpdate = false): int
     {
         return Money::toCents((string)($this->db->value(
             'SELECT COALESCE(SUM(amount), 0) FROM point_ledger
-              WHERE store_code = ? AND source = ? AND operator_id = ?
-                AND entry_type = ? AND status = ? AND created_at >= ?',
-            [$this->storeCode, self::SRC_MANUAL, $operatorId,
-             self::T_EARN, self::S_ACTIVE, $since]
+              WHERE store_code = ? AND operator_id = ? AND created_at >= ?
+                AND source = ? AND entry_type = ? AND status = ?'
+            . ($forUpdate ? ' FOR UPDATE' : ''),
+            [$this->storeCode, $operatorId, $since,
+             self::SRC_MANUAL, self::T_EARN, self::S_ACTIVE]
         ) ?? '0'));
     }
 

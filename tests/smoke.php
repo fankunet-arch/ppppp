@@ -4665,6 +4665,150 @@ $pxDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$pxI
 $pxDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pxIds})", [SMOKE_STORE]);
 $pxDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '46000000%'", [SMOKE_STORE]);
 
+step('㊾ 空行锁人 / 撤销无理由 / 告警吞并 / 额度并发（审计 F10–F15）');
+
+$pyApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$pyDb  = $pyApp->localDb();
+$pyOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+
+// ── F10：0 元 0 份的空行会把人锁死在这张单上 ───────────────
+$pyPos = new FakePosSource();
+$pyPos->now = date('Y-m-d H:i:s');
+$pyPos->addHead(['serial_id' => '4800000001', 'order_head_id' => 480001, 'check_id' => 1,
+    'table_name' => 'PY1', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($pyPos->now) - 600)]);
+$pyPos->addDetail(480001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$pyApp->setPosSource($pyPos);
+$pyApp->points()->locate('PY1', 3600);
+$pyA = (int)$pyApp->members()->create('TK-00048001-PYA', null, null, null)['id'];
+$pyB = (int)$pyApp->members()->create('TK-00048002-PYB', null, null, null)['id'];
+$py10 = $pyApp->points()->grant('4800000001', [
+    ['member_id' => $pyA, 'amount_cents' => 4780, 'portions' => 2],
+    ['member_id' => $pyB, 'amount_cents' => 0,    'portions' => 0],
+], Vip\PointsEngine::MODE_PICK, $pyOp);
+eq('zero_allocation', $py10['error'] ?? '',
+   '★★★ F10 夹在多人提交里的一条「0 元 0 份」被拒 —— 原来只有整笔全零才拒，'
+ . '这种行会落成一条 0 元 0 分 0 次的流水，把那位客人【永久锁死在这张单上】：'
+ . '想补记撞 member_already_on_order，想撤销又没有钱和次可撤');
+eq(0, (int)$pyDb->value('SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND serial_id=?',
+                        [SMOKE_STORE, '4800000001']),
+   '  └ 整笔被拒，一条流水都没落（不是「记了 A、漏了 B」那种半成品）');
+ok(($pyApp->points()->grant('4800000001', [
+        ['member_id' => $pyA, 'amount_cents' => 4780, 'portions' => 2],
+    ], Vip\PointsEngine::MODE_PICK, $pyOp)['ok'] ?? false),
+   '  └ 去掉空行后照常记得上');
+
+// ── F11：撤销必须写原因 ───────────────────────────────
+$pyLid = (int)$pyDb->value('SELECT id FROM point_ledger WHERE store_code=? AND serial_id=?
+                             ORDER BY id DESC LIMIT 1', [SMOKE_STORE, '4800000001']);
+eq('reason_required', $pyApp->points()->reverse($pyLid, '', $pyOp)['error'] ?? '',
+   '★★★ F11 空原因撤不了 —— 撤销是不可逆的减钱动作（分、次、消费额一起退，'
+ . '靠它挣来的券还会被连带作废），而这条路原来允许空原因：'
+ . '客人事后来问「我上周那顿怎么没了」，审计日志里只有一个空串');
+eq('reason_required', $pyApp->points()->reverse($pyLid, '   ', $pyOp)['error'] ?? '',
+   '  └ 全是空格也不行');
+ok($pyApp->points()->reverse($pyLid, '客人要求改记', $pyOp)['ok'] ?? false,
+   '  └ 写了原因就撤得掉（与整组撤销 /points/reverse-group 口径一致，'
+ . '原来只有整组那条要求填，同一件事两条路两套话）');
+
+// ── F13：告警去重键的粒度 ─────────────────────────────
+/**
+ * raiseOnce 的去重键是 (alert_type, ref_type, ref_id)。
+ * 「白送了一顿饭」原来只按【会员】去重，于是同一位常客身上第二次、
+ * 第三次发生同样的事全被吞掉 —— 而每一条都是实打实的一顿免费餐。
+ */
+$pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
+            [SMOKE_STORE, 'reward_on_shrunk_order']);
+$pyApp->alerts()->raiseOnce('reward_on_shrunk_order', 'member', '777@SER-A', '甲单白送了一顿');
+$pyApp->alerts()->raiseOnce('reward_on_shrunk_order', 'member', '777@SER-B', '乙单又白送了一顿');
+$pyApp->alerts()->raiseOnce('reward_on_shrunk_order', 'member', '777@SER-A', '甲单重复推送');
+eq(2, (int)$pyDb->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=? AND status=0',
+                        [SMOKE_STORE, 'reward_on_shrunk_order']),
+   '★★★ F13 同一位客人身上两张不同订单白送两顿 → 两条告警（原来只按会员去重，'
+ . '第二顿被当成重复告警吞掉，越是反复出问题的客人越被吞得干净）');
+ok(str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Service/ReconcileService.php'),
+                "'reward_on_shrunk_order', 'member', \$mid . '@' . \$serial"),
+   '  └ 值比对那条确实带上了订单号');
+ok(str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Service/PointsService.php'),
+                "'reward_on_reversed_grant', 'member', \$orig['member_id'] . '#' . \$ledgerId"),
+   '  └ 撤销那条带上了流水号（同一位客人被撤第二笔时不会被吞）');
+$pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
+            [SMOKE_STORE, 'reward_on_shrunk_order']);
+
+// ── F14：手工录入日额度 —— 真并发下还守不守得住 ────────────
+/**
+ * ★ 必须真的开几个进程。单进程顺序调用永远读得到上一笔的结果，
+ *   怎么跑都是绿的 —— 与 ㊱ 死锁那一段同一个道理。
+ */
+$pyCfg0 = [];
+foreach (['manual_entry_enabled' => '1', 'manual_entry_min' => '1.00',
+          'manual_entry_daily_cap' => '300.00', 'manual_entry_limit' => '500.00',
+          'manual_entry_hard_limit' => '5000.00', 'manual_entry_daily_alert' => '999',
+          'points_mode' => 'by_amount'] as $k => $v) {
+    $pyCfg0[$k] = $pyApp->cfg()->get($k, '');
+    $pyApp->cfg()->set($k, $v);
+}
+$pyM = (int)$pyApp->members()->create('TK-00048003-PYC', null, null, null)['id'];
+// 先把这个操作员今天已有的手工流水清掉，额度才从 0 起算
+$pyDb->exec('DELETE FROM point_ledger WHERE store_code=? AND source=? AND operator_id=1',
+            [SMOKE_STORE, Vip\Repo\LedgerRepo::SRC_MANUAL]);
+$pyDb->exec('UPDATE member SET points_balance=0, total_spent=0, visit_count=0
+              WHERE store_code=? AND id=?', [SMOKE_STORE, $pyM]);
+
+$MC_W = 4;                       // 4 台 Pad
+$MC_N = 5;                       // 每台连录 5 笔 × € 20 = € 100
+$mcStart = microtime(true) + 2.0;
+$mcProcs = [];
+for ($w = 0; $w < $MC_W; $w++) {
+    $mcProcs[] = popen($envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+        . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' '
+        . $pyM . ' 2000 ' . $MC_N . ' ' . sprintf('%.4f', $mcStart) . ' 2>/dev/null', 'r');
+}
+$mcOk = 0;
+foreach ($mcProcs as $ph) {
+    if ($ph === false) { continue; }
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)));
+    $mcOk += (int)($line[0] ?? 0);
+    pclose($ph);
+}
+$mcUsed = (int)$pyDb->value(
+    'SELECT COALESCE(SUM(amount),0)*100 FROM point_ledger
+      WHERE store_code=? AND source=? AND operator_id=1 AND entry_type=? AND status=?',
+    [SMOKE_STORE, Vip\Repo\LedgerRepo::SRC_MANUAL,
+     Vip\Repo\LedgerRepo::T_EARN, Vip\Repo\LedgerRepo::S_ACTIVE]);
+ok($mcUsed <= 30000,
+   "★★★ F14 {$MC_W} 台 Pad 同时连录（共 € " . number_format($MC_W * $MC_N * 20, 2)
+   . ' 的意图），落库总额 € ' . number_format($mcUsed / 100, 2) . ' 没超过上限 € 300.00'
+   . ' —— 这道上限原来在事务【外面】读一下再写，四个进程各自读到「今天用了 0」'
+   . '各自放行，€ 300 被撑成 € 600；与 checkAndGrant 那次「四进程发四张券」同形');
+eq(15, $mcOk, '  └ 恰好 15 笔 × € 20 = € 300 记进去，其余全被拦下（不多不少）');
+foreach ($pyCfg0 as $k => $v) { $pyApp->cfg()->set($k, $v); }
+
+// ── F12 / F15：源码级的两条（不依赖运行时环境） ───────────────
+ok(!preg_match('/(?<![*\s])mb_strtoupper\s*\(/',
+       (string)file_get_contents(__DIR__ . '/../app/lib/ConfigSchema.php'))
+   && !str_contains((string)file_get_contents(__DIR__ . '/../app/lib/ConfigSchema.php'),
+                    '$up = mb_strtoupper'),
+   '★★ F12 核销名称校验不再调 mb_strtoupper —— 现场踩过 mbstring 没装，'
+ . '那时 PointsEngine 里同一个调用让【整条核销路径】挂掉；'
+ . '这里再写一次就是把坑挖在后台保存的路上：店家一改名称就是 500，看不到原因');
+$py12 = new ReflectionMethod(Vip\ConfigSchema::class, 'checkRedeemPatterns');
+$py12->setAccessible(true);
+ok($py12->invoke(null, 'TARJETA 10+1') === null, '  └ 正常的核销名称照样通过');
+ok($py12->invoke(null, 'cupón especial') !== null,
+   '  └ 小写带重音的 cupón 也拦得住（黑名单里大小写两种写法都列了，不指望函数去折）');
+ok(!str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Service/PointsService.php'),
+                 '$maxDays * 86400'),
+   '★★ F15 小票回溯改按【日历天】—— 减秒数会让回溯窗在夏令时那两天各差一小时，'
+ . '春季那天卡在窗边的小票就查不到了，而单子就在客人手里');
+
+$pyIds = implode(',', [$pyA, $pyB, $pyM]);
+$pyDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$pyIds})", [SMOKE_STORE]);
+$pyDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$pyIds})", [SMOKE_STORE]);
+$pyDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pyIds})", [SMOKE_STORE]);
+$pyDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '48000000%'", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(
