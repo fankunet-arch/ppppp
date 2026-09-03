@@ -4798,7 +4798,7 @@ $mcStart = microtime(true) + 2.0;
 $mcProcs = [];
 for ($w = 0; $w < $MC_W; $w++) {
     $mcProcs[] = popen($envPrefix . escapeshellcmd(PHP_BINARY) . ' '
-        . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' '
+        . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' manual '
         . $pyM . ' 2000 ' . $MC_N . ' ' . sprintf('%.4f', $mcStart) . ' 2>/dev/null', 'r');
 }
 $mcOk = 0; $mcWhy = [];
@@ -4821,6 +4821,102 @@ ok($mcUsed <= 30000,
    . ' —— 这道上限原来在事务【外面】读一下再写，四个进程各自读到「今天用了 0」'
    . '各自放行，€ 300 被撑成 € 600；与 checkAndGrant 那次「四进程发四张券」同形');
 eq(15, $mcOk, '  └ 恰好 15 笔 × € 20 = € 300 记进去，其余全被拦下（不多不少）' . $mcWhyTxt);
+/**
+ * ── 🔴 第二件事：那把互斥不能和【正常记账】死锁 ───────────────
+ *
+ * 第一版的互斥是 `SELECT … FOR UPDATE` 锁流水区间。它把正常记账的
+ * INSERT 也圈了进去，而两条路的加锁顺序正好相反 ——
+ * 更要命的是 InnoDB 的 gap 锁【彼此不冲突】：两笔手工录入都拿得到
+ * 同一个 gap，然后各自往里 INSERT，互相等对方的 gap 锁。
+ * 实测 160 笔里 5–7 笔冲破 LocalDb 的两次重试，柜台上就是「数据库繁忙」。
+ *
+ * ★★ 这一段的规模是【量出来的，不是拍的】。
+ *
+ *    第一版断言直接挂在上面那 20 笔额度测试上，结果是【假绿】：
+ *    把区间锁改回去，源码那条断言变红了，而「0 死锁」那条照样绿。
+ *    原因是额度一旦撞上限，后面的尝试就不再 INSERT，也就撞不出那个环 ——
+ *    真正需要的是【几十笔都能成功写进去】的手工录入在互相挤。
+ *    所以这里把上限调高、单独跑一遍，规模照着能稳定复现的那个量取。
+ *    （docs/13 §3.6：断言绿了，要能说清是因为代码对，还是规模不够。）
+ */
+$pyApp->cfg()->set('manual_entry_daily_cap', '100000.00');   // 本段不测额度，调高让它们都写得进去
+$pyDb->exec('DELETE FROM point_ledger WHERE store_code=? AND source=? AND operator_id=1',
+            [SMOKE_STORE, Vip\Repo\LedgerRepo::SRC_MANUAL]);
+
+/**
+ * ★ 环的两半是【手工录入】和【正常记账】——InnoDB 自己的死锁记录：
+ *     TRX A（手工）持有 idx_operator 上的 X gap 锁，等 member 行锁
+ *     TRX B（记账）持有 member 行锁，  等着往那个 gap 里 insert
+ *   手工那条先锁区间再锁会员行，记账那条先锁会员行再往区间里插 ——
+ *   顺序正好相反。所以【两种进程都得开】，而且记账那侧要真的写得进去。
+ *
+ *   ★ 这一点是量出来的：第一版只开手工进程，160 笔照样全绿；
+ *     把区间锁改回去它也绿 —— 因为环的另一半根本没来。
+ *     （我一开始把 InnoDB 那条记录读成「手工 ↔ 手工」，
+ *       依据是「失败的全在手工那侧」—— 那只说明 InnoDB 每次挑的
+ *       牺牲者是手工那笔，不代表另一半也是手工。）
+ */
+// 记账那侧要有真订单可记，先造 40 张
+$dlPos = new FakePosSource();
+$dlPos->now = date('Y-m-d H:i:s');
+// ★ 每个记账进程一段【自己的】订单号 —— 抢同一批的话，第二个进程
+//   会全部撞上 member_already_on_order，一笔都插不进去，环的另一半又没来了。
+$dlSerials = [];
+foreach (['8601', '8602'] as $wIdx => $pfx) {
+    for ($i = 0; $i < 40; $i++) {
+        $ser = sprintf('%s%04d', $pfx, $i);
+        $oh  = (int)$pfx * 10000 + $i;
+        $dlSerials[] = $ser;
+        $dlPos->addHead(['serial_id' => $ser, 'order_head_id' => $oh,
+            'check_id' => 1, 'table_name' => 'DL' . $wIdx . '_' . $i, 'eat_type' => 0,
+            'customer_num' => 1, 'original_amount' => '23.90',
+            'should_amount' => '23.90', 'actual_amount' => '23.90',
+            'order_end_time' => date('Y-m-d H:i:s', strtotime($dlPos->now) - 600)]);
+        $dlPos->addDetail($oh, 1,
+            [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '23.90', 1)]);
+    }
+}
+$pyApp->setPosSource($dlPos);
+foreach ([0, 1] as $wIdx) {
+    for ($i = 0; $i < 40; $i++) { $pyApp->points()->locate('DL' . $wIdx . '_' . $i, 3600); }
+}
+
+$DL_MW = 2; $DL_MN = 40;     // 2 个手工进程 × 40 笔
+$DL_GW = 2; $DL_GN = 40;     // 2 个记账进程 × 40 笔（同一操作员、同一会员）
+$dlmStart = microtime(true) + 2.0;
+$dlmProcs = [];
+for ($w = 0; $w < $DL_MW; $w++) {
+    $dlmProcs[] = popen($envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+        . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' manual '
+        . $pyM . ' 2000 ' . $DL_MN . ' ' . sprintf('%.4f', $dlmStart) . ' 2>/dev/null', 'r');
+}
+foreach (['8601', '8602'] as $pfx) {
+    $dlmProcs[] = popen($envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+        . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' grant '
+        . $pyM . ' 2390 ' . $DL_GN . ' ' . sprintf('%.4f', $dlmStart) . ' ' . $pfx . ' 2>/dev/null', 'r');
+}
+$mcDead = 0; $mcDeadOk = 0; $mcDeadWhy = [];
+foreach ($dlmProcs as $ph) {
+    if ($ph === false) { continue; }
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
+    $mcDeadOk   += (int)($line[0] ?? 0);
+    $mcDead     += (int)($line[1] ?? 0);
+    $mcDeadWhy[] = trim((string)($line[2] ?? ''));
+    pclose($ph);
+}
+$mcDeadTotal = $DL_MW * $DL_MN + $DL_GW * $DL_GN;
+eq(0, $mcDead,
+   "★★★ 手工录入 × {$DL_MW} + 正常记账 × {$DL_GW} 个进程、共 {$mcDeadTotal} 笔，【一次死锁都没有】"
+ . ' —— 这道互斥的第一版是 SELECT … FOR UPDATE 锁流水区间，它把正常记账的 INSERT'
+ . '也圈了进去，而两条路的加锁顺序正好相反（手工：先区间后会员行；记账：先会员行后插入）。'
+ . '同样规模下实测 5–7 笔冲破 LocalDb 的两次重试，柜台上就是「数据库繁忙」。'
+ . '现在锁的是 manual_entry_lock 上的【单行】，正常记账根本不碰它'
+ . $workerWhy($mcDeadWhy));
+eq($mcDeadTotal, $mcDeadOk,
+   "  └ 而且 {$mcDeadTotal} 笔一笔不少地写进去了 —— 这是上一条的【前提】，"
+ . '也是这条断言唯一有牙齿的条件：额度一撞上限、或记账那侧没有真订单可记，'
+ . '就不再 INSERT，环的另一半不来，改回区间锁它照样绿（docs/13 §3.6 的「假绿」）');
+$pyApp->cfg()->set('manual_entry_daily_cap', '300.00');
 foreach ($pyCfg0 as $k => $v) { $pyApp->cfg()->set($k, $v); }
 
 // ── F12 / F15：源码级的两条（不依赖运行时环境） ───────────────
@@ -4846,6 +4942,10 @@ $pyDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$pyI
 $pyDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$pyIds})", [SMOKE_STORE]);
 $pyDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pyIds})", [SMOKE_STORE]);
 $pyDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '48000000%'", [SMOKE_STORE]);
+// 死锁那一段造的订单（本段自己造的，本段自己收）
+$pyDb->exec("DELETE FROM point_ledger WHERE store_code=? AND serial_id LIKE '860%'", [SMOKE_STORE]);
+$pyDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '860%'", [SMOKE_STORE]);
+$pyDb->exec('DELETE FROM manual_entry_lock WHERE store_code=?', [SMOKE_STORE]);
 
 step('⑬ 不变量总校验');
 

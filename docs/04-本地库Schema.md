@@ -212,6 +212,38 @@ CREATE TABLE `point_ledger` (
 - `review_status = 1`，自动进入后台待复核队列
 - 金额超过 `sys_config.manual_entry_limit` 时需 `approved_by`
 
+#### 日额度的互斥行 `manual_entry_lock`
+
+```sql
+CREATE TABLE `manual_entry_lock` (
+  `store_code`  VARCHAR(20) NOT NULL,
+  `operator_id` INT         NOT NULL,
+  `updated_at`  DATETIME    NOT NULL,
+  PRIMARY KEY (`store_code`,`operator_id`)
+) ENGINE=InnoDB;   -- 018
+```
+
+**只当互斥量用，不存任何业务数值。**「这位操作员今天手工录了多少」
+仍然实时从 `point_ledger` 算 —— 单一真相不变，撤销后额度自动释放
+这一现有语义也不变。
+
+为什么需要它：`manual_entry_daily_cap` 是「读一下再写」
+（读出今天用了多少 → 判没超 → 才写）。中间没有互斥就等于没上限，
+实测 4 台 Pad 同时连录，€ 300 的上限落进 € 360。
+
+为什么不锁别的：
+
+| 锁什么 | 为什么不行 |
+|---|---|
+| 会员行 | 额度按**操作员**算，同一个人给两位不同客人各录一笔照样并发 |
+| `operator` 那一行 | 要求那一行确实存在。冒烟里的合成操作员没有对应行，锁当场落空而代码看上去完全正确 —— 「碰巧存在」不是可以拿来守钱的性质 |
+| 流水的**区间**（`SELECT … FOR UPDATE`） | InnoDB 的 gap 锁**彼此不冲突**：两笔手工录入都拿得到同一个 gap，然后各自要往里 `INSERT`，互相等对方的 gap 锁。实测每 160 笔死锁 5–7 次 |
+
+> 🔴 **调用顺序是固定的**：`ensureQuotaRow()`（**事务外**，autocommit）
+> → `transaction { lockManualQuota() → 读额度 → 锁会员行 → 写流水 }`。
+> 补行那一步放进事务里的话，两个事务同时 `INSERT` 同一个主键会各拿一把
+> S 锁、随后都要升级成 X —— 又是一个死锁环。
+
 ### 4.1 撤销示例
 
 ```

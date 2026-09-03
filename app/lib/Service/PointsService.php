@@ -1676,6 +1676,14 @@ final class PointsService
          */
         $dayCap = Money::toCents($this->cfg->get('manual_entry_daily_cap', '0'));
         /**
+         * ★ 互斥行【在事务外】先补齐（见 LedgerRepo::ensureQuotaRow）。
+         *   放进事务里的话，两个事务同时 INSERT 同一个主键会各拿一把 S 锁，
+         *   随后都要升级成 X —— 又是一个死锁环。
+         */
+        if ($dayCap > 0) {
+            $this->ledger->ensureQuotaRow((int)($operator['id'] ?? 0));
+        }
+        /**
          * 两道上限，管的事情不一样：
          *
          * ① manual_entry_limit（软）—— 超过要经理放行。经理身份即视为已批
@@ -1718,10 +1726,11 @@ final class PointsService
              * 与 checkAndGrant 那次「四个进程发出四张券」是同一个形状：
              * 「读一下再写」而中间没有锁，等于没上限。
              *
-             * 锁的是【这个操作员今天那一段流水】本身（额度按操作员算）。
+             * 锁的是 manual_entry_lock 里【这个操作员那一行】（额度按操作员算）。
              * 锁会员行不够 —— 同一个人给两位不同客人各录一笔照样并发；
              * 锁 operator 表那一行也不行 —— 那要求那一行确实存在，
-             * 而「碰巧存在」不是可以拿来守钱的性质。
+             * 而「碰巧存在」不是可以拿来守钱的性质；
+             * 锁流水的区间更不行 —— gap 锁彼此不冲突，反而制造死锁。
              *
              * ★ 起点按【营业日】，不是日历零点。
              *   切点 02:00，晚市 19:30 做到凌晨 02:00 —— 一个班次跨零点。
@@ -1733,11 +1742,13 @@ final class PointsService
              */
             $opIdPre = (int)($operator['id'] ?? 0);
             if ($dayCap > 0 && $opIdPre > 0) {
-                // FOR UPDATE：把「这个操作员今天的手工流水」这一段锁住，
-                // 后来的 INSERT 得排队。锁的是数据本身，不依赖 operator 表里
-                // 有没有这一行 —— 见 manualAmountSince() 的说明。
+                // 单行 X 锁：同一个操作员的手工录入在这里排队。
+                // 不能改成锁流水的区间 —— gap 锁彼此不冲突，两笔都拿得到，
+                // 然后各自 INSERT 进去互等，实测每 160 笔死锁 5–7 次
+                // （见 LedgerRepo::lockManualQuota）。
+                $this->ledger->lockManualQuota($opIdPre);
                 $usedToday = $this->ledger->manualAmountSince(
-                    $opIdPre, $this->businessDayStart(), true);
+                    $opIdPre, $this->businessDayStart());
                 if ($usedToday + $amountCents > $dayCap) {
                     return ['ok' => false, 'error' => 'exceeds_manual_daily_cap',
                             'detail' => ['cap' => Money::toStr($dayCap),

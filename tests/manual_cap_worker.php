@@ -12,44 +12,64 @@
  * 各自判「没超」、各自写进去 —— 上限 € 300 被撑成 € 600。
  * 与 checkAndGrant 那次「四个进程发出四张券」是同一个形状。
  *
+ * ── 🔴 它还守着第二件事：不能和【正常记账】死锁 ──────────────
+ *
+ * 第一版的互斥是 `SELECT … FOR UPDATE` 锁流水的区间。实测（同一操作员，
+ * 2 个手工进程 + 2 个记账进程各 40 笔）160 笔里有 5–7 笔冲破了
+ * LocalDb 的两次重试，在柜台上表现为「数据库繁忙」。
+ * InnoDB 的记录说得很清楚：gap 锁彼此不冲突，两笔手工录入都拿得到
+ * 同一个 gap，然后各自要往里 INSERT，互相等对方的 gap 锁。
+ * 改成 manual_entry_lock 上的【单行】X 锁之后 160/160 全过、0 死锁。
+ *
+ * 所以这个进程支持两种模式，由 smoke 混着开 —— 只跑手工那一种
+ * 复现不出上面那个环。
+ *
  * 用法（由 smoke 传参，人不用手工跑）：
- *   php tests/manual_cap_worker.php <会员id> <每笔金额分> <笔数> <对齐时刻>
- * 输出一行：成功笔数 空格 被上限拦下的笔数
+ *   php tests/manual_cap_worker.php <manual|grant> <会员id> <每笔金额分> <笔数> <对齐时刻> [订单号前缀]
+ * 输出一行：成功笔数 空格 逃逸的死锁数 [失败原因]
  */
 declare(strict_types=1);
 
 require __DIR__ . '/worker_boot.php';
 
-$memberId = (int)($argv[1] ?? 0);
-$cents    = (int)($argv[2] ?? 0);
-$count    = (int)($argv[3] ?? 0);
-$startAt  = (float)($argv[4] ?? 0);
-if ($memberId <= 0 || $cents <= 0 || $count <= 0) {
-    worker_die('参数不对：usage: manual_cap_worker.php <member_id> <cents> <count> <start_at>');
+$kind     = (string)($argv[1] ?? '');
+$memberId = (int)($argv[2] ?? 0);
+$cents    = (int)($argv[3] ?? 0);
+$count    = (int)($argv[4] ?? 0);
+$startAt  = (float)($argv[5] ?? 0);
+// grant 模式下用哪一段订单号（由 smoke 造好夹具再传进来）
+$prefix   = (string)($argv[6] ?? '860000');
+if (!in_array($kind, ['manual', 'grant'], true) || $memberId <= 0 || $cents <= 0 || $count <= 0) {
+    worker_die('参数不对：usage: manual_cap_worker.php <manual|grant> <member_id> <cents> <count> <start_at>');
 }
 
 $app = worker_app();
 
-// ★ 同一个操作员 id —— 额度就是按操作员算的，换了人这条断言什么也测不出
-$op = ['id' => 1, 'name' => '冒烟并发', 'device' => 'MCW', 'approved_by' => 1];
+// ★ 同一个操作员 id —— 额度就是按操作员算的，换了人这条断言什么也测不出；
+//   死锁那一条也一样：两条路要撞上，得是同一个操作员。
+$op = ['id' => 1, 'name' => '冒烟并发', 'device' => 'MCW', 'approved_by' => 1,
+       'role' => 2, 'is_manager' => true];
 
 while (microtime(true) < $startAt) {
     usleep(200);
 }
 
 $ok = 0;
-$capped = 0;
+$dead = 0;
 for ($i = 0; $i < $count; $i++) {
     try {
-        $r = $app->points()->manualGrant($memberId, $cents, 'system_not_found', $op);
-        if ($r['ok'] ?? false) {
-            $ok++;
-        } elseif (($r['error'] ?? '') === 'exceeds_manual_daily_cap') {
-            $capped++;
-        }
+        $r = $kind === 'manual'
+            ? $app->points()->manualGrant($memberId, $cents, 'system_not_found', $op)
+            : $app->points()->grant(sprintf('%s%04d', $prefix, $i),
+                  [['member_id' => $memberId, 'amount_cents' => $cents, 'portions' => 1]],
+                  Vip\PointsEngine::MODE_SPLIT, $op);
+        if ($r['ok'] ?? false) { $ok++; }
+    } catch (\PDOException $e) {
+        // ★ 冲破了 LocalDb 两次重试的死锁/锁等待 —— 柜台上就是「数据库繁忙」
+        if (in_array((int)($e->errorInfo[1] ?? 0), [1213, 1205], true)) { $dead++; }
     } catch (\Throwable $e) {
-        // 锁等待超时等一律算「没记进去」，不影响本段要守的那条
+        // 其余异常不属于本段关心的范围
     }
 }
 
-echo $ok . ' ' . $capped . "\n";
+echo $ok . ' ' . $dead . "\n";
