@@ -18,34 +18,17 @@
  */
 declare(strict_types=1);
 
-if (PHP_SAPI !== 'cli') {
-    http_response_code(404);
-    exit;
-}
-
-require __DIR__ . '/../app/bootstrap.php';
+require __DIR__ . '/worker_boot.php';
 
 $memberId = (int)($argv[1] ?? 0);
 $cents    = (int)($argv[2] ?? 0);
 $count    = (int)($argv[3] ?? 0);
 $startAt  = (float)($argv[4] ?? 0);
 if ($memberId <= 0 || $cents <= 0 || $count <= 0) {
-    fwrite(STDERR, "usage: manual_cap_worker.php <member_id> <cents> <count> <start_at>\n");
-    exit(2);
+    worker_die('参数不对：usage: manual_cap_worker.php <member_id> <cents> <count> <start_at>');
 }
 
-$app = new Vip\App([
-    'store_code' => getenv('SMOKE_STORE') ?: 'SMOKE',
-    'local_db'   => [
-        'host'     => getenv('SMOKE_DB_HOST') ?: '127.0.0.1',
-        'port'     => (int)(getenv('SMOKE_DB_PORT') ?: 3306),
-        'database' => getenv('SMOKE_DB_NAME') ?: '',
-        'user'     => getenv('SMOKE_DB_USER') ?: '',
-        'password' => getenv('SMOKE_DB_PASS') ?: '',
-        'charset'  => 'utf8mb4',
-    ],
-    'pos_db' => [],
-]);
+$app = worker_app();
 
 // ★ 同一个操作员 id —— 额度就是按操作员算的，换了人这条断言什么也测不出
 $op = ['id' => 1, 'name' => '冒烟并发', 'device' => 'MCW', 'approved_by' => 1];

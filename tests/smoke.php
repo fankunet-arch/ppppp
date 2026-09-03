@@ -2588,12 +2588,25 @@ for ($i = 0; $i < $WORKERS; $i++) {
          . $cgMid . ' ' . sprintf('%.4f', $startAt) . ' 2>/dev/null';
     $procs[] = popen($cmd, 'r');
 }
-$granted = 0;
+/**
+ * ★ 工作进程约定：只往标准输出写一行「<数> <数> [失败原因]」。
+ *   带原因时要把它原样带进断言文案 —— 否则 bootstrap 失败（比如缺
+ *   config.php）只会表现成「什么都没输出」，被解析成 0，
+ *   最后报出来的是一个和本段要守的东西毫无关系的数字。
+ */
+$workerWhy = static function (array $lines): string {
+    $why = array_values(array_filter($lines, static fn(string $x): bool => $x !== ''));
+    return $why ? '（工作进程说：' . implode('；', array_unique($why)) . '）' : '';
+};
+$granted = 0; $cgWhy = [];
 foreach ($procs as $ph) {
     if ($ph === false) { continue; }
-    $granted += (int)trim((string)stream_get_contents($ph));
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
+    $granted += (int)($line[0] ?? 0);
+    $cgWhy[]  = trim((string)($line[2] ?? ''));
     pclose($ph);
 }
+$cgWhyTxt = $workerWhy($cgWhy);
 
 $cgCoupons = (int)$cgDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=?',
                                [SMOKE_STORE, $cgMid]);
@@ -2602,7 +2615,8 @@ $cgIssued  = (int)$cgDb->value('SELECT rewards_issued FROM member WHERE store_co
 $expect    = intdiv(10, 10);   // floor(progress / threshold)
 
 ok($granted === $expect,
-   sprintf('★★★ %d 个进程同时抢发券，合计只发出 %d 张（应为 %d 张）', $WORKERS, $granted, $expect));
+   sprintf('★★★ %d 个进程同时抢发券，合计只发出 %d 张（应为 %d 张）', $WORKERS, $granted, $expect)
+   . $cgWhyTxt);
 eq($expect, $cgCoupons, '  └ coupon 表里确实只有 ' . $expect . ' 张 —— 券是真金白银的一顿饭');
 eq($expect, $cgIssued, '  └ rewards_issued 与实发张数一致（不一致的话下次记账会再发一遍）');
 
@@ -3532,19 +3546,21 @@ for ($w = 0; $w < $DL_W; $w++) {
          . sprintf('%.4f', $dlStart) . ' 2>/dev/null';
     $dlProcs[] = popen($cmd, 'r');
 }
-$dlOk = 0; $dlDead = 0;
+$dlOk = 0; $dlDead = 0; $dlWhy = [];
 foreach ($dlProcs as $ph) {
     if ($ph === false) { continue; }
-    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)));
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
     $dlOk   += (int)($line[0] ?? 0);
     $dlDead += (int)($line[1] ?? 0);
+    $dlWhy[] = trim((string)($line[2] ?? ''));
     pclose($ph);
 }
+$dlWhyTxt = $workerWhy($dlWhy);
 
 $dlTotal = $DL_W * $DL_N;
 eq($dlTotal, $dlOk,
    "★★★ {$DL_W} 台 Pad 交叉点人、共 {$dlTotal} 单，【全部记进去】（实际 {$dlOk} 单）"
-   . ' —— 不固定加锁顺序时这里一半会失败');
+   . ' —— 不固定加锁顺序时这里一半会失败' . $dlWhyTxt);
 eq(0, $dlDead, '  └ 一次死锁都没有（固定加锁顺序是第一道，事务重试只是兜底）');
 
 /**
@@ -4765,13 +4781,15 @@ for ($w = 0; $w < $MC_W; $w++) {
         . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' '
         . $pyM . ' 2000 ' . $MC_N . ' ' . sprintf('%.4f', $mcStart) . ' 2>/dev/null', 'r');
 }
-$mcOk = 0;
+$mcOk = 0; $mcWhy = [];
 foreach ($mcProcs as $ph) {
     if ($ph === false) { continue; }
-    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)));
-    $mcOk += (int)($line[0] ?? 0);
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
+    $mcOk   += (int)($line[0] ?? 0);
+    $mcWhy[] = trim((string)($line[2] ?? ''));
     pclose($ph);
 }
+$mcWhyTxt = $workerWhy($mcWhy);
 $mcUsed = (int)$pyDb->value(
     'SELECT COALESCE(SUM(amount),0)*100 FROM point_ledger
       WHERE store_code=? AND source=? AND operator_id=1 AND entry_type=? AND status=?',
@@ -4782,7 +4800,7 @@ ok($mcUsed <= 30000,
    . ' 的意图），落库总额 € ' . number_format($mcUsed / 100, 2) . ' 没超过上限 € 300.00'
    . ' —— 这道上限原来在事务【外面】读一下再写，四个进程各自读到「今天用了 0」'
    . '各自放行，€ 300 被撑成 € 600；与 checkAndGrant 那次「四进程发四张券」同形');
-eq(15, $mcOk, '  └ 恰好 15 笔 × € 20 = € 300 记进去，其余全被拦下（不多不少）');
+eq(15, $mcOk, '  └ 恰好 15 笔 × € 20 = € 300 记进去，其余全被拦下（不多不少）' . $mcWhyTxt);
 foreach ($pyCfg0 as $k => $v) { $pyApp->cfg()->set($k, $v); }
 
 // ── F12 / F15：源码级的两条（不依赖运行时环境） ───────────────

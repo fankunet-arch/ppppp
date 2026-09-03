@@ -13,31 +13,15 @@
  */
 declare(strict_types=1);
 
-if (PHP_SAPI !== 'cli') {
-    http_response_code(404);
-    exit;
-}
-
-require __DIR__ . '/../app/bootstrap.php';
+require __DIR__ . '/worker_boot.php';
 
 $memberId = (int)($argv[1] ?? 0);
 $startAt  = (float)($argv[2] ?? 0);
 if ($memberId <= 0) {
-    fwrite(STDERR, "usage: reward_worker.php <member_id> <start_at>\n");
-    exit(2);
+    worker_die('参数不对：usage: reward_worker.php <member_id> <start_at>');
 }
 
-$app = new Vip\App([
-    'store_code' => getenv('SMOKE_STORE') ?: 'SMOKE',
-    'local_db'   => [
-        'host'     => getenv('SMOKE_DB_HOST') ?: '127.0.0.1',
-        'port'     => (int)(getenv('SMOKE_DB_PORT') ?: 3306),
-        'database' => getenv('SMOKE_DB_NAME') ?: '',
-        'user'     => getenv('SMOKE_DB_USER') ?: '',
-        'password' => getenv('SMOKE_DB_PASS') ?: '',
-    ],
-    'pos_db' => [],
-]);
+$app = worker_app();
 
 // 预热：把连接与服务装配都做完，免得对齐之后还在各干各的
 $app->localDb()->value('SELECT 1');
@@ -49,4 +33,5 @@ while (microtime(true) < $startAt) {
 }
 
 $r = $app->rewards()->checkAndGrant($memberId, ['id' => 1, 'name' => '并发冒烟', 'device' => 'SMOKE']);
-echo (int)($r['granted'] ?? 0), "\n";
+// 三字段约定：<发出的张数> <保留位> [失败原因]，与另两个工作进程一致
+echo (int)($r['granted'] ?? 0), " 0\n";
