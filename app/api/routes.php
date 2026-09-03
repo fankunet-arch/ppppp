@@ -1038,7 +1038,35 @@ $api->on('POST', '/points/manual', static function () use ($app, $requireOperato
         // 超限时经理身份即视为已审批
         'approved_by' => $op['is_manager'] ? $op['id'] : null,
     ]);
-    Api::fromResult($r);
+
+    /**
+     * ── 🔴 手工录入也要查一次达标（审计 F7） ──────────────────
+     *
+     * manualGrant 会 applyDelta 把 total_spent 加上去，但从来没调过
+     * checkAndGrant。于是 reward_mode = amount 时：客人这一笔正好跨过
+     * 门槛，券【不发】—— 而客人就站在柜台前等着。
+     *
+     * 靠「下次记账自愈」不成立：手工录入本来就是 POS 查不到单时的
+     * 降级路径（docs/03 §10），发生的当天往往正是最容易出岔子的那天；
+     * 而且客人可能就是拿着这一顿来兑的。
+     *
+     * ★ 与 /points/grant 完全同构：放在事务外、幂等靠 rewards_issued、
+     *   一条路怎么做另一条就怎么做（docs/13 §3.5）。
+     * ★ checkAndGrant 里那条 reward_from_manual_entry 告警本来就是
+     *   为这条路写的 —— 之前根本没被触发过，因为压根没走到。
+     */
+    $rewards = [];
+    if (($r['ok'] ?? false) === true) {
+        $g = $app->rewards()->checkAndGrant($memberId, ['id' => $op['id'], 'name' => $op['name']]);
+        if (($g['granted'] ?? 0) > 0 || ($g['pending'] ?? 0) > 0) {
+            $m = $app->members()->findById($memberId);
+            $rewards[] = [
+                'member_id' => $memberId, 'card_no' => $m['card_no'] ?? '',
+                'granted' => $g['granted'], 'pending' => $g['pending'], 'coupons' => $g['coupons'],
+            ];
+        }
+    }
+    Api::fromResult($r, ['rewards' => $rewards]);
 });
 
 /** 某会员近期流水（Pad 上查「刚才记给谁了」用） */

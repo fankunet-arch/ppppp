@@ -460,6 +460,42 @@ async function loadCoupons() {
     ['已作废', d.stats.void], ['累计发放', d.stats.total],
   ].map(([k, v, cls]) => `<div class="stat ${cls || ''}"><div class="n">${v}</div><div class="k">${k}</div></div>`).join('');
 
+  /* ── 「待发」队列（影子模式的落脚点，docs/13 §6） ───────────
+     关掉自动发放时，达标的客人堆在这里等经理逐个确认。
+     原来后台只有一个总数没有名单，经理看得到「欠 7 张」却查不出是谁，
+     那条上线建议实际上没法执行。 */
+  const pend = d.pending || [];
+  $('#coupon-pending').innerHTML = pend.length ? `
+    <div class="rule-banner ${d.auto_grant ? 'warn' : ''}">
+      待发 <b>${pend.reduce((s, p) => s + p.pending, 0)}</b> 张，共 ${pend.length} 位客人${
+        d.auto_grant
+          ? ' —— <b>自动发放是开着的，却仍有券没发出去</b>，请先查明原因再发'
+          : '（自动发放已关闭，由您逐位确认）'}
+    </div>
+    <table>
+      <tr><th>会员</th><th>等级</th><th>进度</th><th>待发</th><th></th></tr>${
+      pend.map(p => `<tr>
+        <td>${esc(p.card_no || '(无卡)')}</td>
+        <td>${esc(p.tier_code || '—')}</td>
+        <td class="muted small">${esc(p.text || '')}</td>
+        <td><b>${p.pending}</b></td>
+        <td><button class="tiny primary" data-cip="${p.member_id}"
+              data-cipn="${esc(p.card_no || '#' + p.member_id)}"
+              data-cipc="${p.pending}">发放</button></td>
+      </tr>`).join('')}
+    </table>` : '';
+
+  $$('[data-cip]').forEach(b => b.onclick = async () => {
+    if (!await UI.confirm(
+      `给 ${b.dataset.cipn} 发出 ${b.dataset.cipc} 张免费餐券？`,
+      { okText: '确认发放' })) return;
+    try {
+      const r = await api('/coupons/issue-pending', { member_id: +b.dataset.cip });
+      toast(`已发 ${r.granted} 张`, 'ok');
+      loadCoupons();
+    } catch (e) { toast(e.message, 'err'); }
+  });
+
   $('#coupon-list').innerHTML = d.coupons.length ? `<table>
     <tr><th>券码</th><th>会员</th><th>来源</th><th>状态</th><th>有效期至</th><th>核销时间</th><th>备注</th><th></th></tr>${
     d.coupons.map(c => {

@@ -177,6 +177,70 @@ final class OrderRepo
     }
 
     /**
+     * 定格值比对的基准 —— 只在【第一次发分】时写一次。
+     *
+     * ── 🔴 为什么不能拿 should_amount / actual_amount 当基准 ──────
+     *
+     * 那两列是【主库当前值的镜像】，有两条写入路径抢着刷：
+     *   buildContext()（收银员每次 locate）与 storeOrder()（每轮同步）。
+     * 发分之后只要再 locate 一次，基准就被刷成 POS 的新值，
+     * 值比对于是拿新值跟新值比 —— 永远相等，永远判「一致」。
+     *
+     * 实测：100.00 的单发 71.70 分 → POS 改成 0.00 → 再 locate 一次 →
+     *       比对 changed=0，积分照旧 71，镜像 total=0.00 / allocated=71.70。
+     *       「已分配额 > 可积分总额」当场破掉，而全流程零告警。
+     *
+     * ── 为什么是「只写一次」 ──────────────────────────────
+     *
+     * 基准的语义是「我们发这些分时，POS 说这一单值多少钱」。
+     * AA 分几次记，第二个人提交时不能把基准挪到当下 ——
+     * 那样第一个人那笔就失去了参照。缩水后自愈靠的是
+     * applyShrink 的 `excess = allocated - newTotal`（与基准无关），
+     * 基准只负责回答「要不要去读明细重算」这一个问题。
+     *
+     * 冲正完成后由 resyncVerifyBase() 重新定格 —— 那时点分与金额
+     * 重新对上了，下一轮才能便宜地判「一致」。
+     */
+    public function initVerifyBase(string $serialId): void
+    {
+        $this->db->exec(
+            'UPDATE pos_order
+                SET verify_base_should = should_amount,
+                    verify_base_actual = actual_amount,
+                    verify_base_at     = ?
+              WHERE store_code = ? AND serial_id = ? AND verify_base_at IS NULL',
+            [$this->db->now(), $this->storeCode, $serialId]
+        );
+    }
+
+    /**
+     * 值比对重算之后把镜像的可积分总额改过来。
+     *
+     * ★ 不走 upsert()：那条路会连带重写 should/actual/份数等一整排列，
+     *   而这里只知道「总额变成多少」这一件事。
+     */
+    public function setTotalAmount(string $serialId, int $cents): void
+    {
+        $this->db->exec(
+            'UPDATE pos_order SET total_amount = ?, updated_at = ?
+              WHERE store_code = ? AND serial_id = ?',
+            [Money::toStr($cents), $this->db->now(), $this->storeCode, $serialId]
+        );
+    }
+
+    /** 冲正之后重新定格基准（用刚从主库回读到的值，不是镜像里那份） */
+    public function resyncVerifyBase(string $serialId, int $shouldCents, int $actualCents): void
+    {
+        $this->db->exec(
+            'UPDATE pos_order
+                SET verify_base_should = ?, verify_base_actual = ?, verify_base_at = ?
+              WHERE store_code = ? AND serial_id = ?',
+            [Money::toStr($shouldCents), Money::toStr($actualCents),
+             $this->db->now(), $this->storeCode, $serialId]
+        );
+    }
+
+    /**
      * App 自己核销了一张券在这一单上 —— 把这个【确知的事实】写回镜像。
      *
      * ── 🔴 为什么必须有这一步 ─────────────────────────────
@@ -240,33 +304,79 @@ final class OrderRepo
     /** 值比对：更新核对状态 */
     public function markVerified(string $serialId, int $status): void
     {
+        /**
+         * ★ status = 0 的语义是「从没比对过」，所以要把时间戳一并清空。
+         *
+         *   pendingVerify() 现在按 last_verified_at 排队（保护期内反复比，
+         *   见那个方法的说明）。若这里给 status=0 也盖上「刚比过」的时间戳，
+         *   「重置以便立刻再比一次」这个动作就变成了【把它推迟一整轮】——
+         *   意思正好相反。
+         */
         $this->db->exec(
             'UPDATE pos_order SET verify_status = ?, last_verified_at = ?, updated_at = ?
               WHERE store_code = ? AND serial_id = ?',
-            [$status, $this->db->now(), $this->db->now(), $this->storeCode, $serialId]
+            [$status, $status === 0 ? null : $this->db->now(),
+             $this->db->now(), $this->storeCode, $serialId]
         );
     }
 
     /**
      * 取保护期内待值比对的订单（已发过分的才需要比对）。
-     * 命中 idx_verify。
+     *
+     * ── 🔴 保护期内要【反复比】，不是一生比一次 ──────────────
+     *
+     * 原来的条件是 `verify_status = 0`，而全仓库没有任何一处把它改回 0。
+     * 也就是说：每张单只在发分当晚比一次，判「一致」之后
+     * 就永久退出视野了。而 POS 的改单实测【2.9% 发生在结账之后，
+     * 其中 1,144 单晚于结账 30 分钟以上】（docs/01 §3.4）——
+     * 绝大多数改单发生在那唯一一次比对【之后】。
+     *
+     * 实测：第 1 晚判一致 → POS 把 50.00 改成 10.00 → 第 2 晚 checked=0，
+     *       一分钱没退。「值比对冲正」这条防线整条是空的。
+     *
+     * 现在：保护期内、离上次比对超过 $recheckHours 的都会再比一遍。
+     *
+     * ── 为什么四种状态都要复查 ────────────────────────────
+     *
+     *   0 从没比过           1 上次判一致       2 已冲正过     3 待人工
+     *
+     * 后三种都还会再变：改过一次的单会被再改一次；挂着人工待办的单
+     * 也可能在人处理之前又缩水。而复查本身是【自愈】的
+     * （applyShrink 按 `allocated - newTotal` 算，重跑不会重复扣），
+     * 所以多比一次的代价只是一次主键单点查。
+     *
+     * ── 主库负载 ──────────────────────────────────────
+     *
+     * 冲正之后基准会重新定格（resyncVerifyBase），所以稳态下每张单
+     * 每次复查都只是一次 reloadAmounts + 一次整数比较，不读明细。
+     * 保护期 30 天 × 日均 95.6 单 ≈ 2,870 单，复查间隔 168 小时（7 天）
+     * 时每晚约 410 单 + 当天新单 ≈ 500 单，比原来预算的
+     * 「2,870 单 29 批约 1 分钟」还轻。
+     *
+     * ★ 调用方是 while 循环且【不翻页】—— 靠 markVerified() 更新
+     *   last_verified_at 把已比过的挤出结果集来推进。所以 verifyOne()
+     *   的每一条返回路径都必须落一次 markVerified，否则死循环。
      */
-    public function pendingVerify(int $protectDays, int $limit, int $offset = 0): array
+    public function pendingVerify(int $protectDays, int $limit, int $offset = 0,
+                                  int $recheckHours = 168): array
     {
-        $limit  = max(1, min($limit, 100));
-        $since  = date('Y-m-d H:i:s', strtotime("-{$protectDays} days"));
+        $limit   = max(1, min($limit, 100));
+        $since   = date('Y-m-d H:i:s', strtotime("-{$protectDays} days"));
+        $reCut   = date('Y-m-d H:i:s', time() - max(1, $recheckHours) * 3600);
         return $this->db->all(
             // ★ 这里【故意不取 tax_amount】：值比对要的是「当下的」税额，
             //   由 reloadAmounts() 从主库回读（见 ReconcileService::verifyOne）。
             //   镜像里那一份是下单时的旧值，金额改过之后它一定是错的。
             'SELECT serial_id, order_head_id, check_ids, original_amount, should_amount,
-                    actual_amount, total_amount, allocated_amount
+                    actual_amount, total_amount, allocated_amount,
+                    verify_base_should, verify_base_actual, verify_base_at
                FROM pos_order
-              WHERE store_code = ? AND verify_status = 0
+              WHERE store_code = ?
                 AND order_end_time >= ? AND allocated_amount > 0
-              ORDER BY order_end_time ASC
+                AND (last_verified_at IS NULL OR last_verified_at < ?)
+              ORDER BY last_verified_at IS NULL DESC, order_end_time ASC
               LIMIT ' . $limit . ' OFFSET ' . max(0, $offset),
-            [$this->storeCode, $since]
+            [$this->storeCode, $since, $reCut]
         );
     }
 

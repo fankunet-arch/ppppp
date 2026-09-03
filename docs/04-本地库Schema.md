@@ -53,12 +53,26 @@ CREATE TABLE `pos_order` (
   `verify_status`     TINYINT      NOT NULL DEFAULT 0 COMMENT '0=保护期内 1=已核对一致 2=已冲正 3=待人工复核',
   `last_verified_at`  DATETIME     DEFAULT NULL       COMMENT '最近一次值比对时间',
 
+  -- ★ 值比对的【基准】必须有自己的列（015）。
+  --   should/actual/total 那三列是「主库当前值的镜像」，
+  --   buildContext（收银员每次 locate）和 storeOrder（每轮同步）都在刷它们；
+  --   拿它们当基准就是拿新值跟新值比，永远判「一致」——
+  --   实测 71.70 的单发满分、POS 改成 0.00、再 locate 一次，
+  --   值比对 changed=0，积分照旧，镜像变成 total=0.00 / allocated=71.70。
+  --   下面这三列【只有发分与冲正两条路会写】，同步与 locate 碰不到。
+  `verify_base_should` DECIMAL(11,2) DEFAULT NULL COMMENT '发分时刻的应收额；值比对基准，同步/locate 不得覆盖',
+  `verify_base_actual` DECIMAL(11,2) DEFAULT NULL COMMENT '发分时刻的收款额；同上',
+  `verify_base_at`     DATETIME      DEFAULT NULL COMMENT '基准定格于何时；NULL=还没发过分',
+
   `created_at`        DATETIME     NOT NULL,
   `updated_at`        DATETIME     NOT NULL,
 
   PRIMARY KEY (`id`),
   UNIQUE KEY `uk_business` (`store_code`,`serial_id`),          -- ★ 幂等主键
   KEY `idx_verify`  (`verify_status`,`order_end_time`),          -- 值比对任务扫描
+  -- 值比对在保护期内要【反复跑】（015）：判据是 last_verified_at 够久没动过，
+  -- 不是 verify_status = 0。只比一次的话，POS 结账后才改的那 2.9% 永远抓不到。
+  KEY `idx_recheck` (`store_code`,`last_verified_at`),
   KEY `idx_table`   (`store_code`,`table_name`,`order_end_time`),
   KEY `idx_bizdate` (`store_code`,`business_date`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -174,7 +188,11 @@ CREATE TABLE `point_ledger` (
   KEY `idx_order`   (`store_code`,`serial_id`),
   KEY `idx_reverse` (`reverses_id`),
   KEY `idx_review`  (`store_code`,`review_status`,`created_at`),  -- 待复核队列
-  KEY `idx_group`   (`store_code`,`grant_group`)                  -- 整组撤销 / 风控计数
+  KEY `idx_group`   (`store_code`,`grant_group`),                 -- 整组撤销 / 风控计数
+  -- 手工录入的日额度上限要用 SELECT … FOR UPDATE 把「这个操作员今天那一段」
+  -- 锁住（读一下再写，中间没锁就等于没上限）。没有这个索引就是全表扫，
+  -- 锁的是整张流水表 —— 一个手工录入把全店记账都堵住。（016）
+  KEY `idx_operator` (`store_code`,`operator_id`,`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
@@ -193,6 +211,38 @@ CREATE TABLE `point_ledger` (
 - **不写入 `pos_order`**（无业务号可作主键）
 - `review_status = 1`，自动进入后台待复核队列
 - 金额超过 `sys_config.manual_entry_limit` 时需 `approved_by`
+
+#### 日额度的互斥行 `manual_entry_lock`
+
+```sql
+CREATE TABLE `manual_entry_lock` (
+  `store_code`  VARCHAR(20) NOT NULL,
+  `operator_id` INT         NOT NULL,
+  `updated_at`  DATETIME    NOT NULL,
+  PRIMARY KEY (`store_code`,`operator_id`)
+) ENGINE=InnoDB;   -- 018
+```
+
+**只当互斥量用，不存任何业务数值。**「这位操作员今天手工录了多少」
+仍然实时从 `point_ledger` 算 —— 单一真相不变，撤销后额度自动释放
+这一现有语义也不变。
+
+为什么需要它：`manual_entry_daily_cap` 是「读一下再写」
+（读出今天用了多少 → 判没超 → 才写）。中间没有互斥就等于没上限，
+实测 4 台 Pad 同时连录，€ 300 的上限落进 € 360。
+
+为什么不锁别的：
+
+| 锁什么 | 为什么不行 |
+|---|---|
+| 会员行 | 额度按**操作员**算，同一个人给两位不同客人各录一笔照样并发 |
+| `operator` 那一行 | 要求那一行确实存在。冒烟里的合成操作员没有对应行，锁当场落空而代码看上去完全正确 —— 「碰巧存在」不是可以拿来守钱的性质 |
+| 流水的**区间**（`SELECT … FOR UPDATE`） | InnoDB 的 gap 锁**彼此不冲突**：两笔手工录入都拿得到同一个 gap，然后各自要往里 `INSERT`，互相等对方的 gap 锁。实测每 160 笔死锁 5–7 次 |
+
+> 🔴 **调用顺序是固定的**：`ensureQuotaRow()`（**事务外**，autocommit）
+> → `transaction { lockManualQuota() → 读额度 → 锁会员行 → 写流水 }`。
+> 补行那一步放进事务里的话，两个事务同时 `INSERT` 同一个主键会各拿一把
+> S 锁、随后都要升级成 X —— 又是一个死锁环。
 
 ### 4.1 撤销示例
 

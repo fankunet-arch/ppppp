@@ -494,7 +494,39 @@ $api->on('GET', '/coupons', static function () use ($app, $requireManager): void
         'rule'    => $app->rewards()->ruleText(),
         'stats'   => $app->rewards()->stats(),
         'coupons' => $rows,
+        /**
+         * ★ 「待发」队列 —— 谁攒够了还没拿到券（审计 F8）。
+         *
+         *   docs/13 §6 建议上线第一个月关掉 reward_auto_grant，
+         *   让达标的客人进这个队列由经理逐张确认。而这个队列原来
+         *   只有一个总数、没有名单，经理看得到「欠 7 张」却查不出是谁 ——
+         *   建议的上线方式实际上执行不了。
+         *
+         *   自动发放开着时这个列表通常是空的（发完了）；
+         *   一旦不空就说明有券该发而没发出去，本身就是个该看一眼的信号。
+         */
+        'auto_grant' => $app->cfg()->get('reward_auto_grant', '1') === '1',
+        'pending'    => $app->rewards()->pendingList(200),
     ]);
+});
+
+/**
+ * 从「待发」队列发出某位客人欠的券（影子模式下的人工确认动作）。
+ *
+ * 与手工发券 /coupons/grant 是两件事：
+ *   · 这里发的是客人【靠消费挣来的】，占 rewards_issued，发完队列里就没了
+ *   · /coupons/grant 发的是补偿/投诉处理的，不占进度（见 grantManual）
+ * 混用哪一个都会让账对不上，所以分成两个入口。
+ */
+$api->on('POST', '/coupons/issue-pending', static function () use ($app, $requireManager): void {
+    $op  = $requireManager();
+    $b   = Api::body();
+    $mid = Api::int($b, 'member_id', 0);
+    if ($mid <= 0) {
+        Api::fail('bad_request');
+    }
+    $r = $app->rewards()->issuePending($mid, ['id' => $op['id'], 'name' => $op['name']]);
+    Api::fromResult($r, ['granted' => $r['granted'] ?? 0, 'coupons' => $r['coupons'] ?? []]);
 });
 
 /** 手工发一张券（补偿、投诉处理），必须写原因 */

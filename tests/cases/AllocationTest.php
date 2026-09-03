@@ -56,9 +56,29 @@ T::eq('duplicate_member', PE::validateAllocations([
     ['member_id' => 1, 'amount_cents' => 1000, 'portions' => 1],
 ], $T, 0, $P, 0)['error'],
     '同一会员在一次提交里出现两次 → 拒绝（多半是前端重复提交）');
-T::eq('empty_allocation', PE::validateAllocations(
+T::eq('zero_allocation', PE::validateAllocations(
     [['member_id' => 1, 'amount_cents' => 0, 'portions' => 0]], $T, 0, $P, 0)['error'],
-    '金额与份数都是 0 → 视为空分配');
+    '金额与份数都是 0 → 拒绝（zero_allocation）');
+/**
+ * ★★ 混在多人提交里的那条零行【也要拒】（审计 F10）。
+ *
+ *   原来只有【整笔全零】才拒，夹在别人中间的一条零行是通得过的。
+ *   它落库之后是一条 0 元 0 分 0 次的流水，而那条流水会把这位客人
+ *   永久锁死在这张单上：想补记 → member_already_on_order，
+ *   想撤销 → 撤的是钱和次，撤一条全零的等于没撤。
+ *   而前端确实拆得出这种行（点选菜品时那位客人一样没点、
+ *   AA 人数多于份数时的末位）。
+ */
+T::eq('zero_allocation', PE::validateAllocations([
+    ['member_id' => 1, 'amount_cents' => 4780, 'portions' => 2],
+    ['member_id' => 2, 'amount_cents' => 0,    'portions' => 0],
+], $T, 0, $P, 0)['error'],
+    '★★ 夹在多人提交里的一条 0 元 0 份也拒 —— 它会把那位客人锁死在这张单上');
+T::true(PE::validateAllocations([
+    ['member_id' => 1, 'amount_cents' => 4780, 'portions' => 2],
+    ['member_id' => 2, 'amount_cents' => 1,    'portions' => 0],
+], $T, 0, $P, 0)['ok'],
+    '  └ 对照：有钱没份照常通过（只点酒水的客人该积分不该计次）');
 
 T::group('validateAllocations —— 份数必须带金额（次数与积分绑定）');
 

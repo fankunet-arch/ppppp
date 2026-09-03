@@ -2588,12 +2588,25 @@ for ($i = 0; $i < $WORKERS; $i++) {
          . $cgMid . ' ' . sprintf('%.4f', $startAt) . ' 2>/dev/null';
     $procs[] = popen($cmd, 'r');
 }
-$granted = 0;
+/**
+ * ★ 工作进程约定：只往标准输出写一行「<数> <数> [失败原因]」。
+ *   带原因时要把它原样带进断言文案 —— 否则 bootstrap 失败（比如缺
+ *   config.php）只会表现成「什么都没输出」，被解析成 0，
+ *   最后报出来的是一个和本段要守的东西毫无关系的数字。
+ */
+$workerWhy = static function (array $lines): string {
+    $why = array_values(array_filter($lines, static fn(string $x): bool => $x !== ''));
+    return $why ? '（工作进程说：' . implode('；', array_unique($why)) . '）' : '';
+};
+$granted = 0; $cgWhy = [];
 foreach ($procs as $ph) {
     if ($ph === false) { continue; }
-    $granted += (int)trim((string)stream_get_contents($ph));
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
+    $granted += (int)($line[0] ?? 0);
+    $cgWhy[]  = trim((string)($line[2] ?? ''));
     pclose($ph);
 }
+$cgWhyTxt = $workerWhy($cgWhy);
 
 $cgCoupons = (int)$cgDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=?',
                                [SMOKE_STORE, $cgMid]);
@@ -2602,7 +2615,8 @@ $cgIssued  = (int)$cgDb->value('SELECT rewards_issued FROM member WHERE store_co
 $expect    = intdiv(10, 10);   // floor(progress / threshold)
 
 ok($granted === $expect,
-   sprintf('★★★ %d 个进程同时抢发券，合计只发出 %d 张（应为 %d 张）', $WORKERS, $granted, $expect));
+   sprintf('★★★ %d 个进程同时抢发券，合计只发出 %d 张（应为 %d 张）', $WORKERS, $granted, $expect)
+   . $cgWhyTxt);
 eq($expect, $cgCoupons, '  └ coupon 表里确实只有 ' . $expect . ' 张 —— 券是真金白银的一顿饭');
 eq($expect, $cgIssued, '  └ rewards_issued 与实发张数一致（不一致的话下次记账会再发一遍）');
 
@@ -3532,19 +3546,21 @@ for ($w = 0; $w < $DL_W; $w++) {
          . sprintf('%.4f', $dlStart) . ' 2>/dev/null';
     $dlProcs[] = popen($cmd, 'r');
 }
-$dlOk = 0; $dlDead = 0;
+$dlOk = 0; $dlDead = 0; $dlWhy = [];
 foreach ($dlProcs as $ph) {
     if ($ph === false) { continue; }
-    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)));
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
     $dlOk   += (int)($line[0] ?? 0);
     $dlDead += (int)($line[1] ?? 0);
+    $dlWhy[] = trim((string)($line[2] ?? ''));
     pclose($ph);
 }
+$dlWhyTxt = $workerWhy($dlWhy);
 
 $dlTotal = $DL_W * $DL_N;
 eq($dlTotal, $dlOk,
    "★★★ {$DL_W} 台 Pad 交叉点人、共 {$dlTotal} 单，【全部记进去】（实际 {$dlOk} 单）"
-   . ' —— 不固定加锁顺序时这里一半会失败');
+   . ' —— 不固定加锁顺序时这里一半会失败' . $dlWhyTxt);
 eq(0, $dlDead, '  └ 一次死锁都没有（固定加锁顺序是第一道，事务重试只是兜底）');
 
 /**
@@ -4312,6 +4328,625 @@ $rzDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$rzI
 $rzDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$rzIds})", [SMOKE_STORE]);
 $rzDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '4343%'", [SMOKE_STORE]);
 
+step('㊼ 两次操作【之间】才发作的那一类（审计 F1–F5）');
+
+/**
+ * ── 🔴 为什么单独开一段 ────────────────────────────────────
+ *
+ * 上面 630 多条断言全绿的同时，审计仍然查出 5 条 P0。原因不是漏测了
+ * 某个场景，而是【测法本身有盲区】：既有断言几乎都在「一次操作之内」
+ * 验结果 —— 记一笔、看看对不对；退一笔、看看退干净没有。
+ *
+ * 而这 5 条错在【两次操作之间】：
+ *   · 再查一次单（locate 把比对基准冲掉了）
+ *   · 隔一天（值比对这辈子只跑一次）
+ *   · 换个口径（改 reward_mode 之后拿旧券的进度跟新进度比）
+ *   · 颠倒顺序（先记账后核销，而不是先核销后记账）
+ *   · 换个时钟（营业日 02:00 翻页，日历日 00:00 翻页）
+ *
+ * 所以这一段的每一条都【至少做两件事，中间插一件别的】。
+ */
+$fxApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$fxDb  = $fxApp->localDb();
+$fxOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$fxCfg0 = [];
+foreach (['late_grant_minutes' => '0', 'max_grants_per_period' => '0',
+          'visit_count_mode' => 'by_order', 'points_mode' => 'by_amount',
+          'points_per_euro' => '1.0', 'min_amount_per_visit' => '0',
+          'free_meal_extra_earns' => '0', 'reward_enabled' => '1',
+          'reward_mode' => 'visits', 'reward_threshold_visits' => '3',
+          'reward_auto_grant' => '1', 'verify_protect_days' => '30',
+          'verify_recheck_hours' => '168',
+          'business_day_cutoff' => '02:00'] as $k => $v) {
+    $fxCfg0[$k] = $fxApp->cfg()->get($k, '');
+    $fxApp->cfg()->set($k, $v);
+}
+
+/** 造一张 POS 单 */
+$fxMkPos = function (array $specs) use (&$fxApp): FakePosSource {
+    $pos = new FakePosSource();
+    $pos->now = date('Y-m-d H:i:s');
+    foreach ($specs as $sp) {
+        $pos->addHead([
+            'serial_id' => $sp['ser'], 'order_head_id' => $sp['oh'], 'check_id' => 1,
+            'table_name' => $sp['tbl'], 'eat_type' => 0, 'customer_num' => 2,
+            'original_amount' => $sp['amt'], 'should_amount' => $sp['amt'],
+            'actual_amount' => $sp['amt'],
+            'order_end_time' => date('Y-m-d H:i:s', strtotime($pos->now) - 600),
+        ]);
+        $pos->addDetail($sp['oh'], 1,
+            [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', $sp['amt'], $sp['qty'])]);
+    }
+    return $pos;
+};
+$fxSetAmt = function (FakePosSource $pos, string $ser, string $amt): void {
+    foreach ($pos->heads as $i => $h) {
+        if ($h['serial_id'] === $ser) {
+            $pos->heads[$i]['original_amount'] = $amt;
+            $pos->heads[$i]['should_amount']   = $amt;
+            $pos->heads[$i]['actual_amount']   = $amt;
+        }
+    }
+};
+/** 把时钟往前推 N 天（只动 last_verified_at，模拟「下一轮复查」） */
+$fxAge = function (string $ser, int $days) use ($fxDb): void {
+    $fxDb->exec('UPDATE pos_order SET last_verified_at = DATE_SUB(NOW(), INTERVAL ? DAY)
+                  WHERE store_code = ? AND serial_id = ?', [$days, SMOKE_STORE, $ser]);
+};
+
+// ── F1：保护期内要【反复】比对，不是一生只比一次 ───────────────
+$f1Pos = $fxMkPos([['ser' => '4400000001', 'oh' => 440001, 'tbl' => 'FX1', 'amt' => '50.00', 'qty' => 2]]);
+$fxApp->setPosSource($f1Pos);
+$fxApp->points()->locate('FX1', 3600);
+$f1M = (int)$fxApp->members()->create('TK-00044001-FXA', null, null, null)['id'];
+$fxApp->points()->grant('4400000001',
+    [['member_id' => $f1M, 'amount_cents' => 5000, 'portions' => 2]],
+    Vip\PointsEngine::MODE_SPLIT, $fxOp);
+$f1R1 = $fxApp->reconcile()->verifyAmounts();
+ok((int)$f1R1['checked'] >= 1, 'F1 第 1 晚比对到这一单');
+eq(1, (int)$fxDb->value('SELECT verify_status FROM pos_order WHERE store_code=? AND serial_id=?',
+                        [SMOKE_STORE, '4400000001']),
+   '  └ 金额没变，判一致（verify_status=1）');
+
+// 第 2 天 POS 上把这单改小 —— 实测 2.9% 的订单在结账之后被改过
+$fxSetAmt($f1Pos, '4400000001', '10.00');
+$fxAge('4400000001', 8);                      // 复查间隔 168 小时后
+$f1R2 = $fxApp->reconcile()->verifyAmounts();
+ok((int)$f1R2['checked'] >= 1,
+   '★★★ F1 判过「一致」的单【还会再比】—— 原来 pendingVerify 只取 verify_status=0，'
+ . '而全仓库没有一处把它改回 0，等于每张单一生只比一次，这条防线整条是空的');
+eq(1, (int)$f1R2['changed'], '  └ 抓到了改单');
+eq(10, (int)$fxApp->members()->findById($f1M)['points_balance'],
+   '  └ 积分从 50 退到 10（原来一分都不退）');
+
+// ── F2：再 locate 一次就把比对基准冲掉了 ──────────────────────
+$f2Pos = $fxMkPos([['ser' => '4400000002', 'oh' => 440002, 'tbl' => 'FX2', 'amt' => '71.70', 'qty' => 3]]);
+$fxApp->setPosSource($f2Pos);
+$fxApp->points()->locate('FX2', 3600);
+$f2M = (int)$fxApp->members()->create('TK-00044002-FXB', null, null, null)['id'];
+$fxApp->points()->grant('4400000002',
+    [['member_id' => $f2M, 'amount_cents' => 7170, 'portions' => 3]],
+    Vip\PointsEngine::MODE_SPLIT, $fxOp);
+$fxSetAmt($f2Pos, '4400000002', '0.00');
+// ★ 关键的那「一件别的事」：收银员为同桌下一位客人再查一次单。
+//   每天都在发生，而它会把 should/actual/total 三列全刷成 POS 的新值。
+$fxApp->points()->locate('FX2', 3600);
+$f2R = $fxApp->reconcile()->verifyAmounts();
+eq(1, (int)$f2R['changed'],
+   '★★★ F2 发分后再 locate 一次，值比对照样抓得到 —— 基准存在 verify_base_*，'
+ . '不再是被 locate/同步反复重写的 should/actual/total');
+eq(0, (int)$fxApp->members()->findById($f2M)['points_balance'], '  └ 整单归零，分退干净');
+$f2O = $fxDb->one('SELECT total_amount, allocated_amount, verify_base_at
+                     FROM pos_order WHERE store_code = ? AND serial_id = ?',
+                  [SMOKE_STORE, '4400000002']);
+ok((float)$f2O['allocated_amount'] <= (float)$f2O['total_amount'],
+   '★★★ 「已分配额 ≤ 可积分总额」这条不变量没被破 —— 修之前是 71.70 挂在一张 0 元的单上');
+ok($f2O['verify_base_at'] !== null, '  └ 基准已定格（verify_base_at 非空）');
+
+// 基准列不会被 locate / 同步覆盖 —— 这一条直接钉住 upsert 的列清单
+$f2Base = $fxDb->value('SELECT verify_base_should FROM pos_order WHERE store_code=? AND serial_id=?',
+                       [SMOKE_STORE, '4400000001']);
+$fxApp->points()->locate('FX1', 3600);
+eq($f2Base,
+   $fxDb->value('SELECT verify_base_should FROM pos_order WHERE store_code=? AND serial_id=?',
+                [SMOKE_STORE, '4400000001']),
+   '★★ 再 locate 一次，verify_base_should 纹丝不动（它不在 upsert 的列清单里）');
+
+// ── F3：换发券口径之后撤销，把客人手上的老券全作废 ────────────
+$fxApp->cfg()->set('reward_mode', 'amount');
+$fxApp->cfg()->set('reward_threshold_amount', '60.00');
+$f3M = (int)$fxApp->members()->create('TK-00044003-FXC', null, null, null)['id'];
+$fxDb->exec('UPDATE member SET total_spent = 180.00, rewards_issued = 0
+              WHERE store_code = ? AND id = ?', [SMOKE_STORE, $f3M]);
+$fxApp->rewards()->checkAndGrant($f3M, $fxOp);
+$f3N = (int)$fxDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                         [SMOKE_STORE, $f3M]);
+eq(3, $f3N, 'F3 按金额口径发出 3 张券（进度定格成 18000 分）');
+
+// 店家改口径：改成按次数。老券的 progress_at_grant 还是 18000，新进度是 0 次。
+$fxApp->cfg()->set('reward_mode', 'visits');
+$fxApp->rewards()->clawBackOverIssued($f3M, $fxOp, '冒烟：换口径后的一次撤销');
+eq(3, (int)$fxDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                        [SMOKE_STORE, $f3M]),
+   '★★★ F3 换口径后撤销，客人手上 3 张券【一张都没少】—— 原来 18000 > 0 恒成立，'
+ . '一次撤销就把老券全作废，客人拿来吃饭被告知「无效」，店里查不出原因');
+$fxApp->cfg()->set('reward_mode', 'visits');
+$fxApp->cfg()->set('reward_threshold_visits', '3');
+
+// ── F4：先记账、后核销 → 免费那一餐又攒一次 ────────────────────
+$f4Pos = $fxMkPos([['ser' => '4400000004', 'oh' => 440004, 'tbl' => 'FX4', 'amt' => '23.90', 'qty' => 1]]);
+$fxApp->setPosSource($f4Pos);
+$fxApp->points()->locate('FX4', 3600);
+$f4M = (int)$fxApp->members()->create('TK-00044004-FXD', null, null, null)['id'];
+$fxDb->exec('UPDATE member SET visit_count = 3, rewards_issued = 0
+              WHERE store_code = ? AND id = ?', [SMOKE_STORE, $f4M]);
+$fxApp->rewards()->checkAndGrant($f4M, $fxOp);
+$f4C = (int)$fxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                           ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $f4M]);
+ok($f4C > 0, 'F4 满 3 次发出 1 张券');
+// 前台的真实顺序：先按 AA 把这桌记完，客人才想起来「我有张券」
+$fxApp->points()->grant('4400000004',
+    [['member_id' => $f4M, 'amount_cents' => 2390, 'portions' => 1]],
+    Vip\PointsEngine::MODE_SPLIT, $fxOp);
+eq(4, (int)$fxApp->members()->findById($f4M)['visit_count'], '  └ 记完账计次 4');
+$f4R = $fxApp->rewards()->redeem($f4C, '4400000004', $fxOp, null, ['reason' => '冒烟']);
+ok($f4R['ok'], '  └ 核销成功');
+eq(3, (int)$fxApp->members()->findById($f4M)['visit_count'],
+   '★★★ F4 记完账才核销，那一次【退回来了】—— 原来停在 4，'
+ . '免费餐自己在攒下一顿免费餐，而 redeem_unflagged 告警抓不到（订单确实标了核销）');
+eq(1, (int)$f4R['visits_clawed_back'], '  └ 退了 1 次，且流水里如实记着');
+eq(-1, (int)$fxDb->value('SELECT COALESCE(SUM(counted_visit),0) FROM point_ledger
+                           WHERE store_code=? AND serial_id=? AND entry_type=?',
+                         [SMOKE_STORE, '4400000004', Vip\Repo\LedgerRepo::T_REVERSE]),
+   '  └ 是另插一条负数流水，不是偷偷改 member 表');
+// 幂等：同一单再核销一张券，不能把同一次再退一遍
+$fxDb->exec('UPDATE member SET visit_count = 6, rewards_issued = 0
+              WHERE store_code = ? AND id = ?', [SMOKE_STORE, $f4M]);
+$fxApp->rewards()->checkAndGrant($f4M, $fxOp);
+$f4C2 = (int)$fxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                            ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $f4M]);
+$f4V0 = (int)$fxApp->members()->findById($f4M)['visit_count'];
+$fxApp->rewards()->redeem($f4C2, '4400000004', $fxOp, null, ['reason' => '冒烟']);
+eq($f4V0, (int)$fxApp->members()->findById($f4M)['visit_count'],
+   '★★ 同一单再核销一张券，次数【不再动】—— 判据是「这位客人在这一单上现存的净次数」，'
+ . '不是原流水上那个数，否则会把同一次退两遍、把客人扣穿');
+
+// ── F5：券与卡按【营业日】判过期，不是日历日 ───────────────────
+// 用切点模拟：把切点设成晚于「此刻」，营业日就退到昨天 ——
+// 与真实的「晚市 00:30、切点 02:00」完全同构。
+$fxApp->cfg()->set('business_day_cutoff', date('H:i', strtotime('+2 hours')));
+// ★ 换过配置就得像真实请求那样重新装配一次 —— App::businessDay() 是 once() 缓存的。
+//   （RewardService 那一侧不缓存实例，故意的，见 todayBiz() 的说明。）
+$f5App = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$f5Y = date('Y-m-d', strtotime('-1 day'));
+eq($f5Y, $f5App->businessDay()->today(), 'F5 切点前：营业日仍是昨天（日历日已经是今天了）');
+
+$f5M = (int)$f5App->members()->create('TK-00044005-FXE', null, null, null)['id'];
+$fxDb->exec('UPDATE member SET visit_count = 3, rewards_issued = 0
+              WHERE store_code = ? AND id = ?', [SMOKE_STORE, $f5M]);
+$f5App->rewards()->checkAndGrant($f5M, $fxOp);
+$f5C = (int)$fxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                           ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $f5M]);
+$fxDb->exec('UPDATE coupon SET valid_to = ? WHERE id = ?', [$f5Y, $f5C]);
+eq(0, $f5App->rewards()->expireStale(),
+   '★★★ F5 有效期 = 当前营业日的券，expireStale 不能把它扫死 —— 原来用 date(\'Y-m-d\')，'
+ . '半夜那一轮会把「今天到期」的券整批判成过期，客人第二天中午拿来已经没了');
+$f5R = $f5App->rewards()->redeem($f5C, null, $fxOp, null, ['reason' => '冒烟']);
+ok($f5R['ok'], '  └ 而且核销得掉（原来当场返回 coupon_expired，并把券【写库】置成已过期，再也回不来）');
+ok(!Vip\Repo\CardRepo::isExpired(['valid_to' => $f5Y]),
+   '★★ 实体卡同理 —— 卡面印着 12-31，客人跨年夜 00:30 还坐在桌上，卡不能在他面前作废');
+$fxApp->cfg()->set('business_day_cutoff', '02:00');
+
+foreach ($fxCfg0 as $k => $v) { $fxApp->cfg()->set($k, $v); }
+$fxIds = implode(',', [$f1M, $f2M, $f3M, $f4M, $f5M]);
+$fxDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$fxIds})", [SMOKE_STORE]);
+$fxDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$fxIds})", [SMOKE_STORE]);
+$fxDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$fxIds})", [SMOKE_STORE]);
+$fxDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '44000000%'", [SMOKE_STORE]);
+
+step('㊽ 餐期空档 / 手工录入 / 待发队列 / 中途核销（审计 F6–F9）');
+
+$pxApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$pxDb  = $pxApp->localDb();
+$pxOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+
+// ── F6：餐期之间的空档不能把一整天塌成一顿 ──────────────────
+/**
+ * 出厂餐期 11:00–18:00 与 19:30–02:00，中间 18:00–19:30 是空档。
+ * 原来「落在空档」退回按营业日比 —— 中午 13:00 那顿和傍晚 19:00 那顿
+ * 被判成同一顿，客人第二次白来。
+ * 但一律判「不是同一顿」也不行：18:10 和 19:20 都在同一个空档里。
+ * 所以空档也编格子。这一组用的是纯函数，不落库、不看当前时钟。
+ */
+$pxMp = $pxApp->mealPeriods();
+$pxBd = $pxApp->businessDay();
+$pxD  = date('Y-m-d');
+$pxD1 = date('Y-m-d', strtotime($pxD . ' +1 day'));
+ok(count($pxMp->all()) >= 2, 'F6 前提：配了至少两个餐期（' . count($pxMp->all()) . ' 个）');
+ok($pxMp->sameSitting("{$pxD} 13:00:00", "{$pxD} 13:40:00", $pxBd),
+   '  └ 午市两单 = 同一顿');
+ok(!$pxMp->sameSitting("{$pxD} 13:00:00", "{$pxD} 19:00:00", $pxBd),
+   '★★★ F6 午市 13:00 与空档里的 19:00【不是同一顿】—— 原来退回按营业日比，'
+ . '判成同一顿，客人傍晚这一趟一次都记不上，而 18:00–19:30 这个空档是店家自己配出来的');
+ok($pxMp->sameSitting("{$pxD} 18:10:00", "{$pxD} 19:20:00", $pxBd),
+   '★★ 但同一个空档里的两单仍算同一顿 —— 一律判「不同顿」会开一个重复计次的口子');
+ok(!$pxMp->sameSitting("{$pxD} 19:00:00", "{$pxD} 20:00:00", $pxBd),
+   '  └ 空档与晚市也不是同一顿');
+ok($pxMp->sameSitting("{$pxD} 21:00:00", "{$pxD1} 00:30:00", $pxBd),
+   '  └ 晚市跨零点仍是同一顿（营业日 02:00 才翻页）');
+ok($pxMp->couldBeSameSitting("{$pxD} 19:29:00", "{$pxD} 19:31:00", $pxBd),
+   '★★ 合并口径更宽：19:29 那桌（空档）与 19:31 那桌（晚市）放行 —— '
+ . '按风控那个严口径会把同行分桌硬拆开，而挡「捡小票」的承重墙是 merge_span_minutes');
+
+// ── F7：手工录入也要查一次达标 ───────────────────────────
+$pxCfg0 = [];
+foreach (['reward_mode' => 'amount', 'reward_threshold_amount' => '60.00',
+          'reward_enabled' => '1', 'reward_auto_grant' => '1',
+          'manual_entry_enabled' => '1', 'manual_entry_min' => '1.00',
+          'manual_entry_daily_cap' => '1000.00'] as $k => $v) {
+    $pxCfg0[$k] = $pxApp->cfg()->get($k, '');
+    $pxApp->cfg()->set($k, $v);
+}
+$px7 = (int)$pxApp->members()->create('TK-00046001-PXA', null, null, null)['id'];
+$px7r = $pxApp->points()->manualGrant($px7, 7000, 'system_not_found',
+    ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'approved_by' => 1]);
+ok($px7r['ok'] ?? false, 'F7 手工录入 € 70.00 成功');
+$px7g = $pxApp->rewards()->checkAndGrant($px7, ['id' => 1, 'name' => '冒烟']);
+eq(1, (int)$px7g['granted'],
+   '★★★ F7 手工录入跨过门槛后【拿得到券】—— manualGrant 会把 total_spent 加上去，'
+ . '却从来没调过 checkAndGrant，于是客人站在柜台前等着的那张券不发；'
+ . '而手工录入正是 POS 查不到单时的降级路径，出岔子的当天最容易走到它');
+ok((int)$pxDb->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=?',
+                     [SMOKE_STORE, 'reward_from_manual_entry']) > 0,
+   '  └ 同时留下 reward_from_manual_entry 告警（这条护栏本来就是为这条路写的，之前根本没被触发过）');
+
+// ── F8：影子模式的「待发」队列 ────────────────────────────
+$pxApp->cfg()->set('reward_mode', 'visits');
+$pxApp->cfg()->set('reward_auto_grant', '0');
+$px8thr = $pxApp->cfg()->get('reward_threshold_visits', '10');
+$pxApp->cfg()->set('reward_threshold_visits', '3');
+$px8a = (int)$pxApp->members()->create('TK-00046002-PXB', null, null, null)['id'];
+$px8b = (int)$pxApp->members()->create('TK-00046003-PXC', null, null, null)['id'];
+$pxDb->exec('UPDATE member SET visit_count=7, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $px8a]);
+$pxDb->exec('UPDATE member SET visit_count=3, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $px8b]);
+$px8g = $pxApp->rewards()->checkAndGrant($px8a, ['id' => 1, 'name' => '冒烟']);
+eq(0, (int)$px8g['granted'], 'F8 关掉自动发放后不自动发');
+eq(2, (int)$px8g['pending'], '  └ 但报出欠 2 张');
+$px8list = $pxApp->rewards()->pendingList();
+$px8mine = array_values(array_filter($px8list,
+    static fn(array $r): bool => in_array($r['member_id'], [$px8a, $px8b], true)));
+eq(2, count($px8mine),
+   '★★★ F8 「待发」队列列得出【名单】—— docs/13 §6 建议上线首月关掉自动发放、'
+ . '由经理逐位确认，而后台原来只有一个总数没有名单，经理看得到「欠 N 张」却查不出是谁，'
+ . '那条上线建议实际上执行不了');
+$px8by = array_column($px8mine, 'pending', 'member_id');
+eq(2, (int)($px8by[$px8a] ?? 0), '  └ 名单里带着各自的欠数：7 次 / 门槛 3 → 欠 2 张');
+eq(1, (int)($px8by[$px8b] ?? 0), '  └ 3 次 / 门槛 3 → 欠 1 张');
+eq(array_sum(array_column($pxApp->rewards()->pendingList(500), 'pending')),
+   (int)$pxApp->rewards()->pendingAcrossMembers(),
+   '★★ 名单合计 == pendingAcrossMembers() —— 两处必须同一套算法，'
+ . '否则「总数 7、名单 5 行」谁也不敢信，而后台护栏正是拿那个总数在报警');
+$px8i = $pxApp->rewards()->issuePending($px8a, ['id' => 1, 'name' => '冒烟']);
+ok($px8i['ok'] ?? false, '  └ 经理确认后发得出来（issuePending 不看 auto_grant —— 关掉它就是为了由人确认）');
+eq(2, (int)$px8i['granted'], '  └ 一次把欠的 2 张都发了');
+eq('nothing_pending', $pxApp->rewards()->issuePending($px8a, ['id' => 1, 'name' => '冒烟'])['error'] ?? '',
+   '★★ 再点一次不会重复发 —— 幂等仍然靠 rewards_issued，与自动那条路同一套');
+$pxApp->cfg()->set('reward_auto_grant', '1');
+
+// ── F9：中途核销把同桌的客人挤出这张单 ─────────────────────
+$px9Pos = new FakePosSource();
+$px9Pos->now = date('Y-m-d H:i:s');
+$px9Pos->addHead(['serial_id' => '4600000004', 'order_head_id' => 460004, 'check_id' => 1,
+    'table_name' => 'PX9', 'eat_type' => 0, 'customer_num' => 4,
+    'original_amount' => '95.60', 'should_amount' => '95.60', 'actual_amount' => '95.60',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($px9Pos->now) - 600)]);
+$px9Pos->addDetail(460004, 1,
+    [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '95.60', 4)]);
+$pxApp->setPosSource($px9Pos);
+$pxApp->cfg()->set('free_meal_extra_earns', '1');
+$pxApp->points()->locate('PX9', 3600);
+
+$px9 = [];
+foreach (range(1, 4) as $i) {
+    $px9[] = (int)$pxApp->members()->create(sprintf('TK-0004601%d-PX%d', $i, $i), null, null, null)['id'];
+}
+$pxDb->exec('UPDATE member SET visit_count=3, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $px9[0]]);
+$pxApp->rewards()->checkAndGrant($px9[0], ['id' => 1, 'name' => '冒烟']);
+$px9c = (int)$pxDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                            ORDER BY id DESC LIMIT 1', [SMOKE_STORE, $px9[0]]);
+// 服务员已经按 AA 排好 4 位，其中一位当场掏出券核销
+$pxApp->rewards()->redeem($px9c, '4600000004', $pxOp, null, ['reason' => '冒烟']);
+eq(3, (int)$pxDb->value('SELECT portions_counted FROM pos_order WHERE store_code=? AND serial_id=?',
+                        [SMOKE_STORE, '4600000004']),
+   'F9 核销后订单净份数减到 3');
+$px9sp = Vip\PointsEngine::splitEvenly(9560, 3, 4);
+$px9al = [];
+foreach ($px9 as $i => $id) { $px9al[] = ['member_id' => $id] + $px9sp[$i]; }
+$px9r = $pxApp->points()->grant('4600000004', $px9al, Vip\PointsEngine::MODE_SPLIT, $pxOp);
+ok($px9r['ok'] ?? false,
+   '★★★ F9 4 位一起提交仍然通得过 —— 座位数原来直接取净份数（3），'
+ . '中途核销一下就把第 4 位挤出去，提示「付费套餐份数不够记这么多位客人」，'
+ . '与实情无关也不告诉收银员该怎么办，而客人们就站在柜台前'
+ . ($px9r['ok'] ?? false ? '' : '：' . ($px9r['error'] ?? '?')));
+eq(4, count($px9r['entries'] ?? []), '  └ 四位都记上了（用券那位 0 元 0 份，仍然在这张单上）');
+
+$pxApp->cfg()->set('reward_threshold_visits', (string)$px8thr);
+foreach ($pxCfg0 as $k => $v) { $pxApp->cfg()->set($k, $v); }
+$pxIds = implode(',', array_merge([$px7, $px8a, $px8b], $px9));
+$pxDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$pxIds})", [SMOKE_STORE]);
+$pxDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$pxIds})", [SMOKE_STORE]);
+$pxDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pxIds})", [SMOKE_STORE]);
+$pxDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '46000000%'", [SMOKE_STORE]);
+
+step('㊾ 空行锁人 / 撤销无理由 / 告警吞并 / 额度并发（审计 F10–F15）');
+
+$pyApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$pyDb  = $pyApp->localDb();
+$pyOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+
+// ── F10：0 元 0 份的空行会把人锁死在这张单上 ───────────────
+$pyPos = new FakePosSource();
+$pyPos->now = date('Y-m-d H:i:s');
+$pyPos->addHead(['serial_id' => '4800000001', 'order_head_id' => 480001, 'check_id' => 1,
+    'table_name' => 'PY1', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($pyPos->now) - 600)]);
+$pyPos->addDetail(480001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$pyApp->setPosSource($pyPos);
+$pyApp->points()->locate('PY1', 3600);
+$pyA = (int)$pyApp->members()->create('TK-00048001-PYA', null, null, null)['id'];
+$pyB = (int)$pyApp->members()->create('TK-00048002-PYB', null, null, null)['id'];
+$py10 = $pyApp->points()->grant('4800000001', [
+    ['member_id' => $pyA, 'amount_cents' => 4780, 'portions' => 2],
+    ['member_id' => $pyB, 'amount_cents' => 0,    'portions' => 0],
+], Vip\PointsEngine::MODE_PICK, $pyOp);
+eq('zero_allocation', $py10['error'] ?? '',
+   '★★★ F10 夹在多人提交里的一条「0 元 0 份」被拒 —— 原来只有整笔全零才拒，'
+ . '这种行会落成一条 0 元 0 分 0 次的流水，把那位客人【永久锁死在这张单上】：'
+ . '想补记撞 member_already_on_order，想撤销又没有钱和次可撤');
+eq(0, (int)$pyDb->value('SELECT COUNT(*) FROM point_ledger WHERE store_code=? AND serial_id=?',
+                        [SMOKE_STORE, '4800000001']),
+   '  └ 整笔被拒，一条流水都没落（不是「记了 A、漏了 B」那种半成品）');
+ok(($pyApp->points()->grant('4800000001', [
+        ['member_id' => $pyA, 'amount_cents' => 4780, 'portions' => 2],
+    ], Vip\PointsEngine::MODE_PICK, $pyOp)['ok'] ?? false),
+   '  └ 去掉空行后照常记得上');
+
+// ── F11：撤销必须写原因 ───────────────────────────────
+$pyLid = (int)$pyDb->value('SELECT id FROM point_ledger WHERE store_code=? AND serial_id=?
+                             ORDER BY id DESC LIMIT 1', [SMOKE_STORE, '4800000001']);
+eq('reason_required', $pyApp->points()->reverse($pyLid, '', $pyOp)['error'] ?? '',
+   '★★★ F11 空原因撤不了 —— 撤销是不可逆的减钱动作（分、次、消费额一起退，'
+ . '靠它挣来的券还会被连带作废），而这条路原来允许空原因：'
+ . '客人事后来问「我上周那顿怎么没了」，审计日志里只有一个空串');
+eq('reason_required', $pyApp->points()->reverse($pyLid, '   ', $pyOp)['error'] ?? '',
+   '  └ 全是空格也不行');
+ok($pyApp->points()->reverse($pyLid, '客人要求改记', $pyOp)['ok'] ?? false,
+   '  └ 写了原因就撤得掉（与整组撤销 /points/reverse-group 口径一致，'
+ . '原来只有整组那条要求填，同一件事两条路两套话）');
+
+// ── F13：告警去重键的粒度 ─────────────────────────────
+/**
+ * raiseOnce 的去重键是 (alert_type, ref_type, ref_id)。
+ * 「白送了一顿饭」原来只按【会员】去重，于是同一位常客身上第二次、
+ * 第三次发生同样的事全被吞掉 —— 而每一条都是实打实的一顿免费餐。
+ */
+$pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
+            [SMOKE_STORE, 'reward_on_shrunk_order']);
+$pyApp->alerts()->raiseOnce('reward_on_shrunk_order', 'member', '777@SER-A', '甲单白送了一顿');
+$pyApp->alerts()->raiseOnce('reward_on_shrunk_order', 'member', '777@SER-B', '乙单又白送了一顿');
+$pyApp->alerts()->raiseOnce('reward_on_shrunk_order', 'member', '777@SER-A', '甲单重复推送');
+eq(2, (int)$pyDb->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=? AND status=0',
+                        [SMOKE_STORE, 'reward_on_shrunk_order']),
+   '★★★ F13 同一位客人身上两张不同订单白送两顿 → 两条告警（原来只按会员去重，'
+ . '第二顿被当成重复告警吞掉，越是反复出问题的客人越被吞得干净）');
+ok(str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Service/ReconcileService.php'),
+                "'reward_on_shrunk_order', 'member', \$mid . '@' . \$serial"),
+   '  └ 值比对那条确实带上了订单号');
+ok(str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Service/PointsService.php'),
+                "'reward_on_reversed_grant', 'member', \$orig['member_id'] . '#' . \$ledgerId"),
+   '  └ 撤销那条带上了流水号（同一位客人被撤第二笔时不会被吞）');
+/**
+ * ★ 自查时按同一个方法把所有 raiseOnce 过了一遍，又抓出两条：
+ *   grant_many_per_day / grant_span_wide 说的是「这张卡【今天】怎么了」，
+ *   而去重键只有会员 —— 今天那条经理没处理完，明天同一张卡再犯就一条都不推。
+ *   越是天天出问题的那张卡，越是从第二天起彻底静音。
+ */
+$pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
+            [SMOKE_STORE, 'grant_many_per_day']);
+$pyApp->alerts()->raiseOnce('grant_many_per_day', 'member', '888@2026-01-01', '一月一日记太多次');
+$pyApp->alerts()->raiseOnce('grant_many_per_day', 'member', '888@2026-01-02', '一月二日又记太多次');
+$pyApp->alerts()->raiseOnce('grant_many_per_day', 'member', '888@2026-01-01', '一月一日重复推送');
+eq(2, (int)$pyDb->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=? AND status=0',
+                        [SMOKE_STORE, 'grant_many_per_day']),
+   '★★ 同一张卡连着两天记太多次 → 两条告警（去重键带了营业日）');
+$pySrc = (string)file_get_contents(__DIR__ . '/../app/lib/Service/PointsService.php');
+ok(str_contains($pySrc, "'grant_many_per_day', 'member', \$mid . '@' . \$bizDate")
+   && str_contains($pySrc, "'grant_span_wide', 'member', \$mid . '@' . \$bizDate"),
+   '  └ 两条按天的风控告警都带上了营业日');
+$pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
+            [SMOKE_STORE, 'grant_many_per_day']);
+$pyDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?',
+            [SMOKE_STORE, 'reward_on_shrunk_order']);
+
+// ── F14：手工录入日额度 —— 真并发下还守不守得住 ────────────
+/**
+ * ★ 必须真的开几个进程。单进程顺序调用永远读得到上一笔的结果，
+ *   怎么跑都是绿的 —— 与 ㊱ 死锁那一段同一个道理。
+ */
+$pyCfg0 = [];
+foreach (['manual_entry_enabled' => '1', 'manual_entry_min' => '1.00',
+          'manual_entry_daily_cap' => '300.00', 'manual_entry_limit' => '500.00',
+          'manual_entry_hard_limit' => '5000.00', 'manual_entry_daily_alert' => '999',
+          'points_mode' => 'by_amount'] as $k => $v) {
+    $pyCfg0[$k] = $pyApp->cfg()->get($k, '');
+    $pyApp->cfg()->set($k, $v);
+}
+$pyM = (int)$pyApp->members()->create('TK-00048003-PYC', null, null, null)['id'];
+// 先把这个操作员今天已有的手工流水清掉，额度才从 0 起算
+$pyDb->exec('DELETE FROM point_ledger WHERE store_code=? AND source=? AND operator_id=1',
+            [SMOKE_STORE, Vip\Repo\LedgerRepo::SRC_MANUAL]);
+$pyDb->exec('UPDATE member SET points_balance=0, total_spent=0, visit_count=0
+              WHERE store_code=? AND id=?', [SMOKE_STORE, $pyM]);
+
+$MC_W = 4;                       // 4 台 Pad
+$MC_N = 5;                       // 每台连录 5 笔 × € 20 = € 100
+$mcStart = microtime(true) + 2.0;
+$mcProcs = [];
+for ($w = 0; $w < $MC_W; $w++) {
+    $mcProcs[] = popen($envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+        . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' manual '
+        . $pyM . ' 2000 ' . $MC_N . ' ' . sprintf('%.4f', $mcStart) . ' 2>/dev/null', 'r');
+}
+$mcOk = 0; $mcWhy = [];
+foreach ($mcProcs as $ph) {
+    if ($ph === false) { continue; }
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
+    $mcOk   += (int)($line[0] ?? 0);
+    $mcWhy[] = trim((string)($line[2] ?? ''));
+    pclose($ph);
+}
+$mcWhyTxt = $workerWhy($mcWhy);
+$mcUsed = (int)$pyDb->value(
+    'SELECT COALESCE(SUM(amount),0)*100 FROM point_ledger
+      WHERE store_code=? AND source=? AND operator_id=1 AND entry_type=? AND status=?',
+    [SMOKE_STORE, Vip\Repo\LedgerRepo::SRC_MANUAL,
+     Vip\Repo\LedgerRepo::T_EARN, Vip\Repo\LedgerRepo::S_ACTIVE]);
+ok($mcUsed <= 30000,
+   "★★★ F14 {$MC_W} 台 Pad 同时连录（共 € " . number_format($MC_W * $MC_N * 20, 2)
+   . ' 的意图），落库总额 € ' . number_format($mcUsed / 100, 2) . ' 没超过上限 € 300.00'
+   . ' —— 这道上限原来在事务【外面】读一下再写，四个进程各自读到「今天用了 0」'
+   . '各自放行，€ 300 被撑成 € 600；与 checkAndGrant 那次「四进程发四张券」同形');
+eq(15, $mcOk, '  └ 恰好 15 笔 × € 20 = € 300 记进去，其余全被拦下（不多不少）' . $mcWhyTxt);
+/**
+ * ── 🔴 第二件事：那把互斥不能和【正常记账】死锁 ───────────────
+ *
+ * 第一版的互斥是 `SELECT … FOR UPDATE` 锁流水区间。它把正常记账的
+ * INSERT 也圈了进去，而两条路的加锁顺序正好相反 ——
+ * 更要命的是 InnoDB 的 gap 锁【彼此不冲突】：两笔手工录入都拿得到
+ * 同一个 gap，然后各自往里 INSERT，互相等对方的 gap 锁。
+ * 实测 160 笔里 5–7 笔冲破 LocalDb 的两次重试，柜台上就是「数据库繁忙」。
+ *
+ * ★★ 这一段的规模是【量出来的，不是拍的】。
+ *
+ *    第一版断言直接挂在上面那 20 笔额度测试上，结果是【假绿】：
+ *    把区间锁改回去，源码那条断言变红了，而「0 死锁」那条照样绿。
+ *    原因是额度一旦撞上限，后面的尝试就不再 INSERT，也就撞不出那个环 ——
+ *    真正需要的是【几十笔都能成功写进去】的手工录入在互相挤。
+ *    所以这里把上限调高、单独跑一遍，规模照着能稳定复现的那个量取。
+ *    （docs/13 §3.6：断言绿了，要能说清是因为代码对，还是规模不够。）
+ */
+$pyApp->cfg()->set('manual_entry_daily_cap', '100000.00');   // 本段不测额度，调高让它们都写得进去
+$pyDb->exec('DELETE FROM point_ledger WHERE store_code=? AND source=? AND operator_id=1',
+            [SMOKE_STORE, Vip\Repo\LedgerRepo::SRC_MANUAL]);
+
+/**
+ * ★ 环的两半是【手工录入】和【正常记账】——InnoDB 自己的死锁记录：
+ *     TRX A（手工）持有 idx_operator 上的 X gap 锁，等 member 行锁
+ *     TRX B（记账）持有 member 行锁，  等着往那个 gap 里 insert
+ *   手工那条先锁区间再锁会员行，记账那条先锁会员行再往区间里插 ——
+ *   顺序正好相反。所以【两种进程都得开】，而且记账那侧要真的写得进去。
+ *
+ *   ★ 这一点是量出来的：第一版只开手工进程，160 笔照样全绿；
+ *     把区间锁改回去它也绿 —— 因为环的另一半根本没来。
+ *     （我一开始把 InnoDB 那条记录读成「手工 ↔ 手工」，
+ *       依据是「失败的全在手工那侧」—— 那只说明 InnoDB 每次挑的
+ *       牺牲者是手工那笔，不代表另一半也是手工。）
+ */
+// 记账那侧要有真订单可记，先造 40 张
+$dlPos = new FakePosSource();
+$dlPos->now = date('Y-m-d H:i:s');
+// ★ 每个记账进程一段【自己的】订单号 —— 抢同一批的话，第二个进程
+//   会全部撞上 member_already_on_order，一笔都插不进去，环的另一半又没来了。
+$dlSerials = [];
+foreach (['8601', '8602'] as $wIdx => $pfx) {
+    for ($i = 0; $i < 40; $i++) {
+        $ser = sprintf('%s%04d', $pfx, $i);
+        $oh  = (int)$pfx * 10000 + $i;
+        $dlSerials[] = $ser;
+        $dlPos->addHead(['serial_id' => $ser, 'order_head_id' => $oh,
+            'check_id' => 1, 'table_name' => 'DL' . $wIdx . '_' . $i, 'eat_type' => 0,
+            'customer_num' => 1, 'original_amount' => '23.90',
+            'should_amount' => '23.90', 'actual_amount' => '23.90',
+            'order_end_time' => date('Y-m-d H:i:s', strtotime($dlPos->now) - 600)]);
+        $dlPos->addDetail($oh, 1,
+            [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '23.90', 1)]);
+    }
+}
+$pyApp->setPosSource($dlPos);
+foreach ([0, 1] as $wIdx) {
+    for ($i = 0; $i < 40; $i++) { $pyApp->points()->locate('DL' . $wIdx . '_' . $i, 3600); }
+}
+
+$DL_MW = 2; $DL_MN = 40;     // 2 个手工进程 × 40 笔
+$DL_GW = 2; $DL_GN = 40;     // 2 个记账进程 × 40 笔（同一操作员、同一会员）
+$dlmStart = microtime(true) + 2.0;
+$dlmProcs = [];
+for ($w = 0; $w < $DL_MW; $w++) {
+    $dlmProcs[] = popen($envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+        . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' manual '
+        . $pyM . ' 2000 ' . $DL_MN . ' ' . sprintf('%.4f', $dlmStart) . ' 2>/dev/null', 'r');
+}
+foreach (['8601', '8602'] as $pfx) {
+    $dlmProcs[] = popen($envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+        . escapeshellarg(__DIR__ . '/manual_cap_worker.php') . ' grant '
+        . $pyM . ' 2390 ' . $DL_GN . ' ' . sprintf('%.4f', $dlmStart) . ' ' . $pfx . ' 2>/dev/null', 'r');
+}
+$mcDead = 0; $mcDeadOk = 0; $mcDeadWhy = [];
+foreach ($dlmProcs as $ph) {
+    if ($ph === false) { continue; }
+    $line = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
+    $mcDeadOk   += (int)($line[0] ?? 0);
+    $mcDead     += (int)($line[1] ?? 0);
+    $mcDeadWhy[] = trim((string)($line[2] ?? ''));
+    pclose($ph);
+}
+$mcDeadTotal = $DL_MW * $DL_MN + $DL_GW * $DL_GN;
+eq(0, $mcDead,
+   "★★★ 手工录入 × {$DL_MW} + 正常记账 × {$DL_GW} 个进程、共 {$mcDeadTotal} 笔，【一次死锁都没有】"
+ . ' —— 这道互斥的第一版是 SELECT … FOR UPDATE 锁流水区间，它把正常记账的 INSERT'
+ . '也圈了进去，而两条路的加锁顺序正好相反（手工：先区间后会员行；记账：先会员行后插入）。'
+ . '同样规模下实测 5–7 笔冲破 LocalDb 的两次重试，柜台上就是「数据库繁忙」。'
+ . '现在锁的是 manual_entry_lock 上的【单行】，正常记账根本不碰它'
+ . $workerWhy($mcDeadWhy));
+eq($mcDeadTotal, $mcDeadOk,
+   "  └ 而且 {$mcDeadTotal} 笔一笔不少地写进去了 —— 这是上一条的【前提】，"
+ . '也是这条断言唯一有牙齿的条件：额度一撞上限、或记账那侧没有真订单可记，'
+ . '就不再 INSERT，环的另一半不来，改回区间锁它照样绿（docs/13 §3.6 的「假绿」）');
+$pyApp->cfg()->set('manual_entry_daily_cap', '300.00');
+foreach ($pyCfg0 as $k => $v) { $pyApp->cfg()->set($k, $v); }
+
+// ── F12 / F15：源码级的两条（不依赖运行时环境） ───────────────
+ok(!preg_match('/(?<![*\s])mb_strtoupper\s*\(/',
+       (string)file_get_contents(__DIR__ . '/../app/lib/ConfigSchema.php'))
+   && !str_contains((string)file_get_contents(__DIR__ . '/../app/lib/ConfigSchema.php'),
+                    '$up = mb_strtoupper'),
+   '★★ F12 核销名称校验不再调 mb_strtoupper —— 现场踩过 mbstring 没装，'
+ . '那时 PointsEngine 里同一个调用让【整条核销路径】挂掉；'
+ . '这里再写一次就是把坑挖在后台保存的路上：店家一改名称就是 500，看不到原因');
+$py12 = new ReflectionMethod(Vip\ConfigSchema::class, 'checkRedeemPatterns');
+$py12->setAccessible(true);
+ok($py12->invoke(null, 'TARJETA 10+1') === null, '  └ 正常的核销名称照样通过');
+ok($py12->invoke(null, 'cupón especial') !== null,
+   '  └ 小写带重音的 cupón 也拦得住（黑名单里大小写两种写法都列了，不指望函数去折）');
+ok(!str_contains((string)file_get_contents(__DIR__ . '/../app/lib/Service/PointsService.php'),
+                 '$maxDays * 86400'),
+   '★★ F15 小票回溯改按【日历天】—— 减秒数会让回溯窗在夏令时那两天各差一小时，'
+ . '春季那天卡在窗边的小票就查不到了，而单子就在客人手里');
+
+$pyIds = implode(',', [$pyA, $pyB, $pyM]);
+$pyDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$pyIds})", [SMOKE_STORE]);
+$pyDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$pyIds})", [SMOKE_STORE]);
+$pyDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pyIds})", [SMOKE_STORE]);
+$pyDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '48000000%'", [SMOKE_STORE]);
+// 死锁那一段造的订单（本段自己造的，本段自己收）
+$pyDb->exec("DELETE FROM point_ledger WHERE store_code=? AND serial_id LIKE '860%'", [SMOKE_STORE]);
+$pyDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '860%'", [SMOKE_STORE]);
+$pyDb->exec('DELETE FROM manual_entry_lock WHERE store_code=?', [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(
@@ -4320,6 +4955,17 @@ $bad = $db->all(
       WHERE o.store_code = ? AND o.allocated_amount > o.total_amount',
     [SMOKE_STORE]);
 eq([], $bad, '★ 没有任何订单的已分配额超过可积分总额');
+
+/**
+ * ★ 值比对那个 while 循环【不翻页】：靠 markVerified 更新 last_verified_at
+ *   把已比过的挤出结果集来推进 —— 也就是说「有没有进展」依赖被调用方的副作用。
+ *   verify_stuck 是那条不依赖副作用的兜底判据。它一响就说明有返回路径
+ *   漏了 markVerified，而表现会是【整晚死循环打主库】，
+ *   而那台机器性能极度受限。
+ */
+eq(0, (int)$db->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=?',
+                      [SMOKE_STORE, 'verify_stuck']),
+   '★ 整轮跑完，值比对一次都没打转（verify_stuck 没响）');
 
 $mismatch = $db->all(
     'SELECT o.serial_id, o.allocated_amount,

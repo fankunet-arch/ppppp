@@ -400,6 +400,12 @@ final class ConfigSchema
             'label' => '值比对保护期',
             'desc'  => '发分后多少天内持续回读 POS 金额，发现改单就冲正',
         ],
+        'verify_recheck_hours' => [
+            'group' => 'sync', 'type' => 'positive_int', 'unit' => '小时', 'advanced' => true,
+            'label' => '值比对复查间隔',
+            'desc'  => '保护期内同一张单多久再比一次。POS 的改单大多发生在结账很久之后，'
+                     . '只比一次等于没比。调小抓得更快、也更压主库；出厂 168（7 天）',
+        ],
         'meal_item_alert_price' => [
             'group' => 'sync', 'type' => 'decimal', 'unit' => '€', 'advanced' => true,
             'label' => '新菜品告警价格线',
@@ -544,11 +550,26 @@ final class ConfigSchema
     private static function checkRedeemPatterns(string $value): ?string
     {
         // 子串匹配、忽略大小写 —— 与 PointsEngine 判折扣行时的口径一致
-        $banned = ['DTO', 'DESCUENTO', 'CUPON', 'CUPÓN', 'PROMO', 'OFERTA', 'REBAJA', '%'];
+        // ★ CUPÓN 的重音字母是多字节，stripos 折不了它的大小写 ——
+        //   所以大小写两种写法都列出来，不指望函数去折（见下面 stripos 处）
+        $banned = ['DTO', 'DESCUENTO', 'CUPON', 'CUPÓN', 'CUPóN', 'PROMO', 'OFERTA', 'REBAJA', '%'];
         foreach (PointsEngine::redeemPatternsFrom($value) as $pat) {
-            $up = mb_strtoupper($pat);
             foreach ($banned as $b) {
-                if (str_contains($up, $b)) {
+                /**
+                 * ★ 用 stripos，不用 mb_strtoupper + str_contains（审计 F12）。
+                 *
+                 *   现场踩过 mbstring 没装：PointsEngine 里那句 mb_strtoupper
+                 *   曾让【整条核销路径】挂掉（见该文件 §REDEEM_PATTERNS 的说明）。
+                 *   这里再写一次等于把同一个坑挖回来 —— 而且挖在后台保存的
+                 *   路径上：店家一改核销名称就是 500，看不到任何原因，
+                 *   最后只能把这条校验绕过去。
+                 *
+                 *   stripos 是 PHP 内置的、不依赖任何扩展。它按字节忽略
+                 *   大小写，对 ASCII（DTO / PROMO / %…）完全正确；
+                 *   带重音的 CUPÓN 里 Ó 是多字节，stripos 折不了它的大小写，
+                 *   所以下面把大小写两种写法都列进黑名单，不靠函数去折。
+                 */
+                if (stripos($pat, $b) !== false) {
                     return "「{$pat}」看着是普通折扣（含「{$b}」），不能当核销标记。"
                          . '填进来的话，所有用了满减/折扣的普通客人都会被判成「在用券」——'
                          . '这一单的计次和积分会一并没收，而且前台无法补救。'

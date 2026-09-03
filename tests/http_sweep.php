@@ -539,6 +539,31 @@ if ($thrOld !== null && $thrOld !== '' && ctype_digit($thrOld)) {
 [$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
     ['key' => 'reward_mode', 'value' => 'amount'], $cpJar);
 ok(($j['ok'] ?? false) === true, '★★ 换积分口径也保存得了', brief($st, $raw, $j));
+
+/**
+ * ★ 新增的配置项也要【真的打一遍路由】。
+ *
+ *   栽过一次：`ConfigRepo::get()` 第二个参数不可为 null，
+ *   而 /config/save 里传了 null —— 服务层探针一路绿，
+ *   后台【每一次保存都 500】。新加一个 schema 项就补一条，不要省。
+ */
+[$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
+    ['key' => 'verify_recheck_hours', 'value' => '168'], $cpJar);
+ok(($j['ok'] ?? false) === true, '★★ 值比对复查间隔保存得了', brief($st, $raw, $j));
+[$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
+    ['key' => 'verify_recheck_hours', 'value' => '0'], $cpJar);
+ok(($j['ok'] ?? true) === false,
+   '  └ 填 0 被拒（0 意味着每轮都全量重扫，会把 POS 主机压垮）', brief($st, $raw, $j));
+
+/**
+ * ★ 后台奖励券页现在要带「待发」名单（审计 F8）。
+ *   影子模式（reward_auto_grant = 0）全靠它，缺了那条上线建议就执行不了。
+ */
+[$st, $raw, $j] = req($BASE . '/cp/api.php/coupons', 'GET', null, $cpJar);
+ok(($j['ok'] ?? false) === true && is_array($j['data']['pending'] ?? null),
+   '★★ /coupons 带回「待发」名单（不只是一个总数）', brief($st, $raw, $j));
+ok(array_key_exists('auto_grant', $j['data'] ?? []),
+   '  └ 并且说清当前自动发放是开是关（开着却还有待发的，本身就是个信号）');
 [$st, $raw, $j] = req($BASE . '/cp/api.php/config/save', 'POST',
     ['key' => 'reward_mode', 'value' => 'visits'], $cpJar);
 ok(($j['ok'] ?? false) === true, '  └ 换回来同样', brief($st, $raw, $j));

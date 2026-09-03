@@ -141,7 +141,17 @@ final class PointsService
         // 回溯天数上限：0 表示不限
         $maxDays = $this->cfg->int('invoice_lookup_max_days', 7);
         if ($maxDays > 0 && $out) {
-            $cut = date('Y-m-d H:i:s', strtotime($this->pos->now()) - $maxDays * 86400);
+            /**
+             * ★ 按【日历天】回溯，不是 N × 86400 秒。
+             *
+             *   Europe/Madrid 每年有一天 23 小时、一天 25 小时。
+             *   减秒数会让回溯窗在那两天各差一小时 ——
+             *   春季那天窗口短一小时，恰好卡在窗边的那张小票就查不到了，
+             *   收银员看到的是「查无此单」，而单子就在客人手里。
+             *   与 BusinessDay::range() 同一个理由、同一种解法。
+             */
+            $cut = (new \DateTimeImmutable($this->pos->now()))
+                ->modify('-' . $maxDays . ' days')->format('Y-m-d H:i:s');
             $fresh = array_values(array_filter($out, static fn($c) => $c['order_end_time'] >= $cut));
             if (!$fresh) {
                 /**
@@ -619,9 +629,27 @@ final class PointsService
              */
             $already = [];
             foreach ($this->ledger->activeBySerial($serialId) as $row) {
-                if ((int)$row['entry_type'] === LedgerRepo::T_EARN) {
-                    $already[(int)$row['member_id']] = (string)($row['card_no'] ?? '');
+                if ((int)$row['entry_type'] !== LedgerRepo::T_EARN) {
+                    continue;
                 }
+                /**
+                 * ★ 「0 元 0 分 0 次」的流水不算占位（审计 F10）。
+                 *
+                 *   这种空行落库之后，这位客人就被永久锁死在这张单上：
+                 *   想给他补记 → member_already_on_order，
+                 *   而那条流水里一分钱一次数都没有，撤销也无从撤起
+                 *   （reverseInTx 撤的是钱和次，撤一条全零的等于没撤）。
+                 *
+                 *   现在提交侧已经把 0/0 直接拒掉（zero_allocation），
+                 *   这里是给【已经落库的历史空行】留的出口 ——
+                 *   否则那几位客人得等到订单过了保护期才解得开。
+                 */
+                if (Money::toCents((string)$row['amount']) === 0
+                    && (int)$row['points'] === 0
+                    && (int)$row['counted_visit'] === 0) {
+                    continue;
+                }
+                $already[(int)$row['member_id']] = (string)($row['card_no'] ?? '');
             }
             foreach ($allocations as $a) {
                 $mid = (int)($a['member_id'] ?? 0);
@@ -648,7 +676,27 @@ final class PointsService
              *   Pad 上「+ 添加会员」按钮到数就变灰、AA 人数框也封了顶，
              *   但那是给正常操作省事的；这一层才是真的锁。
              */
-            $seatCap = max(1, $totalPort);
+            /**
+             * ── 🔴 用券吃的那几位也要留座（审计 F9） ────────────────
+             *
+             * portions_counted 是【净】份数：券抵掉的那几份已经被扣掉了。
+             * 拿它直接当座位数，会把「用券的那位客人」挤出这张单：
+             *
+             *   4 人桌，服务员按 AA 排好 4 位 → 其中一位当场核销了一张券
+             *   → markRedeemedByApp 把净份数减到 3
+             *   → 提交时 4 > 3 → too_many_members，整笔被拒
+             *   而客人们就站在柜台前，收银员看到的提示是
+             *   「这张单的付费套餐份数不够记这么多位客人」—— 与实情无关，
+             *   也不告诉他该怎么办。
+             *
+             * 券本身就是「这个人在这儿吃了饭」最硬的凭据，比份数还硬。
+             * 所以座位数要把券抵掉的份数加回来。
+             *
+             * ★ 只加回座位，不加回可分金额与可计次份数 —— 那两样仍然按净额走，
+             *   用券那位照样是 0 元 0 次（免费餐不攒进度，见 §6）。
+             *   这里放开的只是「他有没有资格出现在这张单上」。
+             */
+            $seatCap = max(1, $totalPort + $this->orders->appRedeemedCount($serialId));
             $seats   = $already;
             foreach ($allocations as $a) {
                 $seats[(int)($a['member_id'] ?? 0)] = true;
@@ -802,6 +850,18 @@ final class PointsService
             }
 
             $this->orders->applyAllocation($serialId, $sumAmount, $sumPortions);
+            /**
+             * ★ 定格值比对的基准 —— 就是【此刻】POS 说这一单值多少钱。
+             *
+             *   必须单独存一份：should_amount / actual_amount 那两列
+             *   是主库当前值的镜像，收银员再 locate 一次就被刷掉，
+             *   夜间值比对于是拿新值跟新值比，永远判「一致」
+             *   （审计 F2，见 OrderRepo::initVerifyBase 的实测数据）。
+             *
+             *   只写第一次（方法内自带 verify_base_at IS NULL 条件）：
+             *   AA 分几次记，基准要停在第一笔那一刻。
+             */
+            $this->orders->initVerifyBase($serialId);
 
             $this->audit->log('point_grant', [
                 'target_type'   => 'order',
@@ -1123,7 +1183,15 @@ final class PointsService
         }
         $ref = reset($times);
         foreach ($times as $sid => $t) {
-            if (!$this->periods->sameSitting($t, $ref, $this->bizDay)) {
+            /**
+             * ★ 合并用的是【更宽的】那个口径（couldBeSameSitting，见 F6 的说明）。
+             *
+             *   有一桌落在餐期空档里（比如 19:29 那桌）就放行 ——
+             *   按风控那个严格口径拦下来，等于把同行分桌的两桌硬拆开，
+             *   而客人正站在柜台前。捡小票那一类由下面的
+             *   merge_span_minutes（出厂 60 分钟）挡，那才是承重墙。
+             */
+            if (!$this->periods->couldBeSameSitting($t, $ref, $this->bizDay)) {
                 return ['ok' => false, 'error' => 'merge_not_same_sitting',
                         'detail' => ['serial_id' => $sid]];
             }
@@ -1307,7 +1375,8 @@ final class PointsService
             if ($maxDay <= 0 && $maxSpan <= 0) {
                 return;
             }
-            [$from, $to] = $this->bizDay->range($this->bizDay->of(date('Y-m-d H:i:s')));
+            $bizDate = $this->bizDay->of(date('Y-m-d H:i:s'));
+            [$from, $to] = $this->bizDay->range($bizDate);
 
             foreach (array_unique(array_filter($memberIds)) as $mid) {
                 $rows = $this->ledger->earnedInRange((int)$mid, $from, $to);
@@ -1320,8 +1389,16 @@ final class PointsService
                 $n = count($ops);
                 $card = $this->members->findById((int)$mid)['card_no'] ?? ('#' . $mid);
 
+                /**
+                 * ★ 去重键要带上【营业日】（与审计 F13 同一类）。
+                 *
+                 *   这两条说的是「这张卡【今天】怎么了」—— 一天一件事。
+                 *   而 raiseOnce 只按 (类型, member) 去重的话：今天这条
+                 *   经理没来得及处理，明天同一张卡再犯就【一条都不推】。
+                 *   越是天天出问题的那张卡，越是从第二天起彻底静音。
+                 */
                 if ($maxDay > 0 && $n > $maxDay) {
-                    $this->alerts->raiseOnce('grant_many_per_day', 'member', (string)$mid,
+                    $this->alerts->raiseOnce('grant_many_per_day', 'member', $mid . '@' . $bizDate,
                         sprintf('卡 %s 今天已记账 %d 次（阈值 %d）——「同行分桌」算 1 次，'
                               . '所以这是 %d 次分开的操作，值得核一下是不是同一位客人的消费',
                                 $card, $n, $maxDay, $n),
@@ -1333,7 +1410,7 @@ final class PointsService
                     $stamps = array_map(static fn(array $r): int => (int)strtotime((string)$r['order_end_time']), $rows);
                     $spanH  = (max($stamps) - min($stamps)) / 3600;
                     if ($spanH > $maxSpan) {
-                        $this->alerts->raiseOnce('grant_span_wide', 'member', (string)$mid,
+                        $this->alerts->raiseOnce('grant_span_wide', 'member', $mid . '@' . $bizDate,
                             sprintf('卡 %s 今天记的几单，结账时间跨了 %.1f 小时（阈值 %d）——'
                                   . '同一顿饭不会跨这么久，像是攒了一把小票一起来兑',
                                     $card, $spanH, $maxSpan),
@@ -1380,6 +1457,26 @@ final class PointsService
             }
             if ((int)$orig['entry_type'] !== LedgerRepo::T_EARN) {
                 return ['ok' => false, 'error' => 'not_reversible'];
+            }
+
+            /**
+             * ── 🔴 撤销必须写原因（审计 F11） ────────────────────
+             *
+             * 撤销是【不可逆的减钱动作】：客人的分、次、消费额一起退掉，
+             * 靠它挣来的券还会被连带作废（clawBackOverIssued）。
+             * 而这条路原来允许空原因 —— 审计日志里那条 reason 就是空串。
+             *
+             * 后果不是「记录不好看」：客人事后来问「我上周那顿怎么没了」，
+             * 店里翻出审计日志，只看得到「某年某月某人撤了」，
+             * 说不出为什么。而系统里每一个同量级的动作都是要理由的 ——
+             * 作废券要（void）、强制核销要（override）、强制换卡要、
+             * 后台手工发券要。唯独撤销不要，这本身就说不通。
+             *
+             * ★ 放在时间窗判定【之前】：先说「你得填原因」，
+             *   再说「超时了要经理」——两条都不满足时，先说得清的那条。
+             */
+            if (trim($reason) === '') {
+                return ['ok' => false, 'error' => 'reason_required'];
             }
 
             // 撤销时间窗：超出需经理权限
@@ -1447,7 +1544,9 @@ final class PointsService
              */
             if (($claw['unrecoverable'] ?? 0) > 0) {
                 $this->alerts->raiseOnce(
-                    'reward_on_reversed_grant', 'member', (string)$orig['member_id'],
+                    // ★ 去重键带上流水号：同一位客人被撤第二笔时，
+                    //   那顿同样白送的饭不能被当成重复告警吞掉（F13）
+                    'reward_on_reversed_grant', 'member', $orig['member_id'] . '#' . $ledgerId,
                     sprintf('撤销了一笔记账，但由它带出的 %d 张免费餐券【已经被核销】，收不回来了。'
                           . '请人工核对这位客人的奖励进度（流水 #%d，原因：%s）',
                         (int)$claw['unrecoverable'], $ledgerId, $reason),
@@ -1576,23 +1675,13 @@ final class PointsService
          *   而放行权本身就在最可能滥用的那个人手里。
          */
         $dayCap = Money::toCents($this->cfg->get('manual_entry_daily_cap', '0'));
-        $opIdPre = (int)($operator['id'] ?? 0);
-        if ($dayCap > 0 && $opIdPre > 0) {
-            /**
-             * ★ 起点按【营业日】，不是日历零点。
-             *   切点 02:00，晚市 19:30 做到凌晨 02:00 —— 一个班次跨零点。
-             *   按日历切等于在班次中间把额度清零：实测上限写 € 300，
-             *   同一个人同一个班次录进了 € 600。
-             *   这套系统里 business_date、餐期、告警统计全走营业日，
-             *   不该只有这道上限自己搞一套「一天从几点开始」。
-             */
-            $usedToday = $this->ledger->manualAmountSince($opIdPre, $this->businessDayStart());
-            if ($usedToday + $amountCents > $dayCap) {
-                return ['ok' => false, 'error' => 'exceeds_manual_daily_cap',
-                        'detail' => ['cap' => Money::toStr($dayCap),
-                                     'used' => Money::toStr($usedToday),
-                                     'given' => Money::toStr($amountCents)]];
-            }
+        /**
+         * ★ 互斥行【在事务外】先补齐（见 LedgerRepo::ensureQuotaRow）。
+         *   放进事务里的话，两个事务同时 INSERT 同一个主键会各拿一把 S 锁，
+         *   随后都要升级成 X —— 又是一个死锁环。
+         */
+        if ($dayCap > 0) {
+            $this->ledger->ensureQuotaRow((int)($operator['id'] ?? 0));
         }
         /**
          * 两道上限，管的事情不一样：
@@ -1626,7 +1715,48 @@ final class PointsService
                     'detail' => ['limit' => Money::toStr($limit)]];
         }
 
-        return $this->db->transaction(function () use ($memberId, $amountCents, $reasonCode, $operator) {
+        return $this->db->transaction(function () use ($memberId, $amountCents, $reasonCode,
+                                                       $operator, $dayCap) {
+            /**
+             * ── 🔴 日累计上限要在【事务里、拿到锁之后】判（审计 F14） ────
+             *
+             * 这一段原来在事务外面：读一下 manualAmountSince 判「没超」，
+             * 然后才进事务写流水。两台 Pad 同时提交时各自读到「今天用了 0」，
+             * 各自放行，各自写进去 —— 上限 € 300 被撑成 € 600。
+             * 与 checkAndGrant 那次「四个进程发出四张券」是同一个形状：
+             * 「读一下再写」而中间没有锁，等于没上限。
+             *
+             * 锁的是 manual_entry_lock 里【这个操作员那一行】（额度按操作员算）。
+             * 锁会员行不够 —— 同一个人给两位不同客人各录一笔照样并发；
+             * 锁 operator 表那一行也不行 —— 那要求那一行确实存在，
+             * 而「碰巧存在」不是可以拿来守钱的性质；
+             * 锁流水的区间更不行 —— gap 锁彼此不冲突，反而制造死锁。
+             *
+             * ★ 起点按【营业日】，不是日历零点。
+             *   切点 02:00，晚市 19:30 做到凌晨 02:00 —— 一个班次跨零点。
+             *   按日历切等于在班次中间把额度清零：实测上限写 € 300，
+             *   同一个人同一个班次录进了 € 600。
+             *
+             * ★ transaction() 会在死锁/锁等待时重放这个闭包，所以这里
+             *   不能依赖闭包外算好的中间量 —— 用到的都是入参与现查的值。
+             */
+            $opIdPre = (int)($operator['id'] ?? 0);
+            if ($dayCap > 0 && $opIdPre > 0) {
+                // 单行 X 锁：同一个操作员的手工录入在这里排队。
+                // 不能改成锁流水的区间 —— gap 锁彼此不冲突，两笔都拿得到，
+                // 然后各自 INSERT 进去互等，实测每 160 笔死锁 5–7 次
+                // （见 LedgerRepo::lockManualQuota）。
+                $this->ledger->lockManualQuota($opIdPre);
+                $usedToday = $this->ledger->manualAmountSince(
+                    $opIdPre, $this->businessDayStart());
+                if ($usedToday + $amountCents > $dayCap) {
+                    return ['ok' => false, 'error' => 'exceeds_manual_daily_cap',
+                            'detail' => ['cap' => Money::toStr($dayCap),
+                                         'used' => Money::toStr($usedToday),
+                                         'given' => Money::toStr($amountCents)]];
+                }
+            }
+
             $member = $this->members->lockById($memberId);
             if ($member === null) {
                 return ['ok' => false, 'error' => 'member_not_found'];

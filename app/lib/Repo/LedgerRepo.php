@@ -82,6 +82,63 @@ final class LedgerRepo
         return $this->db->lastInsertId();
     }
 
+    /**
+     * 把「这个操作员的手工录入」这条线串行化 —— 单行 X 锁，不锁区间。
+     *
+     * ── 🔴 为什么必须有互斥（审计 F14） ────────────────────
+     *
+     * 日额度是「读一下再写」：读出今天用了多少、判没超、才写。
+     * 中间没有互斥就等于没上限 —— 实测 4 台 Pad 同时连录，
+     * € 300 的上限落进 € 360。与 checkAndGrant 那次
+     * 「四个进程发出四张券」完全同形。
+     *
+     * ── 为什么是【单行】而不是区间 ─────────────────────────
+     *
+     * 第一版锁流水的区间（SELECT … FOR UPDATE），实测每 160 笔死锁
+     * 5–7 次：InnoDB 的 gap 锁彼此不冲突，两笔手工录入都拿得到同一个
+     * gap，然后各自要往里 INSERT，互相等对方的 gap 锁。
+     * 单行 X 锁没有 gap，两个事务不可能同时持有，排队即可，不会成环。
+     *
+     * ── 为什么单开一张表，不复用 operator 那一行 ─────────────
+     *
+     * 复用要求那一行确实存在。冒烟里的合成操作员没有对应行，
+     * 锁当场落空、上限被撑破 € 360/€ 300，而代码看上去完全正确 ——
+     * 「碰巧存在」不是可以拿来守钱的性质（docs/13 §3.4）。
+     * 这里的行由 ensureQuotaRow() 自己按需补齐，不依赖任何外部前提。
+     *
+     * ★ 补行那一步【必须在事务外】先跑掉（autocommit）。
+     *   放在事务里的话，两个事务同时 INSERT 同一个主键，
+     *   后到的会先拿一把 S 锁，随后两边都要升级成 X —— 又是一个环。
+     *   固定调用顺序：ensureQuotaRow() → transaction{ lockManualQuota() → … }
+     *
+     * ★ 只当互斥量，不存任何业务数值：「今天用了多少」仍然实时从
+     *   point_ledger 算。单一真相不变，撤销后额度自动释放这一现有语义也不变。
+     */
+    public function ensureQuotaRow(int $operatorId): void
+    {
+        if ($operatorId <= 0) {
+            return;
+        }
+        $this->db->exec(
+            'INSERT IGNORE INTO manual_entry_lock (store_code, operator_id, updated_at)
+             VALUES (?,?,?)',
+            [$this->storeCode, $operatorId, $this->db->now()]
+        );
+    }
+
+    /** 取那把单行 X 锁。调用方须已在事务内，且已先调过 ensureQuotaRow()。 */
+    public function lockManualQuota(int $operatorId): void
+    {
+        if ($operatorId <= 0) {
+            return;
+        }
+        $this->db->value(
+            'SELECT operator_id FROM manual_entry_lock
+              WHERE store_code = ? AND operator_id = ? FOR UPDATE',
+            [$this->storeCode, $operatorId]
+        );
+    }
+
     public function findById(int $id): ?array
     {
         return $this->db->one(
@@ -220,14 +277,36 @@ final class LedgerRepo
      *    排除之后：撤销把原流水标成 REVERSED，那一笔的额度正好还回来一次
      *    （值也一并没了，clawBackOverIssued 会把券收回），前后是一致的。
      */
+    /**
+     * 这位操作员从 $since 起手工录进去多少钱（分）。
+     *
+     * ── 判日额度时【不在这里加锁】，互斥交给 lockManualQuota() ────
+     *
+     * 这里曾经带过 FOR UPDATE，想用区间锁把「我刚量过的这一段」封住。
+     * 看着对，实测每 160 笔稳定死锁 5–7 次。InnoDB 自己的记录：
+     *
+     *     TRX A：持有 idx_operator 上的 X gap 锁，等 member 行锁
+     *     TRX B：持有 member 行锁，  等着往那个 gap 里 insert
+     *
+     * 根因是 gap 锁【彼此不冲突】：两笔手工录入都拿得到同一个 gap，
+     * 然后各自要往里 INSERT，于是互相等对方的 gap 锁。
+     * 「先 FOR UPDATE 一段区间，再往这段区间 INSERT」是经典死锁形状，
+     * 与锁的列粒度无关 —— 把 source 加进索引也没用，冲突双方都是手工录入。
+     *
+     * 现在这里是纯读，互斥由 lockManualQuota() 的【单行】X 锁提供。
+     *
+     * ★ 仍然要走 idx_operator（迁移 016 建、017 把 source 提前）——
+     *   否则每笔手工录入都要全表扫一遍流水。
+     */
     public function manualAmountSince(int $operatorId, string $since): int
     {
+        // 条件顺序照着 idx_operator 写：store_code / operator_id / source 等值，created_at 范围
         return Money::toCents((string)($this->db->value(
             'SELECT COALESCE(SUM(amount), 0) FROM point_ledger
-              WHERE store_code = ? AND source = ? AND operator_id = ?
-                AND entry_type = ? AND status = ? AND created_at >= ?',
-            [$this->storeCode, self::SRC_MANUAL, $operatorId,
-             self::T_EARN, self::S_ACTIVE, $since]
+              WHERE store_code = ? AND operator_id = ? AND source = ? AND created_at >= ?
+                AND entry_type = ? AND status = ?',
+            [$this->storeCode, $operatorId, self::SRC_MANUAL, $since,
+             self::T_EARN, self::S_ACTIVE]
         ) ?? '0'));
     }
 
