@@ -812,22 +812,38 @@ final class RewardService
          * 它是按当时的规则挣到的，新规则没有资格判它。
          */
         $srcNow = $p['mode'] === 'amount' ? self::SRC_AMOUNT : self::SRC_VISITS;
-        $stale = $this->db->all(
-            'SELECT id, code, status FROM coupon
-              WHERE store_code = ? AND member_id = ? AND source = ?
-                AND progress_at_grant > ?
-              ORDER BY progress_at_grant DESC, id DESC LIMIT 50',
-            [$this->storeCode, $memberId, $srcNow, (int)$p['progress']]
-        );
-
         /**
-         * 已经核销掉的排在后面不动 —— 那顿饭吃掉了，收不回来。
-         * 它们仍然占着 rewards_issued（客人确实拿到了那份奖励），
-         * 由调用方按 unrecoverable 去挂告警。
+         * ── 🔴 只捞【有效】券，而且要多少捞多少 ────────────────────
+         *
+         * 原来这一句不按状态过滤，只 `ORDER BY progress_at_grant DESC LIMIT 50`，
+         * 捞回来再在 PHP 里筛出有效的。一旦前 50 名被【已作废】的券占满，
+         * 之后每一次调用都捞回同样那 50 张作废券 → 候选为空 → 收回 0 张，
+         * 而 rewards_issued 永远卡在那个数上：
+         *
+         *   实测（门槛 1、60 张券、计次归零）：
+         *     第一次回收 → 收回 50 张，issued 60 → 10
+         *     第二次回收 → 收回 【0】 张，issued 卡在 10          🔴
+         *     客人手上白留 10 张免费餐券，再怎么调用都收不回来。
+         *
+         * 这不是「一次收不完、下次接着收」——是【永久卡死】。
+         * 60 张不算离谱：门槛 10 的老客攒到 600 次就是 60 张，
+         * 而一次数据订正把计次调下来就会走到这里。
+         *
+         * 修法两条，缺一不可：
+         *   ① status = 有效 放进 SQL —— LIMIT 才是「50 张能收的」，
+         *      不是「50 张随便什么状态的」；
+         *   ② 上限按【还要收几张】取，不再写死 50 —— 一次就能收干净。
+         *      仍保留一个上限防止极端情况下拼出巨大语句，
+         *      而因为①，重复调用一定能继续收，收敛有保证。
          */
-        $cands = array_values(array_filter(
-            $stale, static fn(array $c): bool => (int)$c['status'] === self::ST_ACTIVE));
-        $cands = array_slice($cands, 0, $over);
+        $lim   = max(1, min($over, 500));
+        $cands = $this->db->all(
+            'SELECT id, code FROM coupon
+              WHERE store_code = ? AND member_id = ? AND source = ? AND status = ?
+                AND progress_at_grant > ?
+              ORDER BY progress_at_grant DESC, id DESC LIMIT ' . $lim,
+            [$this->storeCode, $memberId, $srcNow, self::ST_ACTIVE, (int)$p['progress']]
+        );
 
         $codes = [];
         foreach ($cands as $c) {
@@ -866,8 +882,18 @@ final class RewardService
          * 真正要报警的是这一件事：有张券发在【后来被退掉的那段进度上】，
          * 而客人已经把它吃了 —— 店里实打实亏一顿饭。
          */
-        $eaten = count(array_filter(
-            $stale, static fn(array $c): bool => (int)$c['status'] === self::ST_REDEEMED));
+        /**
+         * ★ 已经吃掉的单独数一遍，不再从上面那批候选里筛。
+         *   候选现在只含有效券（且带 LIMIT），从里面筛「已核销」恒为 0，
+         *   告警就再也不会响 —— 而那条告警说的正是「白送了一顿饭」。
+         *   这里不加 LIMIT：数数不产生大结果集。
+         */
+        $eaten = (int)$this->db->value(
+            'SELECT COUNT(*) FROM coupon
+              WHERE store_code = ? AND member_id = ? AND source = ? AND status = ?
+                AND progress_at_grant > ?',
+            [$this->storeCode, $memberId, $srcNow, self::ST_REDEEMED, (int)$p['progress']]
+        );
 
         return ['voided'        => count($codes),
                 'unrecoverable' => max(0, min($over - count($codes), $eaten)),

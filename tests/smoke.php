@@ -5113,6 +5113,98 @@ $pyDb->exec("DELETE FROM point_ledger WHERE store_code=? AND serial_id LIKE '860
 $pyDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id LIKE '860%'", [SMOKE_STORE]);
 $pyDb->exec('DELETE FROM manual_entry_lock WHERE store_code=?', [SMOKE_STORE]);
 
+step('㊿ 赠券回收不能卡死、告警不能少报（赠券专项自查）');
+
+/**
+ * ── 🔴 clawBackOverIssued 的候选查询原来会【永久卡死】 ────────────
+ *
+ * 原来那句 SQL 不按状态过滤，只 `ORDER BY progress_at_grant DESC LIMIT 50`，
+ * 捞回来再在 PHP 里筛有效券。于是只要「进度最高的前 50 张」里有 50 张
+ * 已经是作废/已核销的，候选就恒为空 —— 有效券一张也收不回，
+ * 而 rewards_issued 永远卡在那个数上。
+ *
+ * 实测两种形状：
+ *   ① 60 张全有效、计次归零 → 第一次收 50 张（issued 60→10），
+ *      第二次收【0】张，issued 卡在 10，客人白留 10 张免费餐券；
+ *   ② 55 张里 52 张已被吃掉 → 3 张有效的一张也捞不到（前 50 名全是已核销的），
+ *      同时 unrecoverable 只报 50（真实是 52）——「白送了几顿饭」的数字是错的。
+ *
+ * 60 张不算离谱：门槛 10 的老客攒到 600 次就是 60 张，
+ * 而一次数据订正把计次调下来就会走到这里。
+ *
+ * 修法：status = 有效 放进 SQL（LIMIT 才是「50 张能收的」），
+ * 上限按【还要收几张】取；已核销的单独 COUNT，不再从窗口里筛。
+ */
+$czApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$czDb  = $czApp->localDb();
+$czOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$czCfg0 = [];
+foreach (['reward_enabled' => '1', 'reward_mode' => 'visits',
+          'reward_threshold_visits' => '1', 'reward_auto_grant' => '1'] as $k => $v) {
+    $czCfg0[$k] = $czApp->cfg()->get($k, '');
+    $czApp->cfg()->set($k, $v);
+}
+
+// ① 60 张全有效 → 计次归零 → 必须一次收干净
+$cz1 = (int)$czApp->members()->create('TK-00099001-CZA', null, null, null)['id'];
+$czDb->exec('UPDATE member SET visit_count=60, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $cz1]);
+$czApp->rewards()->checkAndGrant($cz1, $czOp);
+eq(60, (int)$czDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                         [SMOKE_STORE, $cz1]), '㊿ 门槛 1、60 次 → 发出 60 张');
+$czDb->exec('UPDATE member SET visit_count=0 WHERE store_code=? AND id=?', [SMOKE_STORE, $cz1]);
+$czR1 = $czApp->rewards()->clawBackOverIssued($cz1, $czOp, '冒烟：计次归零');
+eq(60, (int)$czR1['voided'],
+   '★★★ 计次归零 → 60 张【一次收干净】—— 原来 LIMIT 50 只收 50 张，'
+ . '而第二次调用会捞回同样那 50 张已作废的，候选恒空、再也收不动，'
+ . 'issued 永远卡在 10，客人白留 10 张免费餐券');
+eq(0, (int)$czDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                        [SMOKE_STORE, $cz1]), '  └ 手上一张有效券都不剩');
+eq(0, (int)$czDb->value('SELECT rewards_issued FROM member WHERE store_code=? AND id=?',
+                        [SMOKE_STORE, $cz1]), '  └ rewards_issued 归零（没卡住）');
+eq(0, (int)$czApp->rewards()->clawBackOverIssued($cz1, $czOp, '冒烟：再收一次')['voided'],
+   '  └ 再收一次收 0 张（幂等，不重复动）');
+
+// ② 已核销的占满前 50 名 → 有效券仍要收得动，且告警数字要准
+$cz2 = (int)$czApp->members()->create('TK-00099002-CZB', null, null, null)['id'];
+$czDb->exec('UPDATE member SET visit_count=55, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $cz2]);
+$czApp->rewards()->checkAndGrant($cz2, $czOp);
+// 进度最高的 52 张标成已核销（客人真吃掉了）
+foreach ($czDb->all('SELECT id FROM coupon WHERE store_code=? AND member_id=?
+                      ORDER BY progress_at_grant DESC, id DESC LIMIT 52',
+                    [SMOKE_STORE, $cz2]) as $czC) {
+    $czDb->exec('UPDATE coupon SET status=2 WHERE id=?', [(int)$czC['id']]);
+}
+$czDb->exec('UPDATE member SET visit_count=0 WHERE store_code=? AND id=?', [SMOKE_STORE, $cz2]);
+$czR2 = $czApp->rewards()->clawBackOverIssued($cz2, $czOp, '冒烟：计次归零');
+eq(3, (int)$czR2['voided'],
+   '★★★ 52 张已吃掉的占满「进度最高的前 50 名」时，剩下 3 张有效券【照样收得回】—— '
+ . '原来那 3 张一张也捞不到（窗口里全是已核销的），客人白留 3 张');
+eq(52, (int)$czR2['unrecoverable'],
+   '★★ 而且「白送了几顿饭」报的是真实的 52 —— 原来从 50 行窗口里筛，最多只报得出 50');
+
+// ③ 大批回收之后重新达标：只按新进度发，不把作废的那批再发一遍
+$cz3 = (int)$czApp->members()->create('TK-00099003-CZC', null, null, null)['id'];
+$czApp->cfg()->set('reward_threshold_visits', '10');
+$czDb->exec('UPDATE member SET visit_count=60, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $cz3]);
+$czApp->rewards()->checkAndGrant($cz3, $czOp);
+$czDb->exec('UPDATE member SET visit_count=0 WHERE store_code=? AND id=?', [SMOKE_STORE, $cz3]);
+$czApp->rewards()->clawBackOverIssued($cz3, $czOp, '冒烟：归零');
+$czDb->exec('UPDATE member SET visit_count=60 WHERE store_code=? AND id=?', [SMOKE_STORE, $cz3]);
+$czApp->rewards()->checkAndGrant($cz3, $czOp);
+eq(6, (int)$czDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=1',
+                        [SMOKE_STORE, $cz3]),
+   '★★ 回收 6 张之后重新攒回 60 次 → 手上恰好 6 张（不是 12 张）');
+eq(6, (int)$czDb->value('SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=? AND status=4',
+                        [SMOKE_STORE, $cz3]), '  └ 作废的那 6 张仍是作废，没有「自动恢复」');
+
+foreach ($czCfg0 as $k => $v) { $czApp->cfg()->set($k, $v); }
+$czIds = implode(',', [$cz1, $cz2, $cz3]);
+$czDb->exec("DELETE FROM coupon WHERE store_code=? AND member_id IN ({$czIds})", [SMOKE_STORE]);
+$czDb->exec("DELETE FROM member WHERE store_code=? AND id IN ({$czIds})", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(
