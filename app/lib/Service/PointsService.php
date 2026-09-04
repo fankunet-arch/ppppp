@@ -95,7 +95,32 @@ final class PointsService
 
         $out = [];
         foreach ($agg as $o) {
-            $out[] = $this->buildContext($o);
+            /**
+             * ── 🔴 一张单出问题，不能拖垮整桌 ──────────────────
+             *
+             * locate 是【按桌批量】的：一张桌上最近的几单一起取出、逐单
+             * buildContext。而 buildContext 会写镜像（upsert），万一某一单的
+             * 金额落在 DECIMAL(11,2) 之外（>10 亿欧），upsert 抛
+             * 22003，整桌的 locate 一起挂 —— 收银员对这张桌一个客人都记不了账。
+             *
+             * 这需要 POS 主库里真出现一个 10 亿欧的订单，正常绝不会发生
+             * （POS 自己的字段宽度也就那么大），但「一张坏单阻塞整桌」这件事
+             * 本身不该成立。坏的那一单跳过并告警，其余照常返回。
+             *
+             * ★ PosUnavailable 不在这里吞 —— 那是「主库连不上」，要整体走
+             *   降级（手工录入），已由外层 try 处理。这里只接【单单级】的意外。
+             */
+            try {
+                $out[] = $this->buildContext($o);
+            } catch (PosUnavailable $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                $serial = (string)($o['serial_id'] ?? ('oh:' . ($o['order_head_id'] ?? '?')));
+                $this->alerts->raiseOnce('order_build_failed', 'order', $serial,
+                    sprintf('订单 %s 无法处理（%s），已跳过，不影响同桌其他单',
+                        $serial, $e->getMessage()),
+                    ['severity' => 2]);
+            }
         }
         // 结账时间倒序，最近的排前面
         usort($out, static fn($a, $b) => strcmp($b['order_end_time'], $a['order_end_time']));
@@ -327,6 +352,10 @@ final class PointsService
             // ★ 存【净】份数：被券抵掉的那几份本来就不该计次，
             //   存净值后 validateAllocations 天然把分配上限卡对。
             'portions_counted'   => $netPortions,
+            // ★ 同时存【总】份数（券抵之前）。核销时要按它重算净份数 ——
+            //   否则 markRedeemedByApp 只能靠 is_redeemed 这个布尔去减，
+            //   一桌两张券就少扣一份（迁移 019）。
+            'portions_gross'     => $analysis['portions_counted'],
             'portions_uncounted' => $analysis['portions_uncounted'],
             'is_redeemed'        => $isRedeemed,
             'redeem_cents'       => $analysis['redeem_cents'],
@@ -1491,6 +1520,36 @@ final class PointsService
             $points = (int)$orig['points'];
             $visits = (int)$orig['counted_visit'];
 
+            /**
+             * ── 🔴 先扣掉【已经补偿过】的部分，否则同一次退两遍 ──────
+             *
+             * 「先记账、后核销」时 clawBackVisitOnRedeem() 已经另插了一条
+             * 「免费那一餐不计次」的负数流水（reverses_id 指向这一笔），
+             * 而原流水本身不动（账本是追加式的）。
+             * 于是 $orig['counted_visit'] 已经不是「现在还欠客人几次」。
+             *
+             * 实测三步全是柜台日常动作：
+             *     ① 服务员先按 AA 记账          会员 0 → 1
+             *     ② 客人事后拿出券，核销到这一单 会员 1 → 0（对的）
+             *     ③ 经理发现记错卡，撤销那一笔  会员 0 → -1  🔴
+             * 客人凭空少一次，下一顿免费餐要多来一趟；
+             * 而进度条会写「还差 4 次」——比门槛本身还大。
+             *
+             * ★ 判据必须与 clawBackVisitOnRedeem 一致：看【还剩多少没退】，
+             *   不是【当初记了多少】。那边守住了「一单两张券」，
+             *   这边没守住「核销之后再撤销」—— 同一个形状隔了一个函数
+             *   （docs/13 §3.1）。
+             *
+             * ★ 补偿流水也要一并标记成已冲正：留着有效的话，
+             *   「有效流水的计次合计」会和会员表对不上。
+             */
+            $comps = $this->ledger->activeCompensationsOf($ledgerId);
+            foreach ($comps as $c) {
+                $amt    += Money::toCents((string)$c['amount']);      // 补偿是负数
+                $points += (int)$c['points'];
+                $visits += (int)$c['counted_visit'];
+            }
+
             $this->members->lockById((int)$orig['member_id']);
 
             $revId = $this->ledger->insert([
@@ -1510,6 +1569,11 @@ final class PointsService
             ]);
 
             $this->ledger->markReversed($ledgerId, $revId);
+            // 补偿流水随原流水一起退出有效集 —— 它的使命（把那一次退掉）
+            // 已经被并进上面这条冲正里了，留着就会被重复计入
+            foreach ($comps as $c) {
+                $this->ledger->markReversed((int)$c['id'], $revId);
+            }
 
             // 允许负余额并标记，不阻断撤销；下次消费优先抵扣
             $this->members->applyDelta((int)$orig['member_id'], -$points, -$visits, -$amt);

@@ -139,6 +139,42 @@ final class LedgerRepo
         );
     }
 
+    /**
+     * 已经针对某一笔流水做过、且仍然有效的【补偿流水】。
+     *
+     * ── 🔴 撤销一笔时，必须先看它已经被补偿掉多少 ────────────
+     *
+     * 「先记账、后核销」时，clawBackVisitOnRedeem() 会另插一条
+     * 「免费那一餐不计次」的负数流水，reverses_id 指向原流水，
+     * 但【原流水本身不动】（账本是追加式的，不改历史行）。
+     *
+     * 于是原流水上那个 counted_visit 已经不代表「现在还欠客人几次」了。
+     * 谁再照着它退一次，就是把同一次退两遍 —— 实测客人计次被扣穿：
+     *
+     *     ① 记账      #109 +1 有效
+     *     ② 核销      #110 -1 有效（reverses_id=109），会员 1 → 0
+     *     ③ 撤销 #109 #112 -1 有效 —— 又退了一次，会员 0 → -1  🔴
+     *
+     * 而这个形状有【两处】踩：手工撤销（reverseInTx）与值比对整单归零
+     * （ReconcileService::applyShrink）。两处都要先问一句
+     * 「这一笔还剩多少没退」，而不是「这一笔当初记了多少」。
+     *
+     * ★ clawBackVisitOnRedeem 自己是按「这位客人在这一单上现存的净次数」
+     *   算的，所以一单核销两张券不会退两遍 —— 但那条判据没被另外两处共用，
+     *   正是 docs/13 §3.1「修了那一处、没修那一类」。
+     *
+     * 命中 idx_reverse (reverses_id)。
+     */
+    public function activeCompensationsOf(int $ledgerId): array
+    {
+        return $this->db->all(
+            'SELECT id, amount, points, counted_visit
+               FROM point_ledger
+              WHERE store_code = ? AND reverses_id = ? AND status = ?',
+            [$this->storeCode, $ledgerId, self::S_ACTIVE]
+        );
+    }
+
     public function findById(int $id): ?array
     {
         return $this->db->one(
@@ -165,6 +201,43 @@ final class LedgerRepo
     }
 
     /** 某订单下的有效流水（用于展示「已记给谁」与撤销入口） */
+    /**
+     * 这一单上每位会员【现在还剩多少】—— 计次与份数的净额。
+     *
+     * ── 🔴 为什么不能用 activeBySerial() 去加 ──────────────────
+     *
+     * 撤销是「原流水标 status=2，另插一条负数流水（status=1）」。
+     * 于是按 status=1 筛出来的行里，【负数留着、被它抵掉的正数没了】——
+     * 净额会凭空少一份。实测（fuzz by_portion seed 30）：
+     *   +2（已冲正）  −2（冲正行）  +2（重记）
+     *   按活动行加 = 0，而这位客人手上实实在在是 2 次。
+     * 少算的后果是「该退的没退」—— 券抵掉的那一份还给客人留着计次，
+     * 也就是往下一顿白送。
+     *
+     * 追加式账本里「现在还剩多少」永远是【全部流水求和】，不筛状态 ——
+     * member.visit_count / points_balance 就是这么维护的
+     * （见不变量①：余额 == 全部流水合计，同样不带状态条件）。
+     *
+     * @return array<int,array{visits:int,portions:int}> 按 member_id
+     */
+    public function netBySerial(string $serialId): array
+    {
+        $out = [];
+        foreach ($this->db->all(
+            'SELECT member_id,
+                    COALESCE(SUM(counted_visit), 0)    AS visits,
+                    COALESCE(SUM(portions_counted), 0) AS portions
+               FROM point_ledger
+              WHERE store_code = ? AND serial_id = ?
+              GROUP BY member_id',
+            [$this->storeCode, $serialId]
+        ) as $r) {
+            $out[(int)$r['member_id']] = ['visits'   => (int)$r['visits'],
+                                          'portions' => (int)$r['portions']];
+        }
+        return $out;
+    }
+
     public function activeBySerial(string $serialId): array
     {
         return $this->db->all(

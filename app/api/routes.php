@@ -527,7 +527,10 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator,
         'tier'      => $app->cardTiers()->describe($card['tier_code'] ?? null),
         'valid_to'  => $card['valid_to'],
         // 发卡前要提醒收银员「这张快到期了」，判断在前端做，天数由后端算
-        'days_left' => \Vip\Repo\CardRepo::daysLeft($card),
+        // ★ 显式传营业日：静态助手默认读的是进程级 resolver，
+        //   单请求单 App 时无碍，但一个进程装配多个 App（批处理/测试）时
+        //   会读到「最后装配那个 App」的切点。传进来就与本请求同源，不依赖全局态。
+        'days_left' => \Vip\Repo\CardRepo::daysLeft($card, $app->businessDay()->today()),
     ];
 
     if ($r['state'] === 'active') {
@@ -666,9 +669,9 @@ $api->on('POST', '/card/status', static function () use ($app, $requireOperator)
         'card_no'     => $app->cardNumber()->format((string)$card['card_no']),
         'status'      => (int)$card['status'],
         'valid_to'    => $card['valid_to'],
-        'days_left'   => \Vip\Repo\CardRepo::daysLeft($card),
-        'expired'     => \Vip\Repo\CardRepo::isExpired($card),
-        'grace_over'  => \Vip\Repo\CardRepo::graceOver($card, $app->cardService()->graceMonths()),
+        'days_left'   => \Vip\Repo\CardRepo::daysLeft($card, $app->businessDay()->today()),
+        'expired'     => \Vip\Repo\CardRepo::isExpired($card, $app->businessDay()->today()),
+        'grace_over'  => \Vip\Repo\CardRepo::graceOver($card, $app->cardService()->graceMonths(), $app->businessDay()->today()),
         'void_reason' => $card['void_reason'],
         // 等级：不分级时为 null，前端据此不显示这一栏
         'tier'        => $app->cardTiers()->describe($card['tier_code'] ?? null),
@@ -795,6 +798,20 @@ $api->on('POST', '/points/grant', static function () use ($app, $requireOperator
     }
     if (!in_array($mode, [PE::MODE_WHOLE, PE::MODE_SPLIT, PE::MODE_PICK], true)) {
         Api::fail('bad_request');
+    }
+    /**
+     * ★ 先把条数框住，再开始逐条转换。
+     *
+     *   一张桌子最多坐十几个人，这个上限任何正常客户端都碰不到。
+     *   加它不是因为观测到了卡死 —— 实测 10 万条（4.7 MB）也只是
+     *   1.77 秒后被 member_already_on_order 挡掉，业务闸门跑在前面。
+     *   加它是因为【那是巧合】：闸门在 grantOne 里，而 Money::toCents
+     *   这一趟循环在闸门之前，条数完全由客户端说了算。
+     *   哪天有人把校验顺序挪一下，这里就成了一个无界循环。
+     *   而 POS 主机性能极度受限，一次 1.77 秒的空转本身也不该白给。
+     */
+    if (count($allocs) > 100) {
+        Api::fail('too_many_members', 400, ['given' => count($allocs), 'max' => 100]);
     }
 
     $clean = [];

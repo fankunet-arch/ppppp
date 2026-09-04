@@ -67,7 +67,7 @@ final class OrderRepo
         // 要读明细才算得出来的列 —— 只有 buildContext 有权写
         $setComputed = [
             'total_amount', 'excluded_amount',
-            'portions_counted', 'portions_uncounted',
+            'portions_counted', 'portions_gross', 'portions_uncounted',
             'is_redeemed', 'redeem_amount',
         ];
         $cols = $computed ? array_merge($setRaw, $setComputed) : $setRaw;
@@ -79,10 +79,10 @@ final class OrderRepo
                (store_code, serial_id, order_head_id, check_ids, table_name, eat_type,
                 customer_num, order_end_time, business_date,
                 original_amount, should_amount, actual_amount, tax_amount, total_amount,
-                excluded_amount, portions_counted, portions_uncounted,
+                excluded_amount, portions_counted, portions_gross, portions_uncounted,
                 is_redeemed, redeem_amount,
                 created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
              ON DUPLICATE KEY UPDATE
                ' . $updates . ',
                updated_at         = VALUES(updated_at)',
@@ -103,6 +103,7 @@ final class OrderRepo
                 Money::toStr($o['total_cents'] ?? 0),
                 Money::toStr($o['excluded_cents'] ?? 0),
                 $o['portions_counted'] ?? 0,
+                $o['portions_gross'] ?? ($o['portions_counted'] ?? 0),
                 $o['portions_uncounted'] ?? 0,
                 !empty($o['is_redeemed']) ? 1 : 0,
                 Money::toStr($o['redeem_cents'] ?? 0),
@@ -271,11 +272,50 @@ final class OrderRepo
      *    这里只扣得掉一份。那时会少扣一份 —— 与修之前的行为一样，不是新增退化；
      *    重新 locate 时 buildContext 会按券的【张数】一次性对齐。
      */
+    /**
+     * 前台点「核销」时把这一单的净份数减下去。
+     *
+     * ── 🔴 is_redeemed 是布尔，不能拿来当计数 ────────────────
+     *
+     * 原来写的是
+     *   portions_counted = GREATEST(0, portions_counted - IF(is_redeemed = 1, 0, 1))
+     * ——【只有第一张券扣得动】。一桌两张券（家庭桌里两位都攒够了，
+     * 这不是边角料）就少扣一份：
+     *
+     *   实测 4 份的桌、甲乙各一张券：
+     *     先记账后核销 → 记进去 4 次，两次核销只退回 1 次，
+     *                    实付 2 份却留着 3 次 —— 白送一顿饭的进度；
+     *     先核销后记账 → 净份数停在 3，四人 AA 被 exceeds_portions
+     *                    直接拒掉，收银员当场记不进去。
+     *
+     * 而 buildContext()（locate / 同步那条路）一直是对的：
+     * 净 = 总份数 − max(匹配串反推的份数, App 核销张数)。
+     * 同一个数两个人算，只有一个算对 —— docs/13 §3.1bis。
+     *
+     * ★ 为什么不能简单改成「每次都减 1」：
+     *   POS 上已经有折扣行、匹配串认出来过一次时，buildContext 已经替
+     *   那张券扣过了；再减一次就是把同一份免费餐扣两遍，
+     *   而那个方向是【对客人不利】的。
+     *
+     * 所以按地面真值重算，并且【只减不加】：
+     *   净 = LEAST(现在的净份数, 总份数 − App 已核销张数)
+     *   取 LEAST 是为了不撤销「匹配串比 App 多认出来」的那部分扣减。
+     *
+     * ★ portions_gross = 0 是迁移 019 之前的老数据，那一档退回原来的
+     *   「减 1」写法 —— 总份数不知道时，宁可少扣也不能把净份数清零。
+     */
     public function markRedeemedByApp(string $serialId): void
     {
         $this->db->exec(
             'UPDATE pos_order
-                SET portions_counted = GREATEST(0, portions_counted - IF(is_redeemed = 1, 0, 1)),
+                SET portions_counted = IF(portions_gross > 0,
+                        LEAST(portions_counted,
+                              GREATEST(0, portions_gross - (
+                                  SELECT COUNT(*) FROM coupon c
+                                   WHERE c.store_code = pos_order.store_code
+                                     AND c.redeemed_serial_id = pos_order.serial_id
+                                     AND c.status = 2))),
+                        GREATEST(0, portions_counted - IF(is_redeemed = 1, 0, 1))),
                     is_redeemed      = 1,
                     updated_at       = ?
               WHERE store_code = ? AND serial_id = ?',

@@ -34,6 +34,18 @@ final class CardService
     ) {
     }
 
+    /**
+     * 「今天」= 营业日的今天，且【与本 Service 的配置同源】。
+     *
+     * ★ 不走 CardRepo 静态方法的默认参数：那个默认读的是进程级 resolver，
+     *   一个进程装配多个 App（批处理/测试）时会读到「最后装配那个」的切点。
+     *   这里显式用自己的 cfg 算，永远对得上本门店本请求。
+     */
+    private function todayBiz(): string
+    {
+        return (new \Vip\BusinessDay($this->cfg->get('business_day_cutoff', '02:00')))->today();
+    }
+
     /** 过期后还能换卡的宽限期（月），后台可调 */
     public function graceMonths(): int
     {
@@ -85,14 +97,14 @@ final class CardService
          * 所以这里除了拒绝，还要把「这张卡绑的是谁」一并带回去 ——
          * Pad 据此直接进入换卡流程，收银员不用再查一遍。
          */
-        if (CardRepo::isExpired($card)) {
+        if (CardRepo::isExpired($card, $this->todayBiz())) {
             $member = $card['member_id'] !== null
                 ? $this->members->findById((int)$card['member_id'])
                 : null;
             return [
                 'ok' => false, 'state' => 'expired', 'error' => 'card_expired',
                 'card' => $card, 'member' => $member,
-                'grace_over' => CardRepo::graceOver($card, $this->graceMonths()),
+                'grace_over' => CardRepo::graceOver($card, $this->graceMonths(), $this->todayBiz()),
             ];
         }
 
@@ -147,7 +159,7 @@ final class CardService
                     // 已经是别人的卡了 —— 该走「直接进入该会员」，不是建新的
                     return ['ok' => false, 'error' => 'card_taken'];
                 }
-                if (CardRepo::isExpired($card)) {
+                if (CardRepo::isExpired($card, $this->todayBiz())) {
                     // 库存里躺过期了。别发给客人 —— 他拿回家就是一张废卡
                     return ['ok' => false, 'error' => 'card_expired'];
                 }
@@ -218,7 +230,7 @@ final class CardService
             }
             // 旧卡过期【不影响】换卡 —— 那正是换卡要解决的场景。
             // 但新卡本身不能是过期的，否则换了个寂寞
-            if (CardRepo::isExpired($newCard)) {
+            if (CardRepo::isExpired($newCard, $this->todayBiz())) {
                 return ['ok' => false, 'error' => 'card_expired'];
             }
 
@@ -233,7 +245,7 @@ final class CardService
              * 与「经理强制核销」是同一套做法。
              */
             $forced = false;
-            if ($old !== null && CardRepo::graceOver($old, $grace)) {
+            if ($old !== null && CardRepo::graceOver($old, $grace, $this->todayBiz())) {
                 if ($override === null) {
                     return ['ok' => false, 'error' => 'grace_over',
                             'old_valid_to' => $old['valid_to'],

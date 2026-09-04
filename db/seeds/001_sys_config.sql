@@ -105,6 +105,10 @@ INSERT INTO `sys_config` (`store_code`,`config_key`,`config_value`,`updated_at`)
   -- 按金额口径下的 X（欧元）。
 (@store,'reward_auto_grant','1',@now),
   -- 1=达标自动发券  0=只在后台提示，由人工发（适合想先人工把关的门店）
+(@store,'reward_max_auto_grant','10',@now),
+  -- 一次最多自动发几张。正常客人一次只达标 1 张；一次算出超过这个数，
+  -- 多半是门槛被改小了（把 100.00 打成 1.00，一位消费 800 欧的熟客
+  -- 当场就是 800 张免费餐券）。超限就一张都不自动发，改成告警 + 待人工确认。
 (@store,'coupon_valid_days','90',@now),
   -- 券有效期天数，0 = 永久有效。
 

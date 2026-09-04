@@ -621,6 +621,25 @@ $cronSrc = file_get_contents(__DIR__ . '/../../bin/cron.php');
 T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $cronSrc), 'cron.php 拒绝从网络访问');
 T::true((bool)preg_match('/flock\(/', $cronSrc), 'cron 有并发锁');
 
+/**
+ * ★ 并发锁要按【抢的是哪件事】取名，不是按【哪个任务】取名。
+ *
+ *   第一版每个任务拿自己任务名的锁，于是 nightly 和 incremental
+ *   各拿各的 —— 而 nightly 的第一步就是 incremental。
+ *   营业时段最后一轮 01:40 的增量补抓没跑完（POS 慢、积压多，
+ *   上限 200 批），03:15 的 nightly 照样开跑，两个进程同时推同一条
+ *   水位线：正是这把锁要防的那件事，锁本身放它过去了。
+ *   而 integrity / menu-audit / compliance 三个任务当时一把锁都没有。
+ */
+T::false((bool)preg_match("/withLock\\(\\s*'nightly'/", $cronSrc),
+    "★★ nightly 不拿一把只属于自己的锁 —— 它跑的是别人也在跑的那几件事");
+T::true((bool)preg_match("/withLock\\(\\[[^\\]]*'sync'/", $cronSrc),
+    "  └ nightly 把 sync 那把锁也拿上（否则和 incremental 会叠上）");
+foreach (['integrity', 'menu-audit', 'compliance'] as $t) {
+    T::true((bool)preg_match("/case '" . preg_quote($t, '/') . "':\s*\n\s*withLock\(/", $cronSrc),
+        "  └ {$t} 也有并发锁（原来这三个一把都没有）");
+}
+
 $diagSrc = file_get_contents(__DIR__ . '/../../bin/diag.php');
 T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $diagSrc), 'diag.php 拒绝从网络访问');
 T::true(str_contains($diagSrc, '1045') && str_contains($diagSrc, '1044'),
