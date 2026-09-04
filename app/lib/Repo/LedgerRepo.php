@@ -165,14 +165,38 @@ final class LedgerRepo
      *
      * 命中 idx_reverse (reverses_id)。
      */
-    public function activeCompensationsOf(int $ledgerId): array
+    public function activeCompensationsOf(int $ledgerId, bool $forUpdate = false): array
     {
         return $this->db->all(
             'SELECT id, amount, points, counted_visit
                FROM point_ledger
-              WHERE store_code = ? AND reverses_id = ? AND status = ?',
+              WHERE store_code = ? AND reverses_id = ? AND status = ?'
+            . ($forUpdate ? ' FOR UPDATE' : ''),
             [$this->storeCode, $ledgerId, self::S_ACTIVE]
         );
+    }
+
+    /**
+     * 这一单上有哪些会员的记账流水（只取 id，用来【先加锁再读账】）。
+     *
+     * ★ 调用方必须已经握着这一单的订单行 X 锁 —— 那把锁挡住了并发记账，
+     *   所以这里普通读拿到的名单不会再变；名单定下来才谈得上「按 id 升序
+     *   把人锁完」。顺序固定是防死锁的第一道（docs/13 §3.4）。
+     *
+     * @return int[] 已按 id 升序
+     */
+    public function memberIdsOnSerial(string $serialId): array
+    {
+        $ids = [];
+        foreach ($this->db->all(
+            'SELECT DISTINCT member_id FROM point_ledger
+              WHERE store_code = ? AND serial_id = ?',
+            [$this->storeCode, $serialId]
+        ) as $r) {
+            $ids[] = (int)$r['member_id'];
+        }
+        sort($ids);
+        return $ids;
     }
 
     public function findById(int $id): ?array
@@ -220,26 +244,61 @@ final class LedgerRepo
      *
      * @return array<int,array{visits:int,portions:int}> 按 member_id
      */
-    public function netBySerial(string $serialId): array
+    public function netBySerial(string $serialId, bool $forUpdate = false): array
     {
+        /**
+         * ★ 要加锁时【不能用 GROUP BY】—— MySQL 不允许聚合查询带 FOR UPDATE。
+         *   所以加锁那一档把行取回来在 PHP 里合计，结果完全一样。
+         *
+         * ★ 为什么非要 FOR UPDATE：InnoDB 默认 REPEATABLE READ，
+         *   一笔事务里【普通读】看到的是事务开头那一刻的快照 ——
+         *   哪怕你在读之前已经把会员行锁到手、等对方提交完了，
+         *   普通读【照样返回旧值】。只有加锁读才读得到最新已提交版本。
+         *   「先加锁再读」这句话，在 InnoDB 上必须写成「先加锁再【加锁读】」。
+         *
+         * ★ 命中 idx_order (store_code, serial_id)，锁的范围就是这一单的流水。
+         */
+        $rows = $forUpdate
+            ? $this->db->all(
+                'SELECT member_id, counted_visit, portions_counted
+                   FROM point_ledger
+                  WHERE store_code = ? AND serial_id = ? FOR UPDATE',
+                [$this->storeCode, $serialId])
+            : $this->db->all(
+                'SELECT member_id,
+                        COALESCE(SUM(counted_visit), 0)    AS counted_visit,
+                        COALESCE(SUM(portions_counted), 0) AS portions_counted
+                   FROM point_ledger
+                  WHERE store_code = ? AND serial_id = ?
+                  GROUP BY member_id',
+                [$this->storeCode, $serialId]);
+
         $out = [];
-        foreach ($this->db->all(
-            'SELECT member_id,
-                    COALESCE(SUM(counted_visit), 0)    AS visits,
-                    COALESCE(SUM(portions_counted), 0) AS portions
-               FROM point_ledger
-              WHERE store_code = ? AND serial_id = ?
-              GROUP BY member_id',
-            [$this->storeCode, $serialId]
-        ) as $r) {
-            $out[(int)$r['member_id']] = ['visits'   => (int)$r['visits'],
-                                          'portions' => (int)$r['portions']];
+        foreach ($rows as $r) {
+            $mid = (int)$r['member_id'];
+            $out[$mid] ??= ['visits' => 0, 'portions' => 0];
+            $out[$mid]['visits']   += (int)$r['counted_visit'];
+            $out[$mid]['portions'] += (int)$r['portions_counted'];
         }
         return $out;
     }
 
-    public function activeBySerial(string $serialId): array
+    public function activeBySerial(string $serialId, bool $forUpdate = false): array
     {
+        /**
+         * ★ 加锁那一档【不能带 LEFT JOIN member】：那会把会员行也一起锁上，
+         *   而会员行在本仓库的加锁顺序里排在订单之后、流水之前
+         *   （pos_order → member → coupon → point_ledger）。
+         *   在这里顺手锁会员，等于把顺序打乱。要卡号自己再查。
+         */
+        if ($forUpdate) {
+            return $this->db->all(
+                'SELECT * FROM point_ledger
+                  WHERE store_code = ? AND serial_id = ? AND status = ?
+                  ORDER BY id ASC FOR UPDATE',
+                [$this->storeCode, $serialId, self::S_ACTIVE]
+            );
+        }
         return $this->db->all(
             'SELECT l.*, m.card_no
                FROM point_ledger l
@@ -276,14 +335,27 @@ final class LedgerRepo
 
     /**
      * 一次多桌合并产出的全部有效流水，用于整组撤销。
-     * 加锁：撤销要改会员余额与订单已分配额，必须和并发的记账排队。
+     *
+     * ── 🔴 这里【不能】加 FOR UPDATE ──────────────────────────
+     *
+     * 加锁顺序全仓库统一成 pos_order → member → coupon → point_ledger。
+     * 在这里先把流水行锁住，就是把 point_ledger 提到了最前面 ——
+     * 而 reverseInTx 逐条处理时会去锁订单和会员，两者交叉就是死锁。
+     *
+     * 不加锁也不会漏：reverseInTx 自己会按顺序锁到订单、会员，
+     * 最后【加锁读】这一行并复核 status，中途被别人撤掉的那一笔
+     * 会当场返回 already_reversed，整组一起回滚。
+     *
+     * ★ 排序按 serial_id 在前：整组撤销要按固定顺序去锁那几张订单行，
+     *   否则两笔重叠的整组撤销会互相等（和 grantMerged 的 sort($serials)
+     *   同一个道理）。
      */
-    public function lockActiveByGroup(string $group): array
+    public function activeByGroup(string $group): array
     {
         return $this->db->all(
             'SELECT * FROM point_ledger
               WHERE store_code = ? AND grant_group = ? AND entry_type = ? AND status = ?
-              ORDER BY id FOR UPDATE',
+              ORDER BY serial_id IS NULL, serial_id, id',
             [$this->storeCode, $group, self::T_EARN, self::S_ACTIVE]
         );
     }

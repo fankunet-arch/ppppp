@@ -109,6 +109,18 @@ final class LocalDb
      * 2 次足够：死锁是两笔事务【碰巧】交叉，重放一次几乎必然错开。
      * 给得再多也只是在真正拥塞时把收银台拖得更久。
      */
+    /**
+     * 本进程里事务被回滚重放了几次。
+     *
+     * ★ 不是统计口味的东西，是【断言用的】。死锁重放会把错误的结果
+     *   悄悄修正回来：两条路各读到一份旧账、各退各的，本该退成 -1，
+     *   可它们恰好互相等锁形成环、被 InnoDB 挑一个回滚，重放时重新读账，
+     *   结果又对了。于是「结果对」什么也证明不了 ——
+     *   实测修复前同一组并发【每一轮都死锁】，结果却次次正确。
+     *   要让并发断言有牙，就得直接盯住这个数：正确性不该靠重放兜着。
+     */
+    public static int $deadlockReplays = 0;
+
     private const DEADLOCK_RETRIES = 2;
 
     /** MySQL：1213 = 死锁被选为牺牲者，1205 = 等锁超时。两者都是整笔已回滚 */
@@ -158,6 +170,7 @@ final class LocalDb
                 if ($attempt >= self::DEADLOCK_RETRIES || !self::isRetryable($e)) {
                     throw $e;
                 }
+                self::$deadlockReplays++;
                 // 退让一点点再重放，避免两笔事务再次同时冲上去
                 usleep(random_int(5000, 25000) * ($attempt + 1));
             }

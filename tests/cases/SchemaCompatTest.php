@@ -622,6 +622,40 @@ T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $cronSrc), 'cron.php 拒绝
 T::true((bool)preg_match('/flock\(/', $cronSrc), 'cron 有并发锁');
 
 /**
+ * ── 全仓库统一的加锁顺序（docs/13 §3.4）─────────────────────
+ *   pos_order → card → member → coupon → point_ledger
+ *
+ * 这里钉住最容易被改反的那一段：核销要【先卡后会员】。
+ *
+ * 换卡那条路是 lockByCardNo → updateCardNo，本来就是先卡后会员。
+ * 核销里 verifyPin 会写 card.pin_fail（那是一把写锁），要是为了
+ * 「会员是三条退账路的共同互斥点」把 members->lockById 提到验 PIN 之前，
+ * 就和换卡撞成新的一对反向持锁 —— 修一个坑挖一个坑。
+ * 这一版第一次改就是这么写的，靠「换卡 × 核销」的并发探针才量出来。
+ *
+ * ★ 用源码顺序钉而不是跑并发：那个死锁只在特定时序下出现，
+ *   并发断言会时红时绿；而「谁写在谁前面」是确定的。
+ */
+$rwSrc = file_get_contents(__DIR__ . '/../../app/lib/Service/RewardService.php');
+$rwRedeem = (string)(preg_split('/public function redeem\(/', $rwSrc)[1] ?? '');
+$rwRedeem = (string)(preg_split('/\n    \/\*\*\n     \* 先记账、后核销/', $rwRedeem)[0] ?? $rwRedeem);
+/**
+ * ★ 必须先把注释剥掉再比位置。
+ *   这段说明里就写着 verifyPin / lockBySerial 这几个名字，
+ *   不剥注释量到的是【注释里那一次】—— 断言恒绿，等于没写。
+ *   第一版就是这么写的，把改错的代码放回去它照样绿（docs/13 §3.6）。
+ */
+$rwRedeem = (string)preg_replace('#/\*.*?\*/|//[^\n]*#s', '', $rwRedeem);
+$rwPin  = strpos($rwRedeem, 'verifyPin');
+$rwMem  = strpos($rwRedeem, 'members->lockById');
+$rwOrd  = strpos($rwRedeem, 'orders->lockBySerial');
+T::true($rwOrd !== false && $rwMem !== false && $rwOrd < $rwMem,
+    '★★ 核销：订单行锁排在会员行锁之前（撤销/值比对/记账都是这个顺序）');
+T::true($rwPin !== false && $rwMem !== false && $rwPin < $rwMem,
+    '★★ 核销：验 PIN（会写 card.pin_fail）排在会员行锁之前 —— '
+  . '换卡是先卡后会员，这里反过来就是一对反向持锁');
+
+/**
  * ★ 并发锁要按【抢的是哪件事】取名，不是按【哪个任务】取名。
  *
  *   第一版每个任务拿自己任务名的锁，于是 nightly 和 incremental

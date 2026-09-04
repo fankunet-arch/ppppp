@@ -363,8 +363,26 @@ final class ReconcileService
                 return;
             }
 
+            /**
+             * ── 🔴 先把人锁住，再去读账 ────────────────────────────
+             *
+             * 「这一条还剩多少没退」是三条路（核销 / 撤销 / 这里）共用的数。
+             * 三条路原来都是【先把账读出来、再去取会员锁】，
+             * 于是两边都能读到同一份旧账，各退各的 —— 同一次退两遍。
+             *
+             * 加锁顺序全仓库统一：pos_order → member → coupon → point_ledger。
+             * 订单行的 X 锁上面已经拿到（lockBySerial），所以这一单上的
+             * 会员名单不会再变，普通读拿名单是安全的；拿到之后按 id 升序锁。
+             *
+             * ★ 随后的读一律【加锁读】：InnoDB 默认 REPEATABLE READ，
+             *   普通读返回的是事务开头的快照 —— 锁等到了也读不到新值。
+             */
+            foreach ($this->ledger->memberIdsOnSerial($serial) as $mid) {
+                $this->members->lockById($mid);
+            }
+
             $earns = [];
-            foreach ($this->ledger->activeBySerial($serial) as $e) {
+            foreach ($this->ledger->activeBySerial($serial, true) as $e) {
                 if ((int)$e['entry_type'] === LedgerRepo::T_EARN && Money::toCents((string)$e['amount']) > 0) {
                     $earns[] = $e;
                 }
@@ -402,7 +420,7 @@ final class ReconcileService
          */
         $comps = []; $netAmt = []; $netPts = []; $netVis = []; $remainTotal = 0;
             foreach ($earns as $i => $e) {
-                $comps[$i] = $this->ledger->activeCompensationsOf((int)$e['id']);
+                $comps[$i] = $this->ledger->activeCompensationsOf((int)$e['id'], true);
                 $a = Money::toCents((string)$e['amount']);
                 $p = (int)$e['points'];
                 $v = (int)$e['counted_visit'];
@@ -484,7 +502,7 @@ final class ReconcileService
                  */
                 $backVisits = $newTotal === 0 ? $netVis[$i] : 0;
 
-                $this->members->lockById((int)$e['member_id']);
+                // 会员行的 X 锁在读账之前就按 id 升序全部拿过了，这里不再补锁
                 $refundId = $this->ledger->insert([
                     'member_id'     => (int)$e['member_id'],
                     'serial_id'     => $serial,
