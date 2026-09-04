@@ -95,7 +95,32 @@ final class PointsService
 
         $out = [];
         foreach ($agg as $o) {
-            $out[] = $this->buildContext($o);
+            /**
+             * ── 🔴 一张单出问题，不能拖垮整桌 ──────────────────
+             *
+             * locate 是【按桌批量】的：一张桌上最近的几单一起取出、逐单
+             * buildContext。而 buildContext 会写镜像（upsert），万一某一单的
+             * 金额落在 DECIMAL(11,2) 之外（>10 亿欧），upsert 抛
+             * 22003，整桌的 locate 一起挂 —— 收银员对这张桌一个客人都记不了账。
+             *
+             * 这需要 POS 主库里真出现一个 10 亿欧的订单，正常绝不会发生
+             * （POS 自己的字段宽度也就那么大），但「一张坏单阻塞整桌」这件事
+             * 本身不该成立。坏的那一单跳过并告警，其余照常返回。
+             *
+             * ★ PosUnavailable 不在这里吞 —— 那是「主库连不上」，要整体走
+             *   降级（手工录入），已由外层 try 处理。这里只接【单单级】的意外。
+             */
+            try {
+                $out[] = $this->buildContext($o);
+            } catch (PosUnavailable $e) {
+                throw $e;
+            } catch (\Throwable $e) {
+                $serial = (string)($o['serial_id'] ?? ('oh:' . ($o['order_head_id'] ?? '?')));
+                $this->alerts->raiseOnce('order_build_failed', 'order', $serial,
+                    sprintf('订单 %s 无法处理（%s），已跳过，不影响同桌其他单',
+                        $serial, $e->getMessage()),
+                    ['severity' => 2]);
+            }
         }
         // 结账时间倒序，最近的排前面
         usort($out, static fn($a, $b) => strcmp($b['order_end_time'], $a['order_end_time']));

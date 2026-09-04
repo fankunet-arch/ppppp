@@ -739,8 +739,12 @@ eq($exp180, (string)$db->value('SELECT valid_to FROM coupon WHERE id = ?', [$cid
    '★ 改规则后，先发的那张仍是 180 天 —— 客人拿到手的券到期日不会变');
 
 // 过期判定读券上的日期，不读当前规则
+// ★ 营业日昨天，不是日历昨天 —— 见卡片测试处 $bizToday 的说明
+$couponBizYest = (new DateTimeImmutable(
+    (new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))->businessDay()->today()
+))->modify('-1 day')->format('Y-m-d');
 $db->exec('UPDATE coupon SET valid_to = ? WHERE id = ?',
-    [date('Y-m-d', strtotime('-1 day')), $cid90]);
+    [$couponBizYest, $cid90]);
 $setCfg($db, 'coupon_valid_days', '3650');
 (new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))
     ->rewards()->expireStale();
@@ -1376,10 +1380,23 @@ step('⑰ 卡片有效期 —— 卡面日期是唯一的告知证据');
  * 缺陷是常客也会被清零，补法是「有效期属于卡片，不属于积分」：
  * 到店换卡则积分全部结转。以下把这条链路钉住。
  */
-$today    = date('Y-m-d');
-$past     = date('Y-m-d', strtotime('-1 day'));
-$soon     = date('Y-m-d', strtotime('+10 days'));
-$far      = date('Y-m-d', strtotime('+3 years'));
+/**
+ * ── 🔴 造「过期/未过期」的基准日必须用【营业日】，不是日历日 ──────
+ *
+ * 过期判定走 CardRepo::isExpired → BusinessDay::today()，营业日 02:00 才翻页。
+ * 若这里用 date('-1 day')（日历日）造「昨天」，在营业日 00:00–02:00 的
+ * 那两小时里，日历日已经翻页而营业日没有 —— 「日历昨天」正好等于
+ * 「营业今天」，券判不出过期，断言在那两小时里会误红。
+ *
+ * 而那两小时正是 F5 要守的时段（晚市，客人最多）。所以基准日要和
+ * 被测代码同源：以营业日的今天为轴，前后各推一天。
+ */
+$bizToday = (new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))
+    ->businessDay()->today();
+$today    = $bizToday;
+$past     = (new DateTimeImmutable($bizToday))->modify('-1 day')->format('Y-m-d');
+$soon     = (new DateTimeImmutable($bizToday))->modify('+10 days')->format('Y-m-d');
+$far      = (new DateTimeImmutable($bizToday))->modify('+3 years')->format('Y-m-d');
 
 // ── 生成时的有效期校验 ──
 foreach ([[$past, '已经过去的日期'], [$today, '就是今天'], ['2026-13-45', '格式不对']] as [$bad, $why]) {
@@ -4788,6 +4805,39 @@ ok($px9r['ok'] ?? false,
  . '与实情无关也不告诉收银员该怎么办，而客人们就站在柜台前'
  . ($px9r['ok'] ?? false ? '' : '：' . ($px9r['error'] ?? '?')));
 eq(4, count($px9r['entries'] ?? []), '  └ 四位都记上了（用券那位 0 元 0 份，仍然在这张单上）');
+
+/**
+ * ── locate 的健壮性：一张坏单不能拖垮整桌（攻击自查发现）──────
+ *
+ * locate 按桌批量取最近几单、逐单 buildContext，而 buildContext 会写镜像。
+ * 若某一单的金额落在 DECIMAL(11,2) 之外（>10 亿欧，需 POS 主库真有这种单），
+ * upsert 抛 22003，原来整桌 locate 一起挂 —— 收银员一个客人都记不了。
+ * 现在坏单跳过并告警，其余照常。
+ */
+$pzPos = new FakePosSource();
+$pzPos->now = date('Y-m-d H:i:s');
+$pzPos->addHead(['serial_id' => '4600009001', 'order_head_id' => 469001, 'check_id' => 1,
+    'table_name' => 'PZ', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($pzPos->now) - 600)]);
+$pzPos->addDetail(469001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+// 同桌的毒单：金额超 DECIMAL(11,2)
+$pzPos->addHead(['serial_id' => '4600009002', 'order_head_id' => 469002, 'check_id' => 1,
+    'table_name' => 'PZ', 'eat_type' => 0, 'customer_num' => 1,
+    'original_amount' => '99999999999.99', 'should_amount' => '99999999999.99',
+    'actual_amount' => '99999999999.99',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($pzPos->now) - 300)]);
+$pzPos->addDetail(469002, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '99999999999.99', 1)]);
+$pxApp->setPosSource($pzPos);
+$pzLoc = $pxApp->points()->locate('PZ', 3600);
+ok(($pzLoc['ok'] ?? false) === true && count($pzLoc['candidates'] ?? []) === 1,
+   '★★ 同桌有一张金额溢出的毒单，locate 仍返回【那张正常单】—— '
+ . '原来整桌一起抛 22003，收银员对这张桌一个客人都记不了账');
+ok((int)$pxDb->value('SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type=?',
+                     [SMOKE_STORE, 'order_build_failed']) > 0,
+   '  └ 毒单被跳过并留了 order_build_failed 告警（不是静默丢弃）');
+$pxDb->exec('DELETE FROM alert WHERE store_code=? AND alert_type=?', [SMOKE_STORE, 'order_build_failed']);
+$pxDb->exec("DELETE FROM pos_order WHERE store_code=? AND serial_id LIKE '46000090%'", [SMOKE_STORE]);
 
 $pxApp->cfg()->set('reward_threshold_visits', (string)$px8thr);
 foreach ($pxCfg0 as $k => $v) { $pxApp->cfg()->set($k, $v); }

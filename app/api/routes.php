@@ -527,7 +527,10 @@ $api->on('POST', '/card/lookup', static function () use ($app, $requireOperator,
         'tier'      => $app->cardTiers()->describe($card['tier_code'] ?? null),
         'valid_to'  => $card['valid_to'],
         // 发卡前要提醒收银员「这张快到期了」，判断在前端做，天数由后端算
-        'days_left' => \Vip\Repo\CardRepo::daysLeft($card),
+        // ★ 显式传营业日：静态助手默认读的是进程级 resolver，
+        //   单请求单 App 时无碍，但一个进程装配多个 App（批处理/测试）时
+        //   会读到「最后装配那个 App」的切点。传进来就与本请求同源，不依赖全局态。
+        'days_left' => \Vip\Repo\CardRepo::daysLeft($card, $app->businessDay()->today()),
     ];
 
     if ($r['state'] === 'active') {
@@ -666,9 +669,9 @@ $api->on('POST', '/card/status', static function () use ($app, $requireOperator)
         'card_no'     => $app->cardNumber()->format((string)$card['card_no']),
         'status'      => (int)$card['status'],
         'valid_to'    => $card['valid_to'],
-        'days_left'   => \Vip\Repo\CardRepo::daysLeft($card),
-        'expired'     => \Vip\Repo\CardRepo::isExpired($card),
-        'grace_over'  => \Vip\Repo\CardRepo::graceOver($card, $app->cardService()->graceMonths()),
+        'days_left'   => \Vip\Repo\CardRepo::daysLeft($card, $app->businessDay()->today()),
+        'expired'     => \Vip\Repo\CardRepo::isExpired($card, $app->businessDay()->today()),
+        'grace_over'  => \Vip\Repo\CardRepo::graceOver($card, $app->cardService()->graceMonths(), $app->businessDay()->today()),
         'void_reason' => $card['void_reason'],
         // 等级：不分级时为 null，前端据此不显示这一栏
         'tier'        => $app->cardTiers()->describe($card['tier_code'] ?? null),

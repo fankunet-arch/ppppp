@@ -1053,7 +1053,7 @@ $api->on('POST', '/cards/lookup', static function () use ($app, $requireManager)
         'batch_no'     => $card['batch_no'],
         'tier'         => $app->cardTiers()->describe($card['tier_code'] ?? null),
         'valid_to'     => $card['valid_to'],
-        'expired'      => \Vip\Repo\CardRepo::isExpired($card),
+        'expired'      => \Vip\Repo\CardRepo::isExpired($card, $app->businessDay()->today()),
         'status'       => (int)$card['status'],
         'activated_at' => $card['activated_at'],
         'voided_at'    => $card['voided_at'],
