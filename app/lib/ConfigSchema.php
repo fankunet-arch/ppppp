@@ -63,6 +63,14 @@ final class ConfigSchema
             'desc'  => '「按金额」口径下生效',
             'active_when' => ['key' => 'reward_mode', 'value' => 'amount'],
         ],
+        'reward_max_auto_grant' => [
+            'group' => 'reward', 'type' => 'positive_int', 'unit' => '张',
+            'label' => '一次最多自动发几张',
+            'desc'  => '给「达标自动发券」加的一道保险。正常客人一次只会达标 1 张；'
+                     . '一旦一次算出超过这个数（多半是门槛刚被改小、或进度是手工录入堆出来的），'
+                     . '系统【一张都不自动发】，改成告警 + 进「待发」页等人工确认。'
+                     . '进度不会丢，确认没问题点一下照样补发',
+        ],
         'reward_auto_grant' => [
             'group' => 'reward', 'type' => 'bool',
             'label' => '达标自动发券',
@@ -376,9 +384,11 @@ final class ConfigSchema
 
         // ── 同步与巡检（技术参数）──────────────────────────
         'sync_window_hours' => [
-            'group' => 'sync', 'type' => 'int', 'unit' => '小时', 'advanced' => true,
+            'group' => 'sync', 'type' => 'positive_int', 'unit' => '小时', 'advanced' => true,
             'label' => '补抓窗口',
-            'desc'  => '每次向前补抓多长时间范围的订单',
+            'desc'  => '每次向前补抓多长时间范围的订单。'
+                     . '★ 必须 ≥1：增量同步靠「水位线 + 本值」往前推，填 0 或负数时'
+                     . '水位线永远不动 —— 同步会静默停摆，每轮还白打 200 次 POS 查询',
         ],
         'sync_batch_size' => [
             'group' => 'sync', 'type' => 'int', 'unit' => '单', 'advanced' => true,
@@ -512,9 +522,21 @@ final class ConfigSchema
              *
              *   实测：门槛填 0 → 一位 10 次的会员当场发出 10 张。
              */
+            /**
+             * ★ 文案要按【这一项】说话，不能写死成奖励门槛那一套。
+             *
+             *   这个类型现在还管着 sync_window_hours、verify_recheck_hours 等 ——
+             *   给它们报「填 0 会变成每来一次送一次、会回溯补发」是驴唇不对马嘴，
+             *   店家照着这句话根本判断不出自己填错了什么
+             *   （docs/13 §3.5「照着这句话做，会得到它说的结果吗」）。
+             *   通用部分留给所有项，后果由各项自己的 desc 去说。
+             */
             'positive_int' => (ctype_digit($value) && (int)$value >= 1) ? null
-                              : '必须是 1 或更大的整数。填 0 会变成「每来一次送一次」，'
-                              . '而且会按历史进度给所有会员回溯补发 —— 发出去的券收不回来',
+                              : '必须是 1 或更大的整数'
+                              . (str_starts_with($key, 'reward_threshold')
+                                 ? '。填 0 会变成「每来一次送一次」，'
+                                 . '而且会按历史进度给所有会员回溯补发 —— 发出去的券收不回来'
+                                 : '（填 0 或负数会让相关任务无法推进）'),
             'positive_decimal' => (preg_match('/^\d+(\.\d{1,2})?$/', $value) && (float)$value > 0) ? null
                               : '必须大于 0，最多两位小数。填 0 会让每一笔消费都达标，'
                               . '并按历史消费给所有会员回溯补发',

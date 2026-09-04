@@ -117,6 +117,64 @@ function inv_all(\Vip\LocalDb $db, string $ST, int $thrVisits, int $thrAmountCen
                   GROUP BY redeemed_serial_id HAVING COUNT(DISTINCT id)>50",[$ST]) as $r)
         $bad[] = "⑨同一单核销了{$r['n']}张券: {$r['redeemed_serial_id']}";
 
+    /**
+     * ⑨a 【白送的正面判据】整单免费的饭，不该给任何人留下计次。
+     *
+     * ①–⑧ 查的都是【内部一致性】—— 账本自洽、余额对得上。
+     * 但「白送」可以在完全自洽的情况下发生：一顿全免的饭照样给客人
+     * 记了一次，账面处处正确，只是那一次不该有。计次直接换免费餐，
+     * 多留一次就是往下一顿白送。
+     *
+     * ★ 判据是【净份数为 0】，不是「券数 ≥ 净份数」。
+     *   portions_counted 是【净】份数（券抵掉的已经扣过了），
+     *   拿它和券数比会误伤混合单：2 人单里 1 人用券之后
+     *   净份数=1、券数=1，条件成立 —— 而另一位付了钱的客人
+     *   那一次本来就该留着（docs/03 §5.5「静默少给」）。
+     *   第一版就是这么写错的，被 W2 场景当场证伪。
+     */
+    foreach ($q("SELECT o.serial_id,
+                   (SELECT COUNT(*) FROM coupon c
+                     WHERE c.store_code=o.store_code AND c.redeemed_serial_id=o.serial_id
+                       AND c.status=2) redeemed
+                   FROM pos_order o
+                  WHERE o.store_code=? AND o.portions_counted = 0",[$ST]) as $o) {
+        if ((int)$o['redeemed'] <= 0) { continue; }   // 没核销过券的 0 份单不在此列
+        foreach ($q("SELECT member_id, SUM(counted_visit) v FROM point_ledger
+                      WHERE store_code=? AND serial_id=? GROUP BY member_id
+                     HAVING SUM(counted_visit) > 0",[$ST,$o['serial_id']]) as $r)
+            $bad[] = "⑨a白送: 单{$o['serial_id']} 整单被 {$o['redeemed']} 张券盖满(净份数0)，"
+                   . "会员{$r['member_id']} 仍留着 {$r['v']} 次";
+    }
+
+    /**
+     * ⑨b 【白送的完整版】按份计次时，一单的净计次总和不得超过净份数。
+     *
+     * ⑨a 只查「整单全免」这一个极端（净份数 = 0）。可白送是有中间态的：
+     *   3 份的单记了 3 次，客人用掉 1 张券 → 净份数 2，
+     *   而三次里只该留两次 —— 少退的那一次照样是往下一顿白送，
+     *   ⑨a 却一声不响，因为净份数不是 0。
+     *
+     * by_portion 口径下「一份 = 一次」是定义本身，所以
+     * SUM(净计次) ≤ 净份数 是这个口径下的硬约束，可以直接当判据。
+     *
+     * ★ 只在 by_portion 下成立。另外两种口径是「一个人一单最多 1 次」，
+     *   与份数没有关系 —— 1 份的单两个人分着记，两次一份，
+     *   在那两种口径下是【对的】，拿这条去查会误伤。
+     */
+    $vmode = (string)($q("SELECT config_value v FROM sys_config
+                           WHERE store_code=? AND config_key='visit_count_mode'",[$ST])[0]['v'] ?? 'once_per_period');
+    if ($vmode === 'by_portion') {
+        foreach ($q("SELECT o.serial_id, o.portions_counted,
+                       (SELECT COALESCE(SUM(l.counted_visit),0) FROM point_ledger l
+                         WHERE l.store_code=o.store_code AND l.serial_id=o.serial_id) nv
+                       FROM pos_order o WHERE o.store_code=?",[$ST]) as $o) {
+            if ((int)$o['nv'] > (int)$o['portions_counted']) {
+                $bad[] = "⑨b白送: 单{$o['serial_id']} 净份数{$o['portions_counted']}，"
+                       . "却记着 {$o['nv']} 次（按份计次下一份就是一次）";
+            }
+        }
+    }
+
     // ⑩ 被标记已冲正的流水必须指向一条冲正流水
     foreach ($q("SELECT id,status,reversed_by_id FROM point_ledger
                   WHERE store_code=? AND status=2 AND reversed_by_id IS NULL",[$ST]) as $r)

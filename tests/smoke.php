@@ -5140,7 +5140,11 @@ $czDb  = $czApp->localDb();
 $czOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
 $czCfg0 = [];
 foreach (['reward_enabled' => '1', 'reward_mode' => 'visits',
-          'reward_threshold_visits' => '1', 'reward_auto_grant' => '1'] as $k => $v) {
+          'reward_threshold_visits' => '1', 'reward_auto_grant' => '1',
+          // ★ 这一档测的是【回收】，不是发放上限。60 张这个局面本来
+          //   就要靠「门槛被改小」才造得出来，而那正是 reward_max_auto_grant
+          //   拦住的东西（见下一档 ⓐ）。这里把上限放开，让局面能摆出来。
+          'reward_max_auto_grant' => '100'] as $k => $v) {
     $czCfg0[$k] = $czApp->cfg()->get($k, '');
     $czApp->cfg()->set($k, $v);
 }
@@ -5305,6 +5309,335 @@ $sgIds = implode(',', [$sgA, $sgB]);
 $sgDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$sgIds})", [SMOKE_STORE]);
 $sgDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$sgIds})", [SMOKE_STORE]);
 $sgDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id='6100000001'", [SMOKE_STORE]);
+
+step('52 免费的那一餐，谁记的账都不该留下计次');
+
+/**
+ * ── 🔴 白送有两个形状，之前只堵住了一个 ────────────────────
+ *
+ * 审计 F4 补的是「先记账、后核销」：券核销时把那一餐已经记进去的
+ * 次数退回来。但那一版只看【券持有人自己】的流水，于是漏掉两条路：
+ *
+ *   ① 记账人 ≠ 用券人。一家人：爸爸把整单记到自己卡上，
+ *      妈妈拿自己的券免掉一份 —— 去妈妈名下找，她在这一单上没有流水，
+ *      于是一次都没退，爸爸名下那一次原样留着。
+ *      店里既免了一份饭，又给了那份饭一次「十送一」的进度：白送两头。
+ *      （非按份口径下这一条原来是「判不出该退谁 → 挂个告警了事」，
+ *        听着谨慎，实际就是不退。净份数归零时根本没有需要挑的余地 ——
+ *        要退的是所有人的全部。）
+ *
+ *   ② 净额算错。撤销的写法是「原流水标 status=2，另插一条负数流水」，
+ *      而判据当初是拿 activeBySerial()（只筛 status=1）加出来的 ——
+ *      负数留着、被它抵掉的正数丢了，净额凭空少一份。
+ *      +2（已冲正）−2（冲正行）+2（重记）→ 算成 0，其实是 2。
+ *      于是「净计次 0 ≤ 净份数 1」判成不用退，又一顿白送。
+ *      这就是 docs/13 §3.0：「当初记了多少」和「现在还剩多少」是两个数。
+ *
+ * ★ 两条都是随机化模型测试（tests/fuzz.php 的不变量 ⑨a/⑨b）抓到的，
+ *   而且是把计次口径三种都跑一遍之后才浮出来的 —— 只跑默认那一种，
+ *   clawBackVisitOnRedeem 的另外两条分支一步都没走过。
+ */
+$fmApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$fmDb  = $fmApp->localDb();
+$fmOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$fmCfg0 = [];
+$fmSet = static function (array $kv) use ($fmApp, &$fmCfg0): void {
+    foreach ($kv as $k => $v) {
+        if (!array_key_exists($k, $fmCfg0)) { $fmCfg0[$k] = $fmApp->cfg()->get($k, ''); }
+        $fmApp->cfg()->set($k, $v);
+    }
+};
+$fmSet(['visit_count_mode' => 'by_portion', 'points_mode' => 'by_amount',
+        'points_per_euro' => '1.0', 'min_amount_per_visit' => '0',
+        'late_grant_minutes' => '0', 'reward_enabled' => '1', 'reward_mode' => 'visits',
+        'reward_threshold_visits' => '3', 'reward_auto_grant' => '1',
+        'reward_max_auto_grant' => '100']);
+
+$fmPos = new FakePosSource();
+$fmPos->now = date('Y-m-d H:i:s');
+$fmPos->addHead(['serial_id' => '6200000001', 'order_head_id' => 620001, 'check_id' => 1,
+    'table_name' => 'FM', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($fmPos->now) - 600)]);
+$fmPos->addDetail(620001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$fmApp->setPosSource($fmPos);
+$fmApp->points()->locate('FM', 3600);
+
+$fmDad = (int)$fmApp->members()->create('TK-00062001-FMD', null, null, null)['id'];
+$fmMom = (int)$fmApp->members()->create('TK-00062002-FMM', null, null, null)['id'];
+// 妈妈自己攒够了，手上有一张券；这一桌的账全记在爸爸卡上
+$fmDb->exec('UPDATE member SET visit_count=3, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $fmMom]);
+$fmApp->rewards()->checkAndGrant($fmMom, $fmOp);
+$fmCoupon = (int)$fmDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                                ORDER BY id LIMIT 1', [SMOKE_STORE, $fmMom]);
+$fmApp->points()->grant('6200000001',
+    [['member_id' => $fmDad, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_WHOLE, $fmOp);
+
+$fmVis = static fn(int $mid): int => (int)$fmDb->value(
+    'SELECT COALESCE(SUM(counted_visit),0) FROM point_ledger
+      WHERE store_code=? AND serial_id=? AND member_id=?',
+    [SMOKE_STORE, '6200000001', $mid]);
+
+eq(2, $fmVis($fmDad), '52 爸爸整单记账（2 份 = 2 次）');
+$fmApp->rewards()->redeem($fmCoupon, '6200000001', $fmOp, null, ['reason' => '冒烟']);
+$fmLeft = (int)$fmDb->value('SELECT portions_counted FROM pos_order WHERE store_code=? AND serial_id=?',
+                            [SMOKE_STORE, '6200000001']);
+eq(1, $fmLeft, '  └ 用券之后这一单的实付份数降到 1');
+eq(1, $fmVis($fmDad),
+   '★★★ 妈妈用券免掉的那一份，爸爸名下【不再留着那一次】—— '
+ . '原来只往券持有人名下找，妈妈在这一单上没有流水，于是一次都不退：'
+ . '店里免了一份饭，又替这份免费的饭攒了一次「十送一」的进度');
+
+// ② 撤销之后重记 —— 净额必须按【全部流水】算，只筛活动行会少算一份
+$fmPos2 = new FakePosSource();
+$fmPos2->now = date('Y-m-d H:i:s');
+$fmPos2->addHead(['serial_id' => '6200000002', 'order_head_id' => 620002, 'check_id' => 1,
+    'table_name' => 'FN', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '47.80', 'should_amount' => '47.80', 'actual_amount' => '47.80',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($fmPos2->now) - 600)]);
+$fmPos2->addDetail(620002, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '47.80', 2)]);
+$fmApp->setPosSource($fmPos2);
+$fmApp->points()->locate('FN', 3600);
+
+$fmA = (int)$fmApp->members()->create('TK-00062003-FMA', null, null, null)['id'];
+$fmB = (int)$fmApp->members()->create('TK-00062004-FMB', null, null, null)['id'];
+$fmDb->exec('UPDATE member SET visit_count=3, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $fmB]);
+$fmApp->rewards()->checkAndGrant($fmB, $fmOp);
+$fmC2 = (int)$fmDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                            ORDER BY id LIMIT 1', [SMOKE_STORE, $fmB]);
+
+$fmG1 = $fmApp->points()->grant('6200000002',
+    [['member_id' => $fmA, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_WHOLE, $fmOp);
+// 记错了 → 撤销 → 重记同样的 2 份（现实里就是「点错人了，撤掉重来」）
+$fmApp->points()->reverse((int)$fmG1['entries'][0]['ledger_id'], '记错人了', $fmOp);
+$fmApp->points()->grant('6200000002',
+    [['member_id' => $fmA, 'amount_cents' => 4780, 'portions' => 2]],
+    Vip\PointsEngine::MODE_WHOLE, $fmOp);
+$fmVis2 = static fn(int $mid): int => (int)$fmDb->value(
+    'SELECT COALESCE(SUM(counted_visit),0) FROM point_ledger
+      WHERE store_code=? AND serial_id=? AND member_id=?',
+    [SMOKE_STORE, '6200000002', $mid]);
+eq(2, $fmVis2($fmA), '52 撤销后重记，客人手上仍是 2 次（+2 −2 +2）');
+$fmApp->rewards()->redeem($fmC2, '6200000002', $fmOp, null, ['reason' => '冒烟']);
+eq(1, $fmVis2($fmA),
+   '★★★ 撤销过的单再用券，退次数照样退得动 —— '
+ . '原来净额只筛 status=1 的行，负数留着、被它抵掉的正数丢了，'
+ . '算出来是 0 次，于是判成「不用退」，又一顿白送');
+
+/**
+ * ③ 非「按份」口径下的整单全免。
+ *
+ *   这一条走的是另一个分支：by_order / once_per_period 下「一个人一单
+ *   最多 1 次」，与份数无关，所以不能照搬 by_portion 的算法。
+ *   原来这里写的是「券持有人不在这一单的记账人里 → 判不出该退谁，
+ *   挂个告警了事」—— 听着谨慎，实际是【一次都不退】。
+ *   净份数归零时根本没有需要挑的余地：要退的是所有人的全部。
+ *   （随机化模型测试 by_order seed 6 第 99 步抓到。）
+ */
+$fmSet(['visit_count_mode' => 'once_per_period']);
+$fmPos3 = new FakePosSource();
+$fmPos3->now = date('Y-m-d H:i:s');
+$fmPos3->addHead(['serial_id' => '6200000003', 'order_head_id' => 620003, 'check_id' => 1,
+    'table_name' => 'FO', 'eat_type' => 0, 'customer_num' => 1,
+    'original_amount' => '23.90', 'should_amount' => '23.90', 'actual_amount' => '23.90',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($fmPos3->now) - 600)]);
+$fmPos3->addDetail(620003, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '23.90', 1)]);
+$fmApp->setPosSource($fmPos3);
+$fmApp->points()->locate('FO', 3600);
+
+$fmX = (int)$fmApp->members()->create('TK-00062005-FMX', null, null, null)['id'];
+$fmY = (int)$fmApp->members()->create('TK-00062006-FMY', null, null, null)['id'];
+$fmDb->exec('UPDATE member SET visit_count=3, rewards_issued=0 WHERE store_code=? AND id=?',
+            [SMOKE_STORE, $fmY]);
+$fmApp->rewards()->checkAndGrant($fmY, $fmOp);
+$fmC3 = (int)$fmDb->value('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                            ORDER BY id LIMIT 1', [SMOKE_STORE, $fmY]);
+$fmApp->points()->grant('6200000003',
+    [['member_id' => $fmX, 'amount_cents' => 2390, 'portions' => 1]],
+    Vip\PointsEngine::MODE_WHOLE, $fmOp);
+$fmVis3 = static fn(int $mid): int => (int)$fmDb->value(
+    'SELECT COALESCE(SUM(counted_visit),0) FROM point_ledger
+      WHERE store_code=? AND serial_id=? AND member_id=?',
+    [SMOKE_STORE, '6200000003', $mid]);
+eq(1, $fmVis3($fmX), '52 按「一单一次」口径：甲记了这一单，计次 1');
+$fmApp->rewards()->redeem($fmC3, '6200000003', $fmOp, null, ['reason' => '冒烟']);
+eq(0, (int)$fmDb->value('SELECT portions_counted FROM pos_order WHERE store_code=? AND serial_id=?',
+                        [SMOKE_STORE, '6200000003']),
+   '  └ 乙用券把这一单整个免掉，实付份数归零');
+eq(0, $fmVis3($fmX),
+   '★★★ 整单全免时甲那一次也要收回 —— 原来非「按份」口径下只挂一条'
+ . '「判不出该退谁」的告警就完事，等于一次都不退：这顿饭没人花钱，'
+ . '却给甲攒了一次「十送一」的进度');
+
+foreach ($fmCfg0 as $k => $v) { $fmApp->cfg()->set($k, $v); }
+$fmIds = implode(',', [$fmDad, $fmMom, $fmA, $fmB, $fmX, $fmY]);
+$fmDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$fmIds})", [SMOKE_STORE]);
+$fmDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$fmIds})", [SMOKE_STORE]);
+$fmDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$fmIds})", [SMOKE_STORE]);
+$fmDb->exec("DELETE FROM pos_order    WHERE store_code=? AND
+                serial_id IN ('6200000001','6200000002','6200000003')", [SMOKE_STORE]);
+
+step('53 一个打字错误不该变成几百顿免费餐');
+
+/**
+ * ── 🔴 发券数量没有上限 ────────────────────────────────────
+ *
+ * pending = ⌊进度 ÷ 门槛⌋ − 已发。门槛是后台可改的一个数，
+ * 于是【改错一个数就是几百顿饭】：老板想填「满 100 欧送一次」，
+ * 漏了两个零填成 1.00 —— 一位累计消费 800 欧的普通熟客，
+ * 下一次记账时一口气拿到 800 张免费餐券，0.24 秒，账面上一声不响。
+ * 门槛的合法下限是 0.01 欧，最坏是 80000 张。
+ *
+ * 系统对「员工那一侧」早就把最坏情况框住了（手工录入有单笔限额、
+ * 绝对上限、日累计上限），而「配置那一侧」通向同一样东西，
+ * 一道闸门都没有。
+ *
+ * ★ 一张都不发，而不是「先发 N 张」：pending 超过上限就不是
+ *   「客人跨过了门槛」，而是【门槛本身被改了】。先发一部分
+ *   只是把 800 张摊到 80 次记账里，照样发得出去。
+ * ★ 不发 ≠ 丢掉：rewards_issued 不动，进度还在，「待发」页照样看得到。
+ */
+$bcApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$bcDb  = $bcApp->localDb();
+$bcOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$bcCfg0 = [];
+foreach (['reward_enabled' => '1', 'reward_mode' => 'amount',
+          'reward_threshold_amount' => '100.00', 'reward_auto_grant' => '1',
+          'reward_max_auto_grant' => '10'] as $k => $v) {
+    $bcCfg0[$k] = $bcApp->cfg()->get($k, '');
+    $bcApp->cfg()->set($k, $v);
+}
+$bc1 = (int)$bcApp->members()->create('TK-00063001-BCA', null, null, null)['id'];
+$bcDb->exec("UPDATE member SET total_spent='800.00', rewards_issued=0 WHERE store_code=? AND id=?",
+            [SMOKE_STORE, $bc1]);
+$bcCnt = static fn(): int => (int)$bcDb->value(
+    'SELECT COUNT(*) FROM coupon WHERE store_code=? AND member_id=?', [SMOKE_STORE, $bc1]);
+
+$bcApp->rewards()->checkAndGrant($bc1, $bcOp);
+eq(8, $bcCnt(), '53 门槛 100.00、消费 800 → 正常发出 8 张');
+
+// 老板把 100.00 打成了 1.00
+$bcDb->exec('DELETE FROM coupon WHERE store_code=? AND member_id=?', [SMOKE_STORE, $bc1]);
+$bcDb->exec('UPDATE member SET rewards_issued=0 WHERE store_code=? AND id=?', [SMOKE_STORE, $bc1]);
+$bcApp->cfg()->set('reward_threshold_amount', '1.00');
+$bcR = $bcApp->rewards()->checkAndGrant($bc1, $bcOp);
+eq(0, $bcCnt(),
+   '★★★ 门槛被打成 1.00 → 一张都不自动发（原来一口气发出 800 张免费餐券）');
+eq(800, (int)($bcR['pending'] ?? 0), '  └ 进度没丢，仍算得出欠 800 张');
+eq(0, (int)$bcDb->value('SELECT rewards_issued FROM member WHERE store_code=? AND id=?',
+                        [SMOKE_STORE, $bc1]),
+   '  └ rewards_issued 没动 —— 人工核对完照样补得出来');
+ok((int)$bcDb->value("SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type='reward_burst_blocked'
+                       AND ref_id=?", [SMOKE_STORE, (string)$bc1]) > 0,
+   '★★ 而且【不是静默的】：挂了一条严重告警说明门槛可能被改错了');
+
+// 人工放行也要按批来：一次点击一批，不是一次吐出 800 张
+$bcP1 = $bcApp->rewards()->issuePending($bc1, $bcOp);
+eq(10, (int)($bcP1['granted'] ?? 0), '53 「待发」页人工放行：一次发一批（10 张）');
+eq(790, (int)($bcP1['remaining'] ?? -1), '  └ 并且回报还剩 790 张 —— 点的人看得见自己放行了多少顿饭');
+
+foreach ($bcCfg0 as $k => $v) { $bcApp->cfg()->set($k, $v); }
+$bcDb->exec('DELETE FROM alert        WHERE store_code=? AND ref_id=?', [SMOKE_STORE, (string)$bc1]);
+$bcDb->exec('DELETE FROM coupon       WHERE store_code=? AND member_id=?', [SMOKE_STORE, $bc1]);
+$bcDb->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $bc1]);
+$bcDb->exec('DELETE FROM member       WHERE store_code=? AND id=?', [SMOKE_STORE, $bc1]);
+
+step('54 券码撞车 / 菜单扫描不能一直转（两处「会卡住」的地方）');
+
+/**
+ * ── 🔴 ① 券码撞了就整笔挂掉 ────────────────────────────────
+ *
+ * 券码是 8 位十六进制，码空间 42.9 亿，coupon 上有唯一键 uk_code。
+ * 看着很宽，但撞码走的是【生日问题】：累计 36500 张（每天 20 张、
+ * 五年）撞一次的概率已经 14.4%，10 万张时 68.8%。实测抽样，
+ * 第一次撞码的中位数落在第 7 万张。券只增不减，这个数只会涨。
+ *
+ * 撞上以后原来直接抛 PDOException 1062 冒到最外层，classify()
+ * 归进 default → E109「本地数据库暂时不可用，请联系管理员」——
+ * 库好得很，人又一次被指到完全没问题的地方（和 1213/1205 当初
+ * 那个坑一模一样）。而正确做法只是【换一个码再来】。
+ *
+ * 这里验的是那个前提：唯一键冲突只回滚【这一条语句】，
+ * 不会废掉整个事务 —— 所以在事务里原地重试是安全的。
+ * 真正的重试次数由 RewardService::CODE_TRIES 兜底。
+ */
+$ccDb = $db;
+$ccMid = (int)(new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]))
+    ->members()->create('TK-00064001-CCA', null, null, null)['id'];
+$ccIns = static function (string $code) use ($ccDb, $ccMid): void {
+    $ccDb->exec('INSERT INTO coupon (store_code, member_id, coupon_type, source, amount_cents,
+                    progress_at_grant, note, code, status, valid_from, created_at)
+                 VALUES (?,?,1,1,0,0,NULL,?,1,CURDATE(),NOW())', [SMOKE_STORE, $ccMid, $code]);
+};
+$ccDup = 0;
+$ccDb->transaction(static function () use ($ccIns, &$ccDup): void {
+    $ccIns('SMOKEDU1');
+    try { $ccIns('SMOKEDU1'); } catch (\PDOException $e) { $ccDup = (int)($e->errorInfo[1] ?? 0); }
+    $ccIns('SMOKEDU2');          // ← 撞过之后还能接着写，事务才算没被废掉
+});
+eq(1062, $ccDup, '54 券码撞车确实是 1062（唯一键冲突）');
+eq(2, (int)$ccDb->value("SELECT COUNT(*) FROM coupon WHERE store_code=? AND code LIKE 'SMOKEDU%'",
+                        [SMOKE_STORE]),
+   '★★ 撞车只回滚那一条语句，事务照常提交 —— 所以 issue() 里「换个码重试」是安全的');
+$ccDb->exec("DELETE FROM coupon WHERE store_code=? AND code LIKE 'SMOKEDU%'", [SMOKE_STORE]);
+$ccDb->exec('DELETE FROM member WHERE store_code=? AND id=?', [SMOKE_STORE, $ccMid]);
+
+/**
+ * ── 🔴 ② 菜单巡检的 while(true) 没有批次上限 ──────────────────
+ *
+ * auditMenuRules 原来只靠「POS 返回空页」退出 —— 把「循环会不会停」
+ * 完全交给了 POS 的分页行为。真实世界里视图/存储过程忽略分页并不罕见：
+ * 一旦 fetchMenuItems 无视 offset 永远返回满页，这里就永远转下去，
+ * 每页还 usleep 0.2 秒 —— 夜间 cron 永久挂起、一直占着 POS 连接，
+ * 而 POS 主机性能极度受限。
+ *
+ * ★ 同样是扫 POS 的循环，SyncService 与 ReconcileService 都有
+ *   sync_max_batches 兜底，唯独这一处没有 ——「修了那一处没修那一类」。
+ */
+$msApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$msApp->cfg()->set('sync_max_batches', '5');       // 把上限调小，测试才跑得快
+// FakePosSource 是 final，套一层而不是继承
+$msPos = new class (new FakePosSource()) implements Vip\PosSource {
+    public function __construct(private FakePosSource $inner) {}
+    /** ★ 无视 offset 的 POS：永远返回满页，正是「分页坏了」的样子 */
+    public function fetchMenuItems(int $limit = 100, int $offset = 0): array
+    {
+        $out = [];
+        for ($i = 0; $i < $limit; $i++) {
+            $out[] = ['item_id' => 900000 + $i, 'item_name1' => 'LOOP', 'price_1' => '99.00',
+                      'major_group' => 1, 'family_group' => 7];
+        }
+        return $out;
+    }
+    public function now(): string { return $this->inner->now(); }
+    public function findRecentByTable(string $t, int $w, int $l = 20): array { return $this->inner->findRecentByTable($t, $w, $l); }
+    public function findByInvoice(int $h, int $l = 20): array { return $this->inner->findByInvoice($h, $l); }
+    public function fetchSince(string $w, string $u, int $l = 100, int $o = 0): array { return $this->inner->fetchSince($w, $u, $l, $o); }
+    public function reloadAmounts(int $h, int $c): ?array { return $this->inner->reloadAmounts($h, $c); }
+    public function fetchDetail(int $h, int $c, int $l = 100): array { return $this->inner->fetchDetail($h, $c, $l); }
+    public function fetchDetailForChecks(int $h, array $c): array { return $this->inner->fetchDetailForChecks($h, $c); }
+    public function fetchMajorGroups(): array { return $this->inner->fetchMajorGroups(); }
+    public function fetchFamilyGroups(): array { return $this->inner->fetchFamilyGroups(); }
+    public function countInRange(string $f, string $t): int { return $this->inner->countInRange($f, $t); }
+};
+$msApp->setPosSource($msPos);
+$msT0 = microtime(true);
+$msR  = $msApp->maintenance()->auditMenuRules();
+$msEl = microtime(true) - $msT0;
+ok(($msR['ok'] ?? false) === true && $msEl < 30,
+   sprintf('★★★ POS 分页坏掉（永远返回满页）时菜单巡检会自己停下（%.1f 秒、扫了 %d 项）—— '
+         . '原来这里永远转下去，夜间 cron 挂死并一直占着 POS 连接',
+           $msEl, (int)($msR['scanned'] ?? 0)));
+ok((int)$db->value("SELECT COUNT(*) FROM alert WHERE store_code=? AND alert_type='menu_scan_unbounded'",
+                   [SMOKE_STORE]) > 0,
+   '  └ 而且触顶要告警：菜单只有数千行，触顶必然是 POS 分页出了问题');
+$db->exec("DELETE FROM alert WHERE store_code=? AND alert_type IN ('menu_scan_unbounded','new_menu_item')",
+          [SMOKE_STORE]);
+$msApp->cfg()->set('sync_max_batches', '200');
 
 step('⑬ 不变量总校验');
 

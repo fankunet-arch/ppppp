@@ -61,12 +61,42 @@ final class MaintenanceService
         $noted  = [];   // 非套餐组的高价新品，只记录不告警
         $scanned = 0;
 
+        /**
+         * ── 🔴 必须有批次上限 ────────────────────────────────
+         *
+         * 这个 while(true) 原来只靠「POS 返回空页」退出 —— 而那是把
+         * 「循环会不会停」这件事完全交给了 POS 的分页行为。
+         * 实测：让 fetchMenuItems 无视 offset、永远返回满页（真实世界里
+         * 视图/存储过程忽略分页并不罕见），这里就【永远转下去】，
+         * 每页还 usleep 0.2 秒 —— 夜间 cron 永久挂起、一直占着 POS 连接，
+         * 而 POS 主机性能极度受限。
+         *
+         * ★ 同样是扫 POS 的循环，SyncService 与 ReconcileService 都有
+         *   sync_max_batches 兜底，唯独这一处没有 —— 典型的
+         *   「修了那一处没修那一类」（docs/13 §3.1）。这里补上同一道闸门。
+         *
+         * ★ 触顶就告警：菜单只有数千行，正常绝不该触顶；一旦触顶
+         *   要么菜单异常庞大、要么 POS 分页坏了，两种都得有人知道。
+         */
+        $maxPages = max(1, $this->cfg->int('sync_max_batches', 200));
+        $pages    = 0;
+
         while (true) {
+            if ($pages >= $maxPages) {
+                $this->alerts->raiseOnce('menu_scan_unbounded', 'cursor', 'menu_scan',
+                    sprintf('菜单扫描连续取了 %d 页仍未取完（已扫 %d 项）。'
+                          . '正常菜单只有数千行，多半是 POS 分页没生效 —— '
+                          . '已中止本次扫描，避免夜间任务一直挂着占用 POS 连接',
+                        $pages, $scanned),
+                    ['severity' => 2]);
+                break;
+            }
             try {
                 $page = $this->pos->fetchMenuItems(100, $offset);
             } catch (PosUnavailable $e) {
                 return ['ok' => false, 'reason' => 'pos_unavailable', 'new_items' => []];
             }
+            $pages++;
             if (!$page) {
                 break;
             }

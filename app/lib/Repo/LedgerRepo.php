@@ -201,6 +201,43 @@ final class LedgerRepo
     }
 
     /** 某订单下的有效流水（用于展示「已记给谁」与撤销入口） */
+    /**
+     * 这一单上每位会员【现在还剩多少】—— 计次与份数的净额。
+     *
+     * ── 🔴 为什么不能用 activeBySerial() 去加 ──────────────────
+     *
+     * 撤销是「原流水标 status=2，另插一条负数流水（status=1）」。
+     * 于是按 status=1 筛出来的行里，【负数留着、被它抵掉的正数没了】——
+     * 净额会凭空少一份。实测（fuzz by_portion seed 30）：
+     *   +2（已冲正）  −2（冲正行）  +2（重记）
+     *   按活动行加 = 0，而这位客人手上实实在在是 2 次。
+     * 少算的后果是「该退的没退」—— 券抵掉的那一份还给客人留着计次，
+     * 也就是往下一顿白送。
+     *
+     * 追加式账本里「现在还剩多少」永远是【全部流水求和】，不筛状态 ——
+     * member.visit_count / points_balance 就是这么维护的
+     * （见不变量①：余额 == 全部流水合计，同样不带状态条件）。
+     *
+     * @return array<int,array{visits:int,portions:int}> 按 member_id
+     */
+    public function netBySerial(string $serialId): array
+    {
+        $out = [];
+        foreach ($this->db->all(
+            'SELECT member_id,
+                    COALESCE(SUM(counted_visit), 0)    AS visits,
+                    COALESCE(SUM(portions_counted), 0) AS portions
+               FROM point_ledger
+              WHERE store_code = ? AND serial_id = ?
+              GROUP BY member_id',
+            [$this->storeCode, $serialId]
+        ) as $r) {
+            $out[(int)$r['member_id']] = ['visits'   => (int)$r['visits'],
+                                          'portions' => (int)$r['portions']];
+        }
+        return $out;
+    }
+
     public function activeBySerial(string $serialId): array
     {
         return $this->db->all(

@@ -280,6 +280,51 @@ final class RewardService
                 return ['granted' => 0, 'pending' => $p['pending'], 'coupons' => []];
             }
 
+            /**
+             * ── 🔴 一次能自动发多少张，必须有上限 ──────────────────
+             *
+             * pending = ⌊进度 ÷ 门槛⌋ − 已发。门槛是后台可改的一个数，
+             * 于是【一个打字错误就是几百顿免费餐】：
+             *
+             *   实测：reward_mode = amount、老板想填「满 100 欧送一次」
+             *   却漏了两个零填成 1.00 —— 一位累计消费 800 欧的普通熟客，
+             *   下一次记账时这个 for 循环一口气发出【800 张免费餐券】，
+             *   0.24 秒，账面上一声不响。
+             *   （门槛的合法下限是 0.01 欧，最坏情况是 80000 张。）
+             *
+             * 这套系统对「员工那一侧」已经把最坏情况框住了 ——
+             * 手工录入有单笔限额、有绝对上限、有日累计上限
+             * （PointsService::manualGrant）。而「配置那一侧」通向的是
+             * 同一样东西（免费餐），却一道闸门都没有。
+             *
+             * ★ 为什么是【一张都不发】而不是「先发 N 张」：
+             *   pending 大到超过上限，就不是「客人跨过了门槛」，
+             *   而是【门槛本身被改了】—— 正常客人的 pending 永远是 1。
+             *   先发一部分只是把 800 张摊到 80 次记账里，照样发得出去。
+             *
+             * ★ 不发 ≠ 丢掉。pending 是【算出来的】，不是队列：
+             *   rewards_issued 不动，进度就还在，后台「待发」页照样看得到，
+             *   人工确认配置没问题之后点一下就能补发（issuePending）。
+             *   这正是 auto_grant 关掉时那条路，天然就是为这种时候准备的。
+             */
+            $cap = max(1, $this->cfg->int('reward_max_auto_grant', 10));
+            if ($p['pending'] > $cap) {
+                $this->alerts->raise(
+                    'reward_burst_blocked',
+                    sprintf('会员 #%d 一次算出 %d 张免费餐券（上限 %d），已【全部暂缓发放】。'
+                          . '正常客人一次只会达标 1 张 —— 这个数说明门槛刚被改过，'
+                          . '或者进度是手工录入堆出来的。当前口径：%s，门槛 %s，进度 %s。'
+                          . '请先核对「奖励规则」页的门槛；确认无误后到「待发」页人工发放',
+                        $memberId, $p['pending'], $cap,
+                        $p['mode'] === 'amount' ? '按金额' : '按次数',
+                        $p['mode'] === 'amount' ? '€ ' . Money::toStr($p['threshold']) : $p['threshold'] . ' 次',
+                        $p['mode'] === 'amount' ? '€ ' . Money::toStr($p['progress']) : $p['progress'] . ' 次'),
+                    ['severity' => 3, 'ref_type' => 'member', 'ref_id' => (string)$memberId]
+                );
+                return ['granted' => 0, 'pending' => $p['pending'], 'coupons' => [],
+                        'blocked' => true];
+            }
+
             $out = [];
             for ($i = 0; $i < $p['pending']; $i++) {
                 $out[] = $this->issue(
@@ -402,24 +447,72 @@ final class RewardService
             ->format('Y-m-d');
     }
 
+    /** 券码撞了最多换几次（见 issue() 里的生日问题说明） */
+    private const CODE_TRIES = 8;
+
     private function issue(int $memberId, int $source, int $progress,
                            int $validDays, ?string $note, array $operator,
                            ?string $tierCode = null, ?int $threshold = null): array
     {
         $now  = $this->db->now();
-        $code = strtoupper(bin2hex(random_bytes(4)));   // 8 位，够短能口头核对
         $to   = self::expiryDate($now, $validDays);
 
-        $this->db->exec(
-            'INSERT INTO coupon
-               (store_code, member_id, coupon_type, source, amount_cents, progress_at_grant,
-                tier_code, threshold_used,
-                note, code, status, valid_from, valid_to, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            [$this->storeCode, $memberId, 1, $source, 0, $progress,
-             $tierCode, $threshold,
-             $note, $code, self::ST_ACTIVE, date('Y-m-d', strtotime($now)), $to, $now]
-        );
+        /**
+         * ── 🔴 券码会撞，撞了必须换一个再来 ────────────────────
+         *
+         * 券码是 8 位十六进制（random_bytes(4)），码空间 42.9 亿，
+         * 而 coupon 表上有唯一键 uk_code(store_code, code)。看着很宽，
+         * 但撞码走的是【生日问题】，不是「发满 42.9 亿张才撞」：
+         *
+         *   累计   20000 张 → 至少撞一次的概率  4.5%
+         *   累计   36500 张 → 14.4%   （每天 20 张，五年）
+         *   累计  100000 张 →  68.8%
+         *   实测抽样：第一次撞码的中位数落在【第 7 万张】左右。
+         *
+         * 券只增不减（过期、核销的行都留着占码），所以这个数只会涨。
+         *
+         * 撞上以后原来是直接抛 PDOException 1062 冒到最外层，
+         * classify() 把它归进 default → E109「本地数据库暂时不可用，
+         * 请联系管理员」—— 库好得很，人又一次被指到完全没问题的地方
+         * （和 1213/1205 当初那个坑一模一样，见 Api::classify）。
+         *
+         * ★ 换一个码重试就完事了：InnoDB 的唯一键冲突只回滚【这一条语句】，
+         *   不会废掉整个事务，所以在事务里原地重试是安全的。
+         * ★ 不加长码：8 位是为了「客人报码、店员口头核对」定的，
+         *   加长解决的是同一个概率问题，代价却落在每天的使用上。
+         * ★ 连着几次都撞，说明码空间真的填满了（不是运气），
+         *   那需要有人知道 —— 告警一次，别闷声重试到天亮。
+         */
+        $code = '';
+        for ($try = 1; ; $try++) {
+            $code = strtoupper(bin2hex(random_bytes(4)));   // 8 位，够短能口头核对
+            try {
+                $this->db->exec(
+                    'INSERT INTO coupon
+                       (store_code, member_id, coupon_type, source, amount_cents, progress_at_grant,
+                        tier_code, threshold_used,
+                        note, code, status, valid_from, valid_to, created_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    [$this->storeCode, $memberId, 1, $source, 0, $progress,
+                     $tierCode, $threshold,
+                     $note, $code, self::ST_ACTIVE, date('Y-m-d', strtotime($now)), $to, $now]
+                );
+                break;
+            } catch (\PDOException $e) {
+                if ((int)($e->errorInfo[1] ?? 0) !== 1062 || $try >= self::CODE_TRIES) {
+                    throw $e;
+                }
+                if ($try === 2) {
+                    $this->alerts->raiseOnce('coupon_code_space', 'store', $this->storeCode,
+                        sprintf('券码连续 %d 次撞到已有的券（8 位十六进制）。'
+                              . '目前库里有 %d 张券 —— 码空间开始填满了，'
+                              . '再涨下去每发一张都要重试多次，该考虑加长券码位数了',
+                            $try, (int)$this->db->value(
+                                'SELECT COUNT(*) FROM coupon WHERE store_code = ?', [$this->storeCode])),
+                        ['severity' => 2]);
+                }
+            }
+        }
         $id = $this->db->lastInsertId();
 
         $this->audit->log('coupon_grant', [
@@ -653,53 +746,183 @@ final class RewardService
      */
     private function clawBackVisitOnRedeem(string $serialId, int $memberId, string $code): int
     {
-        $net = 0; $portions = 0; $anchor = null;
+        /**
+         * ── 🔴 免掉的份数属于【订单】，不属于某个人 ──────────────
+         *
+         * 这个方法第一版只看【券持有人】自己的流水。而现实里
+         * 记账人和用券的人经常不是同一个：
+         *
+         *   一家人：爸爸把整单（2 份）记到自己卡上，妈妈拿自己的券免掉一份。
+         *   → markRedeemedByApp 把净份数减到 1，
+         *     而 clawBackVisitOnRedeem 去找妈妈的流水 —— 她在这一单上没有，
+         *     于是【一次都没退】，爸爸名下仍记着 2 次。
+         *   店里既免了一份饭，又给了那份饭一次「十送一」的进度 —— 白送两头。
+         *
+         * F4 修的是「券持有人 = 记账人」那一条，这是同一形状的另一条
+         * （docs/13 §3.1）。现在按【订单】来算：
+         *
+         *   by_portion  ：计次与份数绑定 —— 这一单的净计次总和
+         *                 不得超过净份数，超出的部分退掉。
+         *   其它口径     ：一个人一单最多 1 次，与份数无关。
+         *                 只有当他自己那几份【全被券盖住】时才退他那一次
+         *                 （原有判据，混合桌里付了钱的人不连坐）。
+         *                 而券持有人根本不在这一单上时，谁的那一次该退
+         *                 是判不出来的 —— 不猜，挂告警让人看一眼。
+         *
+         * ★ 退的时候券持有人排最前：免费吃的是他。
+         * ★ 幂等：判据是「现存净次数」（含以前退过的负数行），
+         *   一单核销两张券不会把同一次退两遍。
+         */
+        $order = $this->orders->findBySerial($serialId);
+        if ($order === null) {
+            return 0;   // 核销时填了个本地没有的单号 —— 与计次无关
+        }
+
+        /**
+         * 锚点：新插的那条负数流水挂在谁身上。必须是一条【还活着】的
+         * 记账流水 —— 挂到已经被冲正的行上，等于把一次退给一笔不存在的账。
+         */
+        $anchor = [];
         foreach ($this->ledger->activeBySerial($serialId) as $e) {
-            if ((int)$e['member_id'] !== $memberId) {
-                continue;
-            }
-            // 净次数：原流水的正数 + 以前退过的负数
-            $net += (int)$e['counted_visit'];
             if ((int)$e['entry_type'] === \Vip\Repo\LedgerRepo::T_EARN) {
-                $portions += (int)$e['portions_counted'];
-                $anchor  ??= (int)$e['id'];
+                $anchor[(int)$e['member_id']] ??= (int)$e['id'];
             }
         }
-        if ($net <= 0 || $anchor === null) {
-            // 还没记账（正常顺序），或这一单的次数已经退干净了
-            return 0;
+        if (!$anchor) {
+            return 0;   // 还没记账（正常顺序：先核销后记账），什么都不用做
         }
 
-        // 这位客人在这一单上一共核销了几张券（含刚刚这一张 —— 同一笔事务里已写库）
-        $freed = (int)$this->db->value(
+        /**
+         * ── 🔴 净额要用【全部流水】求和，不能只看活动行 ──────────
+         *
+         * 这里第一版是拿上面那趟 activeBySerial() 顺手加出来的。
+         * 而撤销的写法是「原流水标 status=2，另插一条负数流水」——
+         * 只筛活动行，就变成【负数留着、被它抵掉的正数丢了】。
+         *
+         * 实测（fuzz by_portion seed 30 第 89 步）：
+         *   +2（已冲正） −2（冲正行） +2（重记）
+         *   活动行加出来 = 0，客人手上其实是 2 次。
+         *   于是「净计次 0 ≤ 净份数 1」判成「不用退」，
+         *   券抵掉的那一份仍旧给客人留着计次 —— 又是一顿白送。
+         *
+         * 这就是 docs/13 §3.0 那个老坑的第 N 次现身：
+         * 「当初记了多少」和「现在还剩多少」是两个数。
+         * 追加式账本里后者永远是【全部流水求和】（不变量①同此口径）。
+         */
+        $net = []; $portions = [];
+        foreach ($this->ledger->netBySerial($serialId) as $mid => $r) {
+            $net[$mid]      = $r['visits'];
+            $portions[$mid] = $r['portions'];
+        }
+
+        // 这一单上一共核销了几张券（不分持有人）—— 一张券 = 一份免费套餐
+        $freedAll = (int)$this->db->value(
             'SELECT COUNT(*) FROM coupon
-              WHERE store_code = ? AND member_id = ? AND redeemed_serial_id = ? AND status = ?',
-            [$this->storeCode, $memberId, $serialId, self::ST_REDEEMED]
+              WHERE store_code = ? AND redeemed_serial_id = ? AND status = ?',
+            [$this->storeCode, $serialId, self::ST_REDEEMED]
         );
-        if ($freed <= 0) {
+        if ($freedAll <= 0) {
             return 0;
         }
 
-        $take = $this->cfg->get('visit_count_mode', 'once_per_period') === 'by_portion'
-            ? min($freed, $net)
-            : ($portions <= $freed ? $net : 0);
-        if ($take <= 0) {
-            return 0;
+        $byPortion = $this->cfg->get('visit_count_mode', 'once_per_period') === 'by_portion';
+        $netLeft   = (int)$order['portions_counted'];   // markRedeemedByApp 已经减过了
+        $totalNet  = array_sum($net);
+
+        /** @var array<int,int> $want 每位会员要退几次 */
+        $want = [];
+
+        /**
+         * ── 实付份数归零：谁的计次都不留（两种口径共用）─────────
+         *
+         * netLeft 是【订单的净份数】，券抵掉的已经减过。它到 0，
+         * 意思是这顿饭没有一份是花钱吃的 —— 那这一单上任何人名下的
+         * 计次都不该留着，与谁是券持有人无关。
+         *
+         * ★ 这里原来是「券持有人不在这一单的记账人里 → 判不出该退谁，
+         *   挂个告警了事」。听着谨慎，实际是【一次都不退】：
+         *   实测（fuzz by_order seed 12 第 105 步）1 份的单由会员甲记账，
+         *   会员乙用自己的券把它免掉，甲名下那一次原样留着 —— 又一顿白送。
+         *
+         *   「判不出该退谁」这个顾虑在这里根本不成立：份数归零时
+         *   要退的是【所有人的全部】，没有需要挑的余地。真正判不出的
+         *   只有「还剩份数在付费」的那一档，那一档下面照旧只动券持有人。
+         *
+         * ★ 计次只从餐费项来（meal_item_rule.counts_visit）。净份数 0
+         *   的单本来就产不出计次，所以纯酒水单不会被这一条误伤 ——
+         *   它的 totalNet 本身就是 0。
+         */
+        if ($netLeft <= 0) {
+            foreach ($net as $mid => $v) {
+                if ($v > 0 && isset($anchor[$mid])) {
+                    $want[$mid] = $v;
+                }
+            }
+        } elseif ($byPortion) {
+            // 计次 = 份数：这一单的净计次总和不得超过净份数
+            $excess = $totalNet - $netLeft;
+            if ($excess > 0) {
+                // 券持有人排最前，其余按净次数从多到少。
+                // 只找【挂得上锚点的人】—— 没有活动记账流水的人退不了，
+                // 把额度分给他等于白白漏掉一次。
+                $order2 = array_values(array_filter(array_keys($net),
+                    static fn(int $mid): bool => isset($anchor[$mid])));
+                usort($order2, static function (int $x, int $y) use ($memberId, $net): int {
+                    if ($x === $memberId) { return -1; }
+                    if ($y === $memberId) { return 1; }
+                    return ($net[$y] ?? 0) <=> ($net[$x] ?? 0);
+                });
+                foreach ($order2 as $mid) {
+                    if ($excess <= 0) { break; }
+                    $take = min($excess, max(0, $net[$mid] ?? 0));
+                    if ($take > 0) { $want[$mid] = $take; $excess -= $take; }
+                }
+            }
+        } else {
+            /**
+             * 还有份数在付费：一个人一单最多 1 次，只动券持有人 ——
+             * 只有他自己记的那几份【全被券盖住】时才退。
+             * 混合桌里真掏了钱的人不连坐（docs/03 §5.5「静默少给」）。
+             */
+            $mine = (int)($portions[$memberId] ?? 0);
+            if (isset($anchor[$memberId]) && ($net[$memberId] ?? 0) > 0
+                && $mine <= $freedAll) {
+                $want[$memberId] = (int)$net[$memberId];
+            }
         }
 
-        $this->members->lockById($memberId);
-        $this->ledger->insert([
-            'member_id'     => $memberId,
-            'serial_id'     => $serialId,
-            'entry_type'    => \Vip\Repo\LedgerRepo::T_REVERSE,
-            'amount_cents'  => 0,
-            'points'        => 0,
-            'counted_visit' => -$take,
-            'reverses_id'   => $anchor,
-            'reason'        => sprintf('券 %s 核销在本单上，免费那一餐不计次', $code),
-        ]);
-        $this->members->applyDelta($memberId, 0, -$take, 0);
-        return $take;
+        /**
+         * 该退而退不掉的：次数长在没有活动记账流水的人身上，
+         * 冲正流水没地方挂。不猜，报出来让人看一眼。
+         */
+        $short = $totalNet - max(0, $netLeft) - array_sum($want);
+        if ($short > 0) {
+            $this->alerts->raiseOnce(
+                'redeem_visit_unattributable', 'order', $serialId,
+                sprintf('订单 %s 用券之后净份数只剩 %d，可这一单上还记着 %d 次，'
+                      . '多出来的 %d 次找不到可以冲正的记账流水，请人工核对',
+                        $serialId, max(0, $netLeft), $totalNet, $short),
+                ['severity' => 2, 'detail' => ['coupon' => $code, 'holder' => $memberId]]);
+        }
+
+        $done = 0;
+        foreach ($want as $mid => $take) {
+            if ($take <= 0 || !isset($anchor[$mid])) { continue; }
+            $this->members->lockById($mid);
+            $this->ledger->insert([
+                'member_id'     => $mid,
+                'serial_id'     => $serialId,
+                'entry_type'    => \Vip\Repo\LedgerRepo::T_REVERSE,
+                'amount_cents'  => 0,
+                'points'        => 0,
+                'counted_visit' => -$take,
+                'reverses_id'   => $anchor[$mid],
+                'reason'        => sprintf('券 %s 核销在本单上，免费那一餐不计次', $code),
+            ]);
+            $this->members->applyDelta($mid, 0, -$take, 0);
+            $done += $take;
+        }
+        return $done;
     }
 
     /** 作废一张券（发错了、客人投诉撤销等） */
@@ -1016,8 +1239,20 @@ final class RewardService
                 return ['ok' => false, 'error' => 'nothing_pending'];
             }
 
+            /**
+             * ★ 人工放行这条路也要按批来。
+             *
+             *   这里是「人点了一下」，比自动发放可信得多，所以不像
+             *   checkAndGrant 那样一张都不发 —— 但一次点击也不该吐出
+             *   几百张券：那既是一笔几百行的长事务（锁着这位会员的行），
+             *   也让点的人根本看不清自己放行了多少顿饭。
+             *   一次发一批、把「还剩几张」回给界面，再点就是再一次确认。
+             */
+            $cap  = max(1, $this->cfg->int('reward_max_auto_grant', 10));
+            $take = min($p['pending'], $cap);
+
             $out = [];
-            for ($i = 0; $i < $p['pending']; $i++) {
+            for ($i = 0; $i < $take; $i++) {
                 $out[] = $this->issue(
                     $memberId,
                     $r['mode'] === 'amount' ? self::SRC_AMOUNT : self::SRC_VISITS,
@@ -1040,9 +1275,11 @@ final class RewardService
                 'operator_name' => $operator['name'] ?? null,
                 'detail' => ['from' => 'pending_queue', 'count' => count($out),
                              'progress' => $p['progress'], 'threshold' => $p['threshold'],
+                             'remaining' => $p['pending'] - count($out),
                              'codes' => array_map(static fn(array $c): string => (string)$c['code'], $out)],
             ]);
-            return ['ok' => true, 'granted' => count($out), 'coupons' => $out];
+            return ['ok' => true, 'granted' => count($out), 'coupons' => $out,
+                    'remaining' => $p['pending'] - count($out)];
         });
     }
 

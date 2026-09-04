@@ -487,11 +487,16 @@ async function loadCoupons() {
 
   $$('[data-cip]').forEach(b => b.onclick = async () => {
     if (!await UI.confirm(
-      `给 ${b.dataset.cipn} 发出 ${b.dataset.cipc} 张免费餐券？`,
+      `给 ${b.dataset.cipn} 发出 ${b.dataset.cipc} 张免费餐券？`
+      + (+b.dataset.cipc > 10 ? '（一次发一批，发不完可以再点）' : ''),
       { okText: '确认发放' })) return;
     try {
       const r = await api('/coupons/issue-pending', { member_id: +b.dataset.cip });
-      toast(`已发 ${r.granted} 张`, 'ok');
+      // 一次只发一批（后台的「一次最多自动发几张」同时管着这条路）。
+      // 还剩多少必须说出来，否则点了一下看见「已发 10 张」会以为发完了。
+      toast(r.remaining > 0
+        ? `已发 ${r.granted} 张，还剩 ${r.remaining} 张 —— 再点一次继续`
+        : `已发 ${r.granted} 张`, 'ok');
       loadCoupons();
     } catch (e) { toast(e.message, 'err'); }
   });

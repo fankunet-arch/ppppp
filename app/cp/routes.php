@@ -526,7 +526,11 @@ $api->on('POST', '/coupons/issue-pending', static function () use ($app, $requir
         Api::fail('bad_request');
     }
     $r = $app->rewards()->issuePending($mid, ['id' => $op['id'], 'name' => $op['name']]);
-    Api::fromResult($r, ['granted' => $r['granted'] ?? 0, 'coupons' => $r['coupons'] ?? []]);
+    // remaining 一定要带出去：一次点击只发一批（reward_max_auto_grant），
+    // 点的人得看得见自己刚放行了多少顿饭、还剩多少 —— 否则「点了没反应」
+    Api::fromResult($r, ['granted'   => $r['granted']   ?? 0,
+                         'remaining' => $r['remaining'] ?? 0,
+                         'coupons'   => $r['coupons']   ?? []]);
 });
 
 /** 手工发一张券（补偿、投诉处理），必须写原因 */
