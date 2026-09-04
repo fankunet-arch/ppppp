@@ -5205,6 +5205,107 @@ $czIds = implode(',', [$cz1, $cz2, $cz3]);
 $czDb->exec("DELETE FROM coupon WHERE store_code=? AND member_id IN ({$czIds})", [SMOKE_STORE]);
 $czDb->exec("DELETE FROM member WHERE store_code=? AND id IN ({$czIds})", [SMOKE_STORE]);
 
+step('51 POS 分阶段改小同一张单（随机化模型测试抓到的）');
+
+/**
+ * ── 🔴 按比例分摊用错了分子 ──────────────────────────────
+ *
+ * applyShrink 把要退的钱按比例摊给这一单上的几位客人：
+ *   分子 = 那条流水的金额，分母 = 订单当前已分配额。
+ * 问题是分子取的是流水的【原始】金额（永远不变），
+ * 而分母是【当前】已分配额（每缩水一次就降一次）。
+ * 第一次缩水之后两者就不一致了：原始额之和 > 当前已分配，
+ * 比例之和 > 1 —— 前面的人吃掉超过 excess 的量，
+ * 最后一个人算出负数被 max(0,…) 夹成 0，一分钱也退不到。
+ *
+ * 实测（70/30 两人单，POS 依次改成 50 → 20 → 0）：
+ *   客1 净额 -77.00 / 净分 -77   ← 只给过 70，却被退了 147
+ *   客2 在 €0 的单上【还留着 15 分】
+ *   订单 allocated_amount = -62.00
+ * 三方全输：一位被多扣、一位白拿、订单数据变负。
+ * 而「分几次改小同一张单」是店里很常见的操作
+ * （先退一道菜、再退一杯酒、最后整单作废）。
+ *
+ * ★ 这一条是【随机化模型测试】抓到的（tests/fuzz.php）——
+ *   前几轮「想场景再去测」的路子全都没覆盖到它。
+ */
+$sgApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$sgDb  = $sgApp->localDb();
+$sgOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$sgCfg0 = [];
+foreach (['points_mode' => 'by_amount', 'points_per_euro' => '1.0',
+          'min_amount_per_visit' => '0', 'reward_enabled' => '0',
+          'verify_recheck_hours' => '1', 'late_grant_minutes' => '0'] as $k => $v) {
+    $sgCfg0[$k] = $sgApp->cfg()->get($k, '');
+    $sgApp->cfg()->set($k, $v);
+}
+$sgPos = new FakePosSource();
+$sgPos->now = date('Y-m-d H:i:s');
+$sgPos->addHead(['serial_id' => '6100000001', 'order_head_id' => 610001, 'check_id' => 1,
+    'table_name' => 'SG', 'eat_type' => 0, 'customer_num' => 2,
+    'original_amount' => '100.00', 'should_amount' => '100.00', 'actual_amount' => '100.00',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($sgPos->now) - 600)]);
+$sgPos->addDetail(610001, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '50.00', '100.00', 2)]);
+$sgApp->setPosSource($sgPos);
+$sgApp->points()->locate('SG', 3600);
+$sgA = (int)$sgApp->members()->create('TK-00061001-SGA', null, null, null)['id'];
+$sgB = (int)$sgApp->members()->create('TK-00061002-SGB', null, null, null)['id'];
+// 不均分：70 / 30
+$sgApp->points()->grant('6100000001',
+    [['member_id' => $sgA, 'amount_cents' => 7000, 'portions' => 1]],
+    Vip\PointsEngine::MODE_PICK, $sgOp);
+$sgApp->points()->grant('6100000001',
+    [['member_id' => $sgB, 'amount_cents' => 3000, 'portions' => 1]],
+    Vip\PointsEngine::MODE_PICK, $sgOp);
+
+$sgShrink = static function (string $to) use ($sgApp, $sgPos, $sgDb): void {
+    foreach ($sgPos->heads as $i => $h) {
+        if ($h['serial_id'] === '6100000001') {
+            $sgPos->heads[$i]['original_amount'] = $to;
+            $sgPos->heads[$i]['should_amount']   = $to;
+            $sgPos->heads[$i]['actual_amount']   = $to;
+        }
+    }
+    $sgApp->orders()->markVerified('6100000001', 0);
+    $sgApp->reconcile()->verifyAmounts();
+};
+$sgNet = static function (int $mid) use ($sgDb): array {
+    $r = $sgDb->one('SELECT COALESCE(SUM(amount),0) a, COALESCE(SUM(points),0) p
+                       FROM point_ledger WHERE store_code=? AND serial_id=? AND member_id=?',
+                    [SMOKE_STORE, '6100000001', $mid]);
+    return [(float)$r['a'], (int)$r['p']];
+};
+
+$sgShrink('50.00');
+[$sgAa, $sgAp] = $sgNet($sgA); [$sgBa, $sgBp] = $sgNet($sgB);
+ok(abs($sgAa - 35.0) < 0.005 && abs($sgBa - 15.0) < 0.005,
+   "51 第一次缩水 100→50：按 70/30 摊成 35/15（实际 {$sgAa}/{$sgBa}）");
+
+$sgShrink('20.00');
+[$sgAa, $sgAp] = $sgNet($sgA); [$sgBa, $sgBp] = $sgNet($sgB);
+ok($sgAa >= -0.004 && $sgBa >= -0.004,
+   "★★★ 第二次缩水 50→20：没有人被退成负数（实际 客1={$sgAa} 客2={$sgBa}）—— "
+ . '原来分子用流水【原始】金额、分母用【当前】已分配额，第一次缩水后两者就不一致，'
+ . '比例之和 >1，客1 被退成 -7.00 而客2 一分没退');
+ok(abs($sgAa + $sgBa - 20.0) < 0.02,
+   "  └ 两人净额合计 " . number_format($sgAa + $sgBa, 2) . " ≈ 订单新总额 20.00");
+
+$sgShrink('0.00');
+[$sgAa, $sgAp] = $sgNet($sgA); [$sgBa, $sgBp] = $sgNet($sgB);
+ok($sgAa >= -0.004 && $sgBa >= -0.004 && $sgAp >= 0 && $sgBp >= 0,
+   "★★★ 整单归零：两人净额/净分都不为负（实际 客1={$sgAa}/{$sgAp} 客2={$sgBa}/{$sgBp}）—— "
+ . '原来客1 净额 -77.00、净分 -77，而客2 在 €0 的单上还留着 15 分');
+$sgAlloc = (float)$sgDb->value('SELECT allocated_amount FROM pos_order WHERE store_code=? AND serial_id=?',
+                               [SMOKE_STORE, '6100000001']);
+ok(abs($sgAlloc) < 0.005,
+   "  └ 订单已分配额归零（实际 {$sgAlloc}）—— 原来会变成 -62.00，④⑤ 两条不变量一起破");
+
+foreach ($sgCfg0 as $k => $v) { $sgApp->cfg()->set($k, $v); }
+$sgIds = implode(',', [$sgA, $sgB]);
+$sgDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$sgIds})", [SMOKE_STORE]);
+$sgDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$sgIds})", [SMOKE_STORE]);
+$sgDb->exec("DELETE FROM pos_order    WHERE store_code=? AND serial_id='6100000001'", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

@@ -374,23 +374,68 @@ final class ReconcileService
                 return;
             }
 
+        /**
+         * ── 🔴 按比例分摊必须用【每条还剩多少】，不能用原始金额 ──────
+         *
+         * 原来分子是 $e['amount']（流水的【原始】金额、永远不变），
+         * 分母是 $allocated（订单【当前】已分配额、每次缩水都在降）。
+         * 第一次缩水后两者就不一致了：原始额之和 > 当前已分配，
+         * 于是比例之和 > 1 —— 前面的条目吃掉超过 excess 的量，
+         * 最后一条算出负数被 max(0,…) 夹成 0，一分钱也退不到。
+         *
+         * 实测（POS 分阶段改小，多人单）：
+         *   70/30 两人单，100 → 50 → 20 → 0
+         *     客1 净额 -77.00 / 净分 -77   ← 只给过 70，却被退了 147
+         *     客2 在 €0 的单上【还留着 15 分】
+         *     订单 allocated_amount = -62.00（负数，④⑤ 两条不变量一起破）
+         *   三人均分逐步缩到 0：两位各 -27.78，第三位留 22.22
+         *
+         * 三方全输：一位被多扣、一位白拿、订单数据变负。
+         * 而「POS 分几次改小同一张单」是店里很常见的操作
+         * （先退一道菜、再退一杯酒、最后整单作废）。
+         *
+         * ★ 修法：分子改成【这条流水还剩多少没退】——
+         *   原始额 + 已生效的补偿（负数），也就是 activeCompensationsOf()。
+         *   那正是 R-01 引入的同一个概念：追加式账本里
+         *   「当初记了多少」和「现在还剩多少」是两个数（docs/13 §3.1bis）。
+         *   分母同步换成这些余额之和，与分子同源。
+         */
+        $comps = []; $netAmt = []; $netPts = []; $netVis = []; $remainTotal = 0;
+            foreach ($earns as $i => $e) {
+                $comps[$i] = $this->ledger->activeCompensationsOf((int)$e['id']);
+                $a = Money::toCents((string)$e['amount']);
+                $p = (int)$e['points'];
+                $v = (int)$e['counted_visit'];
+                foreach ($comps[$i] as $c) {
+                    $a += Money::toCents((string)$c['amount']);   // 补偿是负数
+                    $p += (int)$c['points'];
+                    $v += (int)$c['counted_visit'];
+                }
+                $netAmt[$i] = max(0, $a);
+                $netPts[$i] = max(0, $p);
+                $netVis[$i] = max(0, $v);
+                $remainTotal += $netAmt[$i];
+            }
+            // 退的总额不可能超过「大家手上还剩的总和」
+            $excess = min($excess, $remainTotal);
+
             $n = count($earns);
             $acc = 0;
             $totalBack = 0;
 
             foreach ($earns as $i => $e) {
-                $amt = Money::toCents((string)$e['amount']);
+                $amt = $netAmt[$i];                      // ★ 还剩多少，不是当初多少
                 // ② 最后一条吃掉舍入残差，保证 SUM(退款) 恰好等于 excess
                 $backAmt = ($i === $n - 1)
                     ? $excess - $acc
-                    : Money::scale($excess, $amt, max($allocated, 1));
-                $backAmt = max(0, min($backAmt, $amt));   // 不能退超过该条本身
+                    : Money::scale($excess, $amt, max($remainTotal, 1));
+                $backAmt = max(0, min($backAmt, $amt));   // 不能退超过该条【还剩的】
                 $acc += $backAmt;
                 if ($backAmt === 0) {
                     continue;
                 }
 
-                $pts = (int)$e['points'];
+                $pts = $netPts[$i];                      // ★ 同上：还剩多少分
                 /**
                  * ★ 退多少分，看积分口径。
                  *
@@ -437,12 +482,7 @@ final class ReconcileService
                  *   与 PointsService::reverseInTx 完全同一个形状、同一套判据：
                  *   一处修了另一处没修，正是 docs/13 §3.1 那一类。
                  */
-                $comps      = $this->ledger->activeCompensationsOf((int)$e['id']);
-                $netVisits  = (int)$e['counted_visit'];
-                foreach ($comps as $c) {
-                    $netVisits += (int)$c['counted_visit'];
-                }
-                $backVisits = $newTotal === 0 ? max(0, $netVisits) : 0;
+                $backVisits = $newTotal === 0 ? $netVis[$i] : 0;
 
                 $this->members->lockById((int)$e['member_id']);
                 $refundId = $this->ledger->insert([
@@ -478,7 +518,7 @@ final class ReconcileService
                     $this->ledger->markReversed((int)$e['id'], $refundId);
                     // 补偿流水随原流水一起退出有效集 —— 它要退的那一次
                     // 已经并进上面这条冲正里了，留着会被重复计入
-                    foreach ($comps as $c) {
+                    foreach ($comps[$i] as $c) {
                         $this->ledger->markReversed((int)$c['id'], $refundId);
                     }
                 }
