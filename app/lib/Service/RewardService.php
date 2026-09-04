@@ -609,8 +609,34 @@ final class RewardService
         ?array $override = null,
     ): array {
         return $this->db->transaction(function () use ($couponId, $serialId, $operator, $pin, $override) {
+            /**
+             * ── 🔴 加锁顺序：pos_order → card → member → coupon → point_ledger ──
+             *
+             * 全仓库统一这一个顺序（docs/13 §3.4）。这条路原来是
+             * 【券 → 卡 → 订单 → 会员】，正好和撤销那条路
+             * （流水 → 会员 → 订单 → 券，clawBackOverIssued 要作废券）交叉 ——
+             * 实测「同一张单上一边核销、一边撤销」100% 死锁，
+             * 靠 LocalDb 的回滚重放才救回来。重放本身没错，
+             * 但每一次都要整笔重来，重试次数一旦用完（只重放两次），
+             * 收银员当场看到 E110「系统忙」。
+             *
+             * ★ 顺序里【卡在会员前面】不是随手排的：换卡那条路
+             *   （CardService::changeCard）是 lockByCardNo → updateCardNo，
+             *   也就是先卡后会员。这里要是反过来先锁会员再验 PIN
+             *   （verifyPin 会写 card 的失败计数，那是一把写锁），
+             *   就和换卡撞成新的一对反向持锁 —— 修一个坑挖一个坑。
+             *
+             * ★ 券要先【不加锁】读一次做便宜的校验（不存在 / 已用 / 过期），
+             *   真正的加锁读放在卡与会员之后，并且【重新校验一次状态】——
+             *   两个人同时核销同一张券时，第二个人要在这里被拦下。
+             */
+            $hasSerial = $serialId !== null && trim($serialId) !== '';
+            if ($hasSerial) {
+                $this->orders->lockBySerial((string)$serialId);
+            }
+
             $c = $this->db->one(
-                'SELECT * FROM coupon WHERE store_code = ? AND id = ? FOR UPDATE',
+                'SELECT * FROM coupon WHERE store_code = ? AND id = ?',
                 [$this->storeCode, $couponId]
             );
             if ($c === null) {
@@ -626,7 +652,7 @@ final class RewardService
                 return ['ok' => false, 'error' => 'coupon_expired'];
             }
 
-            // ── 持卡验证 ──
+            // ── 持卡验证（会写 card 的失败计数 —— 卡锁在这一步）──
             $forced = false;
             if ($override !== null) {
                 if ((int)($operator['role'] ?? 0) < 2) {
@@ -652,6 +678,22 @@ final class RewardService
                 }
             }
 
+            // 会员行 —— 排在卡之后、券之前
+            $this->members->lockById((int)$c['member_id']);
+
+            // ★ 现在才给券加锁并【重新校验】：上面那次是不加锁读，
+            //   两个人同时拿同一张券进来时，第二个要在这里被挡住
+            $c = $this->db->one(
+                'SELECT * FROM coupon WHERE store_code = ? AND id = ? FOR UPDATE',
+                [$this->storeCode, $couponId]
+            );
+            if ($c === null) {
+                return ['ok' => false, 'error' => 'coupon_not_found'];
+            }
+            if ((int)$c['status'] !== self::ST_ACTIVE) {
+                return ['ok' => false, 'error' => 'coupon_not_active'];
+            }
+
             $this->db->exec(
                 'UPDATE coupon SET status = ?, redeemed_at = ?, redeemed_serial_id = ?, operator_id = ?
                   WHERE id = ?',
@@ -672,7 +714,7 @@ final class RewardService
              *     只能继续靠匹配串，兜底由 checkIntegrity 的对账告警负责。
              */
             $visitsBack = 0;
-            if ($serialId !== null && trim($serialId) !== '') {
+            if ($hasSerial) {
                 $this->orders->markRedeemedByApp($serialId);
                 // ★ 顺序不能反：先把镜像标好（份数已减 1），
                 //   下面才按【减完之后】的份数判该退几次。
@@ -779,11 +821,39 @@ final class RewardService
         }
 
         /**
+         * ── 🔴 先把人锁住，再去读账 ────────────────────────────
+         *
+         * 「还剩多少没退」这个数，三条路（核销 / 撤销 / 值比对缩水）
+         * 都在读、都在写。公式统一成 activeCompensationsOf() 之后，
+         * 顺序执行是对的 —— 但三条路原来都是【先把账读出来、再去取会员锁】，
+         * 于是两边都能读到同一份旧账，然后各退各的：同一次退两遍。
+         *
+         * 判据只有一个：读这个数的时候，得握着写这个数的人也要握的那把锁。
+         * 会员行是三条路唯一都会碰的行，拿它当互斥点。
+         *
+         * ★ 名单可以普通读：调用方（redeem）已经握着这一单的订单行 X 锁，
+         *   并发记账进不来，这一单上的会员名单不会再变。
+         * ★ 券持有人也要一起锁上 —— 下面 by_portion 那一支会退到他头上。
+         * ★ 按 id 升序锁，顺序固定（docs/13 §3.4 那三版死锁的教训）。
+         */
+        $ids = $this->ledger->memberIdsOnSerial($serialId);
+        if (!in_array($memberId, $ids, true)) {
+            $ids[] = $memberId;
+            sort($ids);
+        }
+        foreach ($ids as $mid) {
+            $this->members->lockById($mid);
+        }
+
+        /**
          * 锚点：新插的那条负数流水挂在谁身上。必须是一条【还活着】的
          * 记账流水 —— 挂到已经被冲正的行上，等于把一次退给一笔不存在的账。
+         *
+         * ★ 加锁读：会员锁到手之后，普通读【仍然返回事务开头的快照】
+         *   （InnoDB REPEATABLE READ），等于白锁。见 netBySerial() 的说明。
          */
         $anchor = [];
-        foreach ($this->ledger->activeBySerial($serialId) as $e) {
+        foreach ($this->ledger->activeBySerial($serialId, true) as $e) {
             if ((int)$e['entry_type'] === \Vip\Repo\LedgerRepo::T_EARN) {
                 $anchor[(int)$e['member_id']] ??= (int)$e['id'];
             }
@@ -810,7 +880,7 @@ final class RewardService
          * 追加式账本里后者永远是【全部流水求和】（不变量①同此口径）。
          */
         $net = []; $portions = [];
-        foreach ($this->ledger->netBySerial($serialId) as $mid => $r) {
+        foreach ($this->ledger->netBySerial($serialId, true) as $mid => $r) {
             $net[$mid]      = $r['visits'];
             $portions[$mid] = $r['portions'];
         }
@@ -826,7 +896,10 @@ final class RewardService
         }
 
         $byPortion = $this->cfg->get('visit_count_mode', 'once_per_period') === 'by_portion';
-        $netLeft   = (int)$order['portions_counted'];   // markRedeemedByApp 已经减过了
+        // ★ 订单行同样要加锁读：上面 findBySerial 是普通读，
+        //   在 REPEATABLE READ 下拿到的可能还是本事务改之前的快照
+        $locked  = $this->orders->lockBySerial($serialId) ?? $order;
+        $netLeft = (int)$locked['portions_counted'];    // markRedeemedByApp 已经减过了
         $totalNet  = array_sum($net);
 
         /** @var array<int,int> $want 每位会员要退几次 */
@@ -908,7 +981,7 @@ final class RewardService
         $done = 0;
         foreach ($want as $mid => $take) {
             if ($take <= 0 || !isset($anchor[$mid])) { continue; }
-            $this->members->lockById($mid);
+            // 会员行的 X 锁在读账之前就按 id 升序全部拿过了，这里不再补锁
             $this->ledger->insert([
                 'member_id'     => $mid,
                 'serial_id'     => $serialId,

@@ -1477,6 +1477,29 @@ final class PointsService
      */
     private function reverseInTx(int $ledgerId, string $reason, array $operator): array
     {
+            /**
+             * ── 🔴 加锁顺序：pos_order → member → coupon → point_ledger ──
+             *
+             * 这条路原来第一步就锁流水行，然后 lockById(member)，
+             * 最后 applyAllocation 去改订单行、clawBackOverIssued 去作废券 ——
+             * 顺序是【流水 → 会员 → 订单 → 券】，和核销那条路
+             * （券 → 订单 → 会员）正好交叉，实测同一张单上并发
+             * 「核销 × 撤销」100% 死锁。
+             *
+             * 现在统一成先订单、再会员：同一张单上的任何两个动作从这一刻
+             * 起就是排队的。为此要先【不加锁】读一次流水行，
+             * 只为知道这笔账挂在哪一单、哪位客人身上；
+             * 真正的校验放在下面加锁读之后。
+             */
+            $peek = $this->ledger->findById($ledgerId);
+            if ($peek === null) {
+                return ['ok' => false, 'error' => 'ledger_not_found'];
+            }
+            if ($peek['serial_id'] !== null) {
+                $this->orders->lockBySerial((string)$peek['serial_id']);
+            }
+            $this->members->lockById((int)$peek['member_id']);
+
             $orig = $this->ledger->lockById($ledgerId);
             if ($orig === null) {
                 return ['ok' => false, 'error' => 'ledger_not_found'];
@@ -1543,15 +1566,21 @@ final class PointsService
              * ★ 补偿流水也要一并标记成已冲正：留着有效的话，
              *   「有效流水的计次合计」会和会员表对不上。
              */
-            $comps = $this->ledger->activeCompensationsOf($ledgerId);
+            /**
+             * ★ 加锁读。会员行的 X 锁上面已经拿到了，但 InnoDB 默认
+             *   REPEATABLE READ —— 普通读返回的是事务开头那一刻的快照，
+             *   哪怕锁等到了对方提交完，读到的【还是旧账】。
+             *   「先加锁再读」在 InnoDB 上必须写成「先加锁再加锁读」。
+             *   命中 idx_reverse，锁的范围就是这一笔的补偿流水。
+             */
+            $comps = $this->ledger->activeCompensationsOf($ledgerId, true);
             foreach ($comps as $c) {
                 $amt    += Money::toCents((string)$c['amount']);      // 补偿是负数
                 $points += (int)$c['points'];
                 $visits += (int)$c['counted_visit'];
             }
 
-            $this->members->lockById((int)$orig['member_id']);
-
+            // 会员行的 X 锁在读账之前就拿到了（见上面加锁顺序的说明）
             $revId = $this->ledger->insert([
                 'member_id'        => (int)$orig['member_id'],
                 'serial_id'        => $orig['serial_id'],
@@ -1651,7 +1680,7 @@ final class PointsService
             return ['ok' => false, 'error' => 'bad_request'];
         }
         return $this->db->transaction(function () use ($group, $reason, $operator) {
-            $rows = $this->ledger->lockActiveByGroup($group);
+            $rows = $this->ledger->activeByGroup($group);
             if (!$rows) {
                 return ['ok' => false, 'error' => 'group_not_found'];
             }

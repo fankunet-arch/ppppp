@@ -5701,6 +5701,172 @@ $db->exec("DELETE FROM alert WHERE store_code=? AND alert_type IN ('menu_scan_un
           [SMOKE_STORE]);
 $msApp->cfg()->set('sync_max_batches', '200');
 
+step('55 两个人同时动手（核销 × 撤销 / 一单两张券 / 抢同一张券）');
+
+/**
+ * ── 🔴 公式统一了，加锁边界没统一 ────────────────────────────
+ *
+ * 「还剩多少没退」这个数，三条路都在读、也都在写：
+ *   clawBackVisitOnRedeem（核销）/ reverseInTx（撤销）/ applyShrink（缩水）。
+ * 公式统一成 activeCompensationsOf() 之后顺序执行是对的，
+ * 但三条路都是【先把账读出来、再去取会员行锁】，而且谁也不锁对方的锚点：
+ * 两边读到同一份旧账，然后各退各的 —— 同一次退两遍，客人计次变成 -1。
+ *
+ * ── 为什么这条断言要盯【死锁次数】而不是结果 ──────────────
+ *
+ * 改之前在本机跑，结果次次正确 —— 一查才知道两条路的加锁顺序正好交叉
+ * （核销：券 → 订单 → 会员；撤销：流水 → 会员 → 券），
+ * 于是【每一轮都死锁】，InnoDB 挑一个回滚，LocalDb 重放时重新读账，
+ * 把错的悄悄改对了。实测 20 轮 20 次重放，而「结果对不对」全绿。
+ *
+ * 所以「结果对」在这里什么也证明不了：
+ *   · 换一台机器、换个版本，环没形成 → 一方只是等锁，等到了照旧用旧账 → -1；
+ *   · 重试次数一旦用完（LocalDb 只重放 2 次），收银员当场看到 E110。
+ * 判据必须是【一次死锁都不该有】—— 正确性不能靠重放兜着。
+ *
+ * 修法与当年那把额度锁同一招：全仓库统一加锁顺序
+ *   pos_order → member → coupon → point_ledger，
+ * 并且把「读账」改成【加锁读】—— InnoDB 默认 REPEATABLE READ，
+ * 锁等到了，普通读拿到的还是事务开头的快照。
+ *
+ * 实测：改之前 20/20 轮死锁重放；改之后 0/25，且把 DEADLOCK_RETRIES
+ * 调成 0（完全不重放）两组也各 15/15 全成功、结果全对。
+ */
+$rcApp2 = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$rcDb2  = $rcApp2->localDb();
+$rcOp2  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 2, 'is_manager' => true];
+$rcCfg0 = [];
+$rcSet  = static function (array $kv) use ($rcApp2, &$rcCfg0): void {
+    foreach ($kv as $k => $v) {
+        if (!array_key_exists($k, $rcCfg0)) { $rcCfg0[$k] = $rcApp2->cfg()->get($k, ''); }
+        $rcApp2->cfg()->set($k, $v);
+    }
+};
+
+/**
+ * 跑一组并发：造好夹具，让两个真进程卡在同一时刻动手。
+ * @return array{0:int,1:int,2:int,3:array} [A 成功, B 成功, 死锁次数, 各会员净计次]
+ */
+$rcRound = static function (string $kind, int $round)
+        use ($rcApp2, $rcDb2, $rcOp2, $envPrefix): array {
+    $ser = sprintf('66%06d', $round);
+    $oh  = 660000 + $round;
+    $q   = $kind === 'redeem_redeem' ? 2 : 1;
+    $amt = number_format(23.90 * $q, 2, '.', '');
+    $pos = new FakePosSource();
+    $pos->now = date('Y-m-d H:i:s');
+    $pos->addHead(['serial_id' => $ser, 'order_head_id' => $oh, 'check_id' => 1,
+        'table_name' => 'RC' . $round, 'eat_type' => 0, 'customer_num' => $q,
+        'original_amount' => $amt, 'should_amount' => $amt, 'actual_amount' => $amt,
+        'order_end_time' => date('Y-m-d H:i:s', strtotime($pos->now) - 600)]);
+    $pos->addDetail($oh, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', $amt, $q)]);
+    $rcApp2->setPosSource($pos);
+    $rcApp2->points()->locate('RC' . $round, 3600);
+
+    $mid = (int)$rcApp2->members()->create(sprintf('TK-00066%03d-RCA', $round), null, null, null)['id'];
+    // 先攒够门槛把券发出来，再把进度清零 —— 只留「一张已记账的单 + 手上的券」
+    $rcDb2->exec('UPDATE member SET visit_count=?, rewards_issued=0 WHERE store_code=? AND id=?',
+                 [$q === 2 ? 6 : 3, SMOKE_STORE, $mid]);
+    $rcApp2->rewards()->checkAndGrant($mid, $rcOp2);
+    $rcDb2->exec("UPDATE member SET visit_count=0, total_spent='0.00', points_balance=0,
+                     rewards_issued=0 WHERE store_code=? AND id=?", [SMOKE_STORE, $mid]);
+    $rcDb2->exec('DELETE FROM point_ledger WHERE store_code=? AND member_id=?', [SMOKE_STORE, $mid]);
+
+    $g = $rcApp2->points()->grant($ser,
+        [['member_id' => $mid, 'amount_cents' => (int)round(23.90 * $q * 100), 'portions' => $q]],
+        Vip\PointsEngine::MODE_WHOLE, $rcOp2);
+    if (!($g['ok'] ?? false)) { return [0, 0, 0, ['grant_failed' => $g['error'] ?? '?']]; }
+    $lid = (int)$g['entries'][0]['ledger_id'];
+    $cs  = $rcDb2->all('SELECT id FROM coupon WHERE store_code=? AND member_id=? AND status=1
+                         ORDER BY id', [SMOKE_STORE, $mid]);
+
+    $at   = microtime(true) + 1.2;
+    $spawn = static function (string $m, int $i, string $sv) use ($envPrefix, $at) {
+        return popen($envPrefix . escapeshellcmd(PHP_BINARY) . ' '
+            . escapeshellarg(__DIR__ . '/redeem_race_worker.php') . ' '
+            . escapeshellarg($m) . ' ' . $i . ' ' . escapeshellarg($sv) . ' '
+            . sprintf('%.4f', $at) . ' 2>/dev/null', 'r');
+    };
+    $pa = $spawn('redeem', (int)$cs[0]['id'], $ser);
+    $pb = match ($kind) {
+        // 一单两张券：两位客人各用各的
+        'redeem_redeem' => $spawn('redeem', (int)($cs[1]['id'] ?? 0), $ser),
+        // ★ 同一张券两个人同时核销 —— 券的加锁读被挪到卡与会员之后了，
+        //   挪之后必须还挡得住「一张券吃两顿饭」
+        'redeem_same'   => $spawn('redeem', (int)$cs[0]['id'], $ser),
+        default         => $spawn('reverse', $lid, '-'),
+    };
+
+    $read = static function ($ph): array {
+        if ($ph === false) { return [0, 0, 'popen 失败']; }
+        $l = preg_split('/\s+/', trim((string)stream_get_contents($ph)), 3);
+        pclose($ph);
+        return [(int)($l[0] ?? 0), (int)($l[1] ?? 0), trim((string)($l[2] ?? ''))];
+    };
+    [$oa, $da, $wa] = $read($pa);
+    [$ob, $dbk, $wb] = $read($pb);
+
+    $vc = (int)$rcDb2->value('SELECT visit_count FROM member WHERE store_code=? AND id=?',
+                             [SMOKE_STORE, $mid]);
+    return [$oa, $ob, $da + $dbk,
+            ['vc' => $vc, 'mid' => $mid, 'serial' => $ser,
+             'why' => array_values(array_filter([$wa, $wb],
+                static fn(string $x): bool => $x !== '' && $x !== '-'))]];
+};
+
+$rcMids = []; $rcSerials = [];
+foreach ([['redeem_reverse', 'by_order',   '核销 × 撤销'],
+          ['redeem_redeem',  'by_portion', '核销 × 核销（一单两张券）'],
+          ['redeem_same',    'by_order',   '两个人抢同一张券']] as $rcI => $rcCase) {
+    [$rcKind, $rcVmode, $rcLabel] = $rcCase;
+    $rcSet(['visit_count_mode' => $rcVmode, 'points_mode' => 'by_amount',
+            'points_per_euro' => '1.0', 'min_amount_per_visit' => '0',
+            'late_grant_minutes' => '0', 'reward_enabled' => '1', 'reward_mode' => 'visits',
+            'reward_threshold_visits' => '3', 'reward_auto_grant' => '1',
+            'reward_max_auto_grant' => '50', 'reversal_window_hours' => '240']);
+    $rcN = 6;
+    $rcOkA = 0; $rcOkB = 0; $rcDead = 0; $rcNeg = 0; $rcWhy = [];
+    for ($r = 0; $r < $rcN; $r++) {
+        [$a, $b, $d, $info] = $rcRound($rcKind, $rcI * 100 + $r);
+        if (isset($info['mid']))    { $rcMids[]    = (int)$info['mid']; }
+        if (isset($info['serial'])) { $rcSerials[] = (string)$info['serial']; }
+        $rcOkA += $a; $rcOkB += $b; $rcDead += $d;
+        if ((int)($info['vc'] ?? 0) < 0) { $rcNeg++; }
+        foreach (($info['why'] ?? []) as $w) { $rcWhy[] = $w; }
+        if (isset($info['grant_failed'])) { $rcWhy[] = '记账失败:' . $info['grant_failed']; }
+    }
+    $rcTxt = $rcWhy ? '（工作进程说：' . implode('；', array_unique($rcWhy)) . '）' : '';
+    if ($rcKind === 'redeem_same') {
+        // 一张券只能吃一顿饭：恰好一个成功，另一个必须被 coupon_not_active 挡下
+        eq($rcN, $rcOkA + $rcOkB,
+           "★★★ {$rcLabel}：{$rcN} 轮里【每轮只有一个成功】（实际 "
+           . ($rcOkA + $rcOkB) . "/{$rcN}）—— 券的加锁读挪到卡与会员之后了，"
+           . '挪之后还得挡得住「一张券吃两顿饭」' . $rcTxt);
+    } else {
+        eq($rcN * 2, $rcOkA + $rcOkB,
+           "55 {$rcLabel}：{$rcN} 轮里两边都成功（实际 " . ($rcOkA + $rcOkB) . "/" . ($rcN * 2) . "）{$rcTxt}");
+    }
+    eq(0, $rcNeg, "  └ 没有一位客人的计次被退成负数");
+    eq(0, $rcDead,
+       "★★★ {$rcLabel}：{$rcN} 轮【一次死锁都没有】（实际 {$rcDead} 次）—— "
+     . '改加锁顺序之前这里每一轮都死锁，而结果次次正确：重放会重新读账、'
+     . '把「两条路各读一份旧账各退各的」那个错悄悄改对。'
+     . '所以这一档只有盯住死锁次数才有牙，盯结果是盯不到的');
+}
+foreach ($rcCfg0 as $k => $v) { $rcApp2->cfg()->set($k, $v); }
+// ★ 按【这一档真正造出来的 id】清理，别用 LIKE 去猜：
+//   漏掉一位就会在 ⑬「余额 == 流水合计」上变红，而红的地方与真正的原因隔着十万八千里
+if ($rcMids) {
+    $rcIn = implode(',', array_map('intval', $rcMids));
+    $rcDb2->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$rcIn})", [SMOKE_STORE]);
+    $rcDb2->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$rcIn})", [SMOKE_STORE]);
+    $rcDb2->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$rcIn})", [SMOKE_STORE]);
+}
+foreach (array_unique($rcSerials) as $rcS) {
+    $rcDb2->exec('DELETE FROM point_ledger WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $rcS]);
+    $rcDb2->exec('DELETE FROM pos_order    WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $rcS]);
+}
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(
