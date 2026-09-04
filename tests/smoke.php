@@ -5473,13 +5473,75 @@ eq(0, $fmVis3($fmX),
  . '「判不出该退谁」的告警就完事，等于一次都不退：这顿饭没人花钱，'
  . '却给甲攒了一次「十送一」的进度');
 
+/**
+ * ④ 一桌两张券 —— `is_redeemed` 是布尔，被当成计数用了。
+ *
+ *   markRedeemedByApp 原来写的是
+ *     portions_counted = GREATEST(0, portions_counted - IF(is_redeemed = 1, 0, 1))
+ *   ——【只有第一张券扣得动】。而 buildContext（locate / 同步那条路）
+ *   一直是对的：净 = 总份数 − max(匹配串反推, App 核销张数)。
+ *   同一个数两个人算，只有一个算对（docs/13 §3.1bis）。
+ *
+ *   家庭桌里两位都攒够了并不是边角料。实测 4 份的桌、甲乙各一张券：
+ *     · 先记账后核销 → 记进去 4 次，两次核销只退回 1 次，
+ *       实付 2 份却留着 3 次 —— 白送一顿饭的进度；
+ *     · 先核销后记账 → 净份数停在 3，四人 AA 被 exceeds_portions
+ *       直接拒掉，收银员当场记不进去。
+ *
+ *   修法不是「每次都减 1」：POS 上已有折扣行、匹配串认出来过一次时
+ *   buildContext 已经替那张券扣过了，再减一次是把同一份扣两遍。
+ *   改成按地面真值重算并且只减不加：
+ *     净 = LEAST(现在的净份数, 总份数 − App 已核销张数)（迁移 019）
+ */
+$fmSet(['visit_count_mode' => 'by_portion']);
+$fmPos4 = new FakePosSource();
+$fmPos4->now = date('Y-m-d H:i:s');
+$fmPos4->addHead(['serial_id' => '6200000004', 'order_head_id' => 620004, 'check_id' => 1,
+    'table_name' => 'FP', 'eat_type' => 0, 'customer_num' => 4,
+    'original_amount' => '95.60', 'should_amount' => '95.60', 'actual_amount' => '95.60',
+    'order_end_time' => date('Y-m-d H:i:s', strtotime($fmPos4->now) - 600)]);
+$fmPos4->addDetail(620004, 1, [FakePosSource::line(2390, 'MENÚ INFINITY NOCHE', '23.90', '95.60', 4)]);
+$fmApp->setPosSource($fmPos4);
+$fmApp->points()->locate('FP', 3600);
+
+$fmFam = [];
+for ($i = 1; $i <= 4; $i++) {
+    $fmFam[$i] = (int)$fmApp->members()->create(sprintf('TK-0006201%d-FF', $i), null, null, null)['id'];
+}
+foreach ([1, 2] as $i) {          // 甲乙各攒够一张券
+    $fmDb->exec('UPDATE member SET visit_count=3, rewards_issued=0 WHERE store_code=? AND id=?',
+                [SMOKE_STORE, $fmFam[$i]]);
+    $fmApp->rewards()->checkAndGrant($fmFam[$i], $fmOp);
+}
+// 四人 AA 各记 1 份 → 4 次
+$fmApp->points()->grant('6200000004',
+    array_map(static fn(int $mid): array => ['member_id' => $mid, 'amount_cents' => 2390, 'portions' => 1],
+              array_values($fmFam)),
+    Vip\PointsEngine::MODE_SPLIT, $fmOp);
+$fmTot4 = static fn(): int => (int)$fmDb->value(
+    'SELECT COALESCE(SUM(counted_visit),0) FROM point_ledger WHERE store_code=? AND serial_id=?',
+    [SMOKE_STORE, '6200000004']);
+eq(4, $fmTot4(), '52 四人桌 AA 各记 1 份 → 这一单一共 4 次');
+foreach ($fmDb->all('SELECT id FROM coupon WHERE store_code=? AND member_id IN (?,?) AND status=1
+                      ORDER BY id', [SMOKE_STORE, $fmFam[1], $fmFam[2]]) as $fmCp) {
+    $fmApp->rewards()->redeem((int)$fmCp['id'], '6200000004', $fmOp, null, ['reason' => '冒烟']);
+}
+eq(2, (int)$fmDb->value('SELECT portions_counted FROM pos_order WHERE store_code=? AND serial_id=?',
+                        [SMOKE_STORE, '6200000004']),
+   '  └ 两张券 = 两份免费，实付份数应降到 2（原来只减得掉 1 份，停在 3）');
+eq(2, $fmTot4(),
+   '★★★ 一桌两张券时两次计次都要退 —— 原来 is_redeemed 是个布尔却被当成计数用，'
+ . '第二张券一份也扣不动：实付 2 份却留着 3 次，白送一顿饭的进度。'
+ . '（反过来「先核销后记账」时净份数停在 3，四人 AA 会被 exceeds_portions 拒掉，'
+ . '收银员当场记不进去）');
+
 foreach ($fmCfg0 as $k => $v) { $fmApp->cfg()->set($k, $v); }
-$fmIds = implode(',', [$fmDad, $fmMom, $fmA, $fmB, $fmX, $fmY]);
+$fmIds = implode(',', array_merge([$fmDad, $fmMom, $fmA, $fmB, $fmX, $fmY], array_values($fmFam)));
 $fmDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$fmIds})", [SMOKE_STORE]);
 $fmDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$fmIds})", [SMOKE_STORE]);
 $fmDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$fmIds})", [SMOKE_STORE]);
 $fmDb->exec("DELETE FROM pos_order    WHERE store_code=? AND
-                serial_id IN ('6200000001','6200000002','6200000003')", [SMOKE_STORE]);
+                serial_id IN ('6200000001','6200000002','6200000003','6200000004')", [SMOKE_STORE]);
 
 step('53 一个打字错误不该变成几百顿免费餐');
 

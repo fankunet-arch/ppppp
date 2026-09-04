@@ -43,6 +43,14 @@ CREATE TABLE `pos_order` (
   `allocated_amount`  DECIMAL(11,2) NOT NULL DEFAULT 0 COMMENT '已分配金额',
   `allocated_portions` SMALLINT     NOT NULL DEFAULT 0 COMMENT '已分配份数，与金额一样受守恒约束',
 
+  -- 份数快照
+  --   counted 是【净】份数（券抵掉的已扣），gross 是券抵之前的总份数。
+  --   两个都要存：前台点「核销」时按 gross − App 已核销张数 重算 counted，
+  --   否则只能靠 is_redeemed 这个布尔去减，一桌两张券就少扣一份（019）。
+  `portions_counted`   SMALLINT     NOT NULL DEFAULT 0 COMMENT '净份数：counts_visit=1 菜品的 SUM(quantity) 减去券抵掉的份数',
+  `portions_gross`     SMALLINT     NOT NULL DEFAULT 0 COMMENT '券抵之前的总份数；0=019 迁移之前的老数据未回填',
+  `portions_uncounted` SMALLINT     NOT NULL DEFAULT 0 COMMENT 'counts_visit=0 的套餐份数（DEL DIA / 儿童套餐等）',
+
   -- 状态
   `is_free_meal`      TINYINT      NOT NULL DEFAULT 0 COMMENT '1=10送1 免费餐，不计次',
   -- 十送一核销（见 03 §6）。要区分「整单免」与「混合单」：

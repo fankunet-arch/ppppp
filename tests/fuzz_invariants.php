@@ -175,6 +175,44 @@ function inv_all(\Vip\LocalDb $db, string $ST, int $thrVisits, int $thrAmountCen
         }
     }
 
+    /**
+     * ⑨c 【别拿被测代码自己算的数当标尺】净计次不得超过
+     *     「总份数 − 这一单已核销的券数」。
+     *
+     * ⑨b 拿的是 pos_order.portions_counted —— 可那正是被测代码写进去的
+     * 净份数。它自己算错时，⑨b 跟着一起错，两边正好抵消：
+     * 实测「一桌两张券只扣得掉一份」这个白送，⑨b 在 50 个种子里
+     * 一个都没红（docs/13 §3.6「期望值复用了被测代码」）。
+     *
+     * 这一条改用两个【App 自己确知】的地面真值：
+     *   · portions_gross      —— 券抵之前的总份数（019）
+     *   · 该单 status=2 的券数 —— 一张券 = 一份免费套餐
+     * 两者都不经过 markRedeemedByApp 那段算术，所以它错了这里会红。
+     *
+     * ★ 顺带把镜像本身也查一遍：净份数不得高于「总份数 − 券数」。
+     *   （可以更低 —— 匹配串反推出来的份数可能比券数多，那是对的。）
+     */
+    foreach ($q("SELECT o.serial_id, o.portions_gross, o.portions_counted,
+                   (SELECT COUNT(*) FROM coupon c
+                     WHERE c.store_code=o.store_code AND c.redeemed_serial_id=o.serial_id
+                       AND c.status=2) redeemed,
+                   (SELECT COALESCE(SUM(l.counted_visit),0) FROM point_ledger l
+                     WHERE l.store_code=o.store_code AND l.serial_id=o.serial_id) nv
+                   FROM pos_order o
+                  WHERE o.store_code=? AND o.portions_gross > 0",[$ST]) as $o) {
+        // 券比份数还多是客人自己把券用亏了（净份数正确地夹在 0），
+        // 不是店里的损失 —— 所以下限取 0
+        $paid = max(0, (int)$o['portions_gross'] - (int)$o['redeemed']);
+        if ((int)$o['portions_counted'] > $paid) {
+            $bad[] = "⑨c镜像: 单{$o['serial_id']} 净份数{$o['portions_counted']} > "
+                   . "总份数{$o['portions_gross']}−券{$o['redeemed']}={$paid}";
+        }
+        if ($vmode === 'by_portion' && (int)$o['nv'] > $paid) {
+            $bad[] = "⑨c白送: 单{$o['serial_id']} 实付份数{$paid}"
+                   . "（总{$o['portions_gross']}−券{$o['redeemed']}），却记着 {$o['nv']} 次";
+        }
+    }
+
     // ⑩ 被标记已冲正的流水必须指向一条冲正流水
     foreach ($q("SELECT id,status,reversed_by_id FROM point_ledger
                   WHERE store_code=? AND status=2 AND reversed_by_id IS NULL",[$ST]) as $r)

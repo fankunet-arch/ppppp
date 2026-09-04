@@ -102,7 +102,10 @@ $pick=fn(array $a)=>$a[mt_rand(0,count($a)-1)];
 $curThrV=3; $curThrA=10000; $curMode='visits';
 
 for($step=1;$step<=$STEPS;$step++){
-  $ops=['grant','grant','grant','reverse','redeem','check','claw','verify','shrink','expire','manual','pending','void'];
+  // ★ redeem2 = 同一张单上连核两张券（家庭桌里两位都攒够了）。
+  //   纯随机撒券几乎撞不出这一档 —— 实测跑完 250 步，8 张单里
+  //   单张最多只有 1 张券，而白送恰恰长在第二张上。
+  $ops=['grant','grant','grant','reverse','redeem','redeem2','check','claw','verify','shrink','expire','manual','pending','void'];
   if(!$STABLE){ $ops[]='thr'; $ops[]='mode'; }
   $op=$pick($ops);
   $desc=$op;
@@ -126,8 +129,34 @@ for($step=1;$step<=$STEPS;$step++){
         $app->points()->reverse((int)$r['id'],'fuzz撤销',$OP); break; }
       case 'redeem': {
         $c=$pickRow($db,"SELECT id,member_id FROM coupon WHERE store_code=? AND status=1 ORDER BY id",[ST]);
-        if(!$c) break; $ser=$pick($SER); $desc="redeem c{$c['id']} on $ser";
+        if(!$c) break;
+        /**
+         * ★ 有三分之一的概率【往已经用过券的那一单上再核销一张】。
+         *
+         *   纯随机撒到 8 张单上，「一桌两张券」几乎撞不出来 ——
+         *   实测跑完 250 步，8 张单最多只有 1 张券。而那正是家庭桌
+         *   （两位都攒够了）最常见的样子，也正是 markRedeemedByApp
+         *   把 is_redeemed 这个布尔当计数用时会白送的那一档。
+         *   随机化测试撞不到的场景，等于没测。
+         */
+        $ser=$pick($SER);
+        if (mt_rand(1,3)===1) {
+          $hot=$db->all("SELECT DISTINCT redeemed_serial_id s FROM coupon
+                          WHERE store_code=? AND status=2 AND redeemed_serial_id IS NOT NULL
+                          ORDER BY redeemed_serial_id",[ST]);
+          if($hot) $ser=(string)$hot[mt_rand(0,count($hot)-1)]['s'];
+        }
+        $desc="redeem c{$c['id']} on $ser";
         $app->rewards()->redeem((int)$c['id'],$ser,$OP,null,['reason'=>'fuzz']); break; }
+      case 'redeem2': {
+        // 同一张单上连核两张券
+        $cs=$db->all("SELECT id FROM coupon WHERE store_code=? AND status=1 ORDER BY id",[ST]);
+        if(count($cs)<2) break;
+        $i=mt_rand(0,count($cs)-1); $j=mt_rand(0,count($cs)-1); if($j===$i) $j=($i+1)%count($cs);
+        $ser=$pick($SER); $desc="redeem2 c{$cs[$i]['id']}+c{$cs[$j]['id']} on $ser";
+        $app->rewards()->redeem((int)$cs[$i]['id'],$ser,$OP,null,['reason'=>'fuzz']);
+        $app->rewards()->redeem((int)$cs[$j]['id'],$ser,$OP,null,['reason'=>'fuzz']);
+        break; }
       case 'check': { $m=$pick($MEM); $desc="check m$m"; $app->rewards()->checkAndGrant($m,$OP); break; }
       case 'pending':{ $m=$pick($MEM); $desc="pending m$m"; $app->rewards()->issuePending($m,$OP); break; }
       case 'claw':  { $m=$pick($MEM); $desc="claw m$m"; $app->rewards()->clawBackOverIssued($m,$OP,'fuzz回收'); break; }
@@ -195,6 +224,20 @@ else{
   }
   printf("     最后 12 步：\n");
   foreach(array_slice($hist,-12) as $i=>$h) printf("       %s\n",$h);
+}
+/**
+ * FUZZ_DUMP=1：跑完把 8 张单的「总份数 / 净份数 / 券数」打出来。
+ *
+ * 用来回答「随机化测试到底有没有走到那个形状」—— 这不是锦上添花：
+ * 「一桌两张券」那条白送，不变量写对了却连着 50 个种子不红，
+ * 正是因为纯随机撒券根本撞不出第二张（每张单最多 1 张券）。
+ * 断言不红有两种可能：代码是对的，或者【场景压根没发生】。
+ */
+if (getenv('FUZZ_DUMP')) {
+  foreach($db->all("SELECT o.serial_id,o.portions_gross,o.portions_counted,
+      (SELECT COUNT(*) FROM coupon c WHERE c.store_code=o.store_code AND c.redeemed_serial_id=o.serial_id AND c.status=2) rd
+      FROM pos_order o WHERE o.store_code=?",[ST]) as $r)
+    printf("   单%s 总%s 净%s 券%s\n",$r['serial_id'],$r['portions_gross'],$r['portions_counted'],$r['rd']);
 }
 foreach (TBL as $t){ try{$db->exec("DELETE FROM {$t} WHERE store_code=?",[ST]);}catch(\Throwable $e){} }
 exit($viol===null?0:1);

@@ -352,6 +352,10 @@ final class PointsService
             // ★ 存【净】份数：被券抵掉的那几份本来就不该计次，
             //   存净值后 validateAllocations 天然把分配上限卡对。
             'portions_counted'   => $netPortions,
+            // ★ 同时存【总】份数（券抵之前）。核销时要按它重算净份数 ——
+            //   否则 markRedeemedByApp 只能靠 is_redeemed 这个布尔去减，
+            //   一桌两张券就少扣一份（迁移 019）。
+            'portions_gross'     => $analysis['portions_counted'],
             'portions_uncounted' => $analysis['portions_uncounted'],
             'is_redeemed'        => $isRedeemed,
             'redeem_cents'       => $analysis['redeem_cents'],
