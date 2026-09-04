@@ -799,6 +799,20 @@ $api->on('POST', '/points/grant', static function () use ($app, $requireOperator
     if (!in_array($mode, [PE::MODE_WHOLE, PE::MODE_SPLIT, PE::MODE_PICK], true)) {
         Api::fail('bad_request');
     }
+    /**
+     * ★ 先把条数框住，再开始逐条转换。
+     *
+     *   一张桌子最多坐十几个人，这个上限任何正常客户端都碰不到。
+     *   加它不是因为观测到了卡死 —— 实测 10 万条（4.7 MB）也只是
+     *   1.77 秒后被 member_already_on_order 挡掉，业务闸门跑在前面。
+     *   加它是因为【那是巧合】：闸门在 grantOne 里，而 Money::toCents
+     *   这一趟循环在闸门之前，条数完全由客户端说了算。
+     *   哪天有人把校验顺序挪一下，这里就成了一个无界循环。
+     *   而 POS 主机性能极度受限，一次 1.77 秒的空转本身也不该白给。
+     */
+    if (count($allocs) > 100) {
+        Api::fail('too_many_members', 400, ['given' => count($allocs), 'max' => 100]);
+    }
 
     $clean = [];
     foreach ($allocs as $a) {

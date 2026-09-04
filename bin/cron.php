@@ -81,28 +81,56 @@ $log = static function (string $m) use ($verbose): void {
 /**
  * 并发锁 —— 上一次没跑完就被下一次叠上，会造成重复抓取与水位线错乱。
  * 用文件锁，不依赖数据库（数据库正是可能卡住的那一环）。
+ *
+ * ── 🔴 锁要按「抢的是哪件事」取名，不是按「哪个任务」 ──────────
+ *
+ * 第一版每个任务用自己的任务名当锁名，于是 nightly 和 incremental
+ * 各拿各的锁 —— 而 nightly 里【第一步就是 incremental】。
+ * 营业时段最后一轮 01:40 的增量补抓要是还没跑完（POS 慢、积压多，
+ * 上限是 200 批），03:15 的 nightly 照样开跑，两个进程同时推同一条
+ * 水位线：正是这把锁本来要防的那件事。
+ * integrity / menu-audit / compliance 三个任务则【一把锁都没有】。
+ *
+ * 改成按资源取名，一个任务把它要碰的资源锁全拿上：
+ *   sync        增量补抓（水位线）
+ *   verify      值比对冲正（订单镜像与流水）
+ *   maintenance 巡检 / 合规 / 完整性（只读为主，但都会打告警）
+ *
+ * ★ 全部 LOCK_NB、按固定顺序拿：拿不到就整轮跳过，绝不等待，
+ *   所以不会有「两个 cron 各拿一半互相等」的死锁。
+ *
+ * @param string|string[] $names
  */
-function withLock(string $name, callable $fn): mixed
+function withLock(array|string $names, callable $fn): mixed
 {
+    $names = (array)$names;
+    sort($names);                       // 固定顺序，配合 LOCK_NB 就不会互等
     // sys_get_temp_dir() 在 Windows 下返回带反斜杠的路径，两个分隔符都剥
     $dir = rtrim(sys_get_temp_dir(), "/\\") . '/vip-cron';
     if (!is_dir($dir)) {
         @mkdir($dir, 0700, true);
     }
-    $fh = fopen($dir . '/' . preg_replace('/[^a-z0-9_-]/i', '_', $name) . '.lock', 'c');
-    if ($fh === false) {
-        throw new RuntimeException('无法创建锁文件');
+
+    $held = [];
+    foreach ($names as $name) {
+        $fh = fopen($dir . '/' . preg_replace('/[^a-z0-9_-]/i', '_', $name) . '.lock', 'c');
+        if ($fh === false) {
+            foreach ($held as $h) { flock($h, LOCK_UN); fclose($h); }
+            throw new RuntimeException('无法创建锁文件');
+        }
+        if (!flock($fh, LOCK_EX | LOCK_NB)) {
+            fclose($fh);
+            foreach ($held as $h) { flock($h, LOCK_UN); fclose($h); }
+            echo "另一轮任务正占着「{$name}」，本次跳过\n";
+            return null;
+        }
+        $held[] = $fh;
     }
-    if (!flock($fh, LOCK_EX | LOCK_NB)) {
-        fclose($fh);
-        echo "上一轮 {$name} 仍在运行，本次跳过\n";
-        return null;
-    }
+
     try {
         return $fn();
     } finally {
-        flock($fh, LOCK_UN);
-        fclose($fh);
+        foreach ($held as $h) { flock($h, LOCK_UN); fclose($h); }
     }
 }
 
@@ -119,14 +147,16 @@ try {
 
         // ── 营业时段：增量补抓 ────────────────────────────
         case 'incremental':
-            withLock('incremental', function () use ($app, $log): void {
+            withLock('sync', function () use ($app, $log): void {
                 out('增量补抓', $app->sync()->incremental($log));
             });
             break;
 
         // ── 夜间全套（03:00–05:00）────────────────────────
         case 'nightly':
-            withLock('nightly', function () use ($app, $log): void {
+            // ★ 三把锁全拿：这一轮里 incremental / verify / 各类巡检都要跑，
+            //   任何一件正被别的 cron 占着，整轮就跳过
+            withLock(['sync', 'verify', 'maintenance'], function () use ($app, $log): void {
                 // 顺序有讲究：先把订单补齐，再做值比对，最后才是巡检类
                 out('增量补抓',   $app->sync()->incremental($log));
                 out('值比对冲正', $app->reconcile()->verifyAmounts($log));
@@ -143,15 +173,18 @@ try {
             break;
 
         case 'integrity':
-            out('完整性监控', $app->sync()->checkIntegrity($argInt(0, 7)));
+            withLock('maintenance',
+                fn() => out('完整性监控', $app->sync()->checkIntegrity($argInt(0, 7))));
             break;
 
         case 'menu-audit':
-            out('规则表巡检', $app->maintenance()->auditMenuRules($log));
+            withLock('maintenance',
+                fn() => out('规则表巡检', $app->maintenance()->auditMenuRules($log)));
             break;
 
         case 'compliance':
-            out('合规到期', $app->maintenance()->expireUnconfirmedMembers($log));
+            withLock('maintenance',
+                fn() => out('合规到期', $app->maintenance()->expireUnconfirmedMembers($log)));
             break;
 
         // ── 状态速查 ──────────────────────────────────────
