@@ -270,6 +270,34 @@ ok(($h['local_db'] ?? false) === true, '  └ 本地库连得上');
 ok(isset($h['app_version']), '  └ 报了 app_version（Pad 靠它判断要不要自动更新）');
 ok(isset($h['default_lang']), '  └ 报了 default_lang（登录页要用）');
 
+/**
+ * ── 🔴 /health 必须答得出「POS 侧还在出单吗」──────────────────
+ *
+ * docs/08 §0.1 让现场第一个打开的就是这个接口，而它原来只答
+ * 「连得上吗」。连得上就是绿的 —— 于是最难查的那一类故障
+ * （连得上、但按桌号永远查不到刚买单的桌）在这里看不出任何异常。
+ *
+ * 那一类的成因至少四种，在 Pad 上长得一模一样：POS 写单的时钟与
+ * 主库 NOW() 不是同一个（时区配错，此时 PHP 与 POS 的 NOW() 完全一致，
+ * 时钟偏差告警一声不响）、连到了备份库或错的库、POS 停止写
+ * history_order_head、店里还没开始营业。
+ *
+ * 前三种都不是「时间窗太窄」，而按桌号查不到时最容易做的动作恰恰是
+ * 把窗口调大 —— 那只会把陈年旧单放进来，把真正的问题盖住。
+ */
+if (($h['pos_db'] ?? false) === true) {
+    ok(array_key_exists('pos_data', $h),
+       '★★ /health 报了 POS 侧的数据新鲜度（pos_data）—— 「连得上」不等于「有新单」');
+    $pd = $h['pos_data'] ?? null;
+    ok(is_array($pd) && array_key_exists('newest_order_at', $pd)
+       && array_key_exists('newest_age_minutes', $pd) && isset($pd['pos_now']),
+       '  └ 带着 POS 的 NOW()、最新一张单的时间、以及它有多旧');
+    ok(array_key_exists('pos_stale_note', $h),
+       '  └ 太旧时给一句人话（正常时是 null，不给正常的店推噪音）');
+} else {
+    ok(($h['pos_note'] ?? null) !== null, '  └ POS 连不上时给了降级提示');
+}
+
 [$st, $raw, $j] = req($BASE . '/api.php/card/lookup', 'POST', ['card_no' => 'TK-99999999-ZZZ'], $padJar);
 ok($st === 422, '★ 查一张不存在的卡回 422 而不是 404（404 会被 nginx 换掉）', brief($st, $raw, $j));
 ok(($j['error'] ?? '') === 'card_unknown', '  └ 错误码是 card_unknown');

@@ -5708,6 +5708,7 @@ $msPos = new class (new FakePosSource()) implements Vip\PosSource {
     public function fetchMajorGroups(): array { return $this->inner->fetchMajorGroups(); }
     public function fetchFamilyGroups(): array { return $this->inner->fetchFamilyGroups(); }
     public function countInRange(string $f, string $t): int { return $this->inner->countInRange($f, $t); }
+    public function newestOrderEndTime(): ?string { return $this->inner->newestOrderEndTime(); }
 };
 $msApp->setPosSource($msPos);
 $msT0 = microtime(true);

@@ -40,4 +40,5 @@ final class ExplodingPos implements PosSource
     public function fetchMajorGroups(): array { $this->boom('fetchMajorGroups'); }
     public function fetchFamilyGroups(): array { $this->boom('fetchFamilyGroups'); }
     public function countInRange(string $f, string $t): int { $this->boom('countInRange'); }
+    public function newestOrderEndTime(): ?string { $this->boom('newestOrderEndTime'); }
 }

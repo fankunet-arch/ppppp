@@ -261,4 +261,41 @@ final class PosReader implements PosSource
         );
         return (int)($r[0]['c'] ?? 0);
     }
+
+    /**
+     * POS 侧【最新一张已结账的单】是什么时候 —— 用来分辨两件长得一样的事。
+     *
+     * ── 🔴 「查不到这张单」和「整个 POS 都没有新单」不是一回事 ──────
+     *
+     * 按桌号定位的四个条件里，时间窗那一条最容易被误诊：
+     * 界面上一律显示「未找到」，而 `why.php` 看见「这张单超出时间窗」
+     * 就会建议把窗口调大 —— 如果真相是【整个 POS 侧最近几小时一张新单都没有】，
+     * 那个建议是错的，照做只会把陈年旧单放进来，把真正的问题盖住。
+     *
+     * 实测能造成这个局面的，至少有四种，而它们在 Pad 上长得一模一样：
+     *   · POS 写 order_end_time 用的时钟与 NOW() 不是同一个（时区配错）——
+     *     **PHP 与 POS 的 NOW() 会完全一致，现有的时钟偏差告警一声不响**；
+     *   · 配置指到了 POS 库的**备份/旧副本**，或指错了库；
+     *   · POS 那一侧停止写 history_order_head（升级、换版本、磁盘满）；
+     *   · 门店真的还没开始营业。
+     *
+     * 前三种都不是「窗口太窄」，而 `/health` 只答「连得上吗」，
+     * 连得上就是绿的 —— 于是现场看到的是「一切正常，但就是查不到单」。
+     *
+     * ★ 只查一行、命中 idx_order_end_time，代价与 countInRange 同级。
+     * ★ 不过滤 eat_type / table_name：这里问的是「POS 还在写单吗」，
+     *   不是「这张单能不能发分」。
+     *
+     * @return string|null 'Y-m-d H:i:s'；一张已结账的单都没有时返回 null
+     */
+    public function newestOrderEndTime(): ?string
+    {
+        $r = $this->db->select(
+            'SELECT order_end_time FROM history_order_head
+              WHERE order_end_time IS NOT NULL
+              ORDER BY order_end_time DESC LIMIT 1'
+        );
+        $v = $r[0]['order_end_time'] ?? null;
+        return $v === null ? null : (string)$v;
+    }
 }

@@ -244,7 +244,94 @@ if ($miss) {
 }
 
 // ── 6. 日志位置 ───────────────────────────────────────────
-$hd('⑥ 错误日志');
+/**
+ * ── ⑥ POS 主库：连得上，还要「有新单」──────────────────────
+ *
+ * 这一节是照着现场那句「按桌号就是查不到刚买单的桌，也不知道为什么」加的。
+ *
+ * 按桌号定位要求 order_end_time 落在时间窗内（出厂 30 分钟）。
+ * 下面这几种局面都会让它恒为空，而在 Pad 上长得一模一样（「未找到」）：
+ *   · POS 写 order_end_time 用的时钟与主库 NOW() 不是同一个（时区配错）
+ *     —— 最阴的一种：PHP 与 POS 的 NOW() 会完全一致，
+ *     现有的时钟偏差告警（阈值一整天）一声不响；
+ *   · pos_db 指到了备份库或旧副本，或指错了库；
+ *   · POS 那一侧停止写 history_order_head；
+ *   · 店里现在确实还没有人买单。
+ *
+ * 前三种都不是「时间窗太窄」，而现场最容易做的动作恰恰是把窗口调大 ——
+ * 那只会把陈年旧单放进来，把真正的问题盖住。所以这里直接把
+ * 「主库现在几点」和「最新一张单几点」并排摆出来，让人一眼能对。
+ */
+$hd('⑥ POS 主库（只读）');
+/**
+ * ★ 这一节也【不用 autoloader】—— 与本文件其余部分同一条规矩：
+ *   diag 的全部价值就在于「什么都坏了它还能跑」。所以直接用 mysqli，
+ *   顺带把「mysqli 能不能连主库」这件事本身也验了，
+ *   不依赖 app/ 那一层是否装配得起来。
+ */
+$pc = $cfg['pos_db'] ?? [];
+if (!extension_loaded('mysqli')) {
+    $no('mysqli 没装，POS 侧无法检查（上面②已经报过）');
+} elseif (($pc['host'] ?? '') === '') {
+    $wa('config.php 里没有配 pos_db —— 只用手工录入的话可以，按桌号查单则用不了');
+} else {
+    $pm = mysqli_init();
+    $pm->options(MYSQLI_OPT_CONNECT_TIMEOUT, (int)($pc['connect_timeout'] ?? 3));
+    $pm->options(MYSQLI_OPT_READ_TIMEOUT,    (int)($pc['read_timeout'] ?? 5));
+    try {
+        @$pm->real_connect((string)$pc['host'], (string)$pc['user'], (string)$pc['password'],
+                           (string)$pc['database'], (int)($pc['port'] ?? 3306));
+        $ok(sprintf('连得上：%s@%s/%s', (string)$pc['user'], (string)$pc['host'], (string)$pc['database']));
+
+        $posNow = (string)($pm->query('SELECT NOW() AS n')->fetch_assoc()['n'] ?? '');
+        $r = $pm->query('SELECT MAX(order_end_time) AS t FROM history_order_head');
+        $newest = $r ? ($r->fetch_assoc()['t'] ?? null) : null;
+
+        echo "     主库 NOW()        {$posNow}\n";
+        if ($newest === null) {
+            $no('history_order_head 里一张已结账的单都没有 —— 多半是连错了库');
+            $fail++;
+        } else {
+            $age = (int)floor((strtotime($posNow) - strtotime((string)$newest)) / 60);
+            echo "     最新一张已结账单  {$newest}（{$age} 分钟前）\n";
+            /**
+             * ── 🔴 「连得上」不等于「有新单」──────────────────────
+             *
+             * 按桌号定位要求 order_end_time 落在时间窗内（出厂 30 分钟）。
+             * 下面几种局面都会让它恒为空，而在 Pad 上长得一模一样（「未找到」）：
+             *   · POS 写 order_end_time 用的时钟与主库 NOW() 不是同一个（时区配错）
+             *     —— 最阴的一种：PHP 与 POS 的 NOW() 会完全一致，
+             *     现有的时钟偏差告警（阈值一整天）一声不响；
+             *   · pos_db 指到了备份库或旧副本，或指错了库；
+             *   · POS 那一侧停止写 history_order_head；
+             *   · 店里现在确实还没有人买单。
+             *
+             * 前三种都不是「时间窗太窄」，而现场最容易做的动作恰恰是把窗口调大 ——
+             * 那只会把陈年旧单放进来，把真正的问题盖住。
+             */
+            if ($age > 120) {
+                $no("最新一张单已经是 {$age} 分钟前 —— 按桌号（默认只找近 30 分钟）会一直查不到");
+                echo "     \033[33m→ 店里刚刚还在买单的话，这【不是】时间窗太窄。按可能性查：\033[0m\n";
+                echo "     \033[33m  ① POS 写单的时钟与主库 NOW() 不是同一个（时区配错）——\033[0m\n";
+                echo "     \033[33m     拿一张刚打的小票，对照它上面的时间和上面那个 NOW()\033[0m\n";
+                echo "     \033[33m  ② config.php 的 pos_db 指到了备份库或旧副本（确认 host / database）\033[0m\n";
+                echo "     \033[33m  ③ POS 那一侧不再写 history_order_head（升级、换版本、磁盘满）\033[0m\n";
+                echo "     \033[33m  ④ 现在确实还没有人买单 —— 那就等有单了再看一次\033[0m\n";
+                $fail++;
+            } else {
+                $ok('POS 侧在正常出单');
+            }
+        }
+        @$pm->close();
+    } catch (\Throwable $e) {
+        $no('连不上 POS 主库：' . $e->getMessage());
+        echo "     \033[33m→ 收银流程仍可继续（手工录入），但按桌号/小票号查单会一直查不到\033[0m\n";
+        echo "     \033[33m  先确认 pos_db 的 host / port / user / password / database\033[0m\n";
+        $fail++;
+    }
+}
+
+$hd('⑦ 错误日志');
 $logDir = $cfg['log_path'] ?? (__DIR__ . '/../var/log');
 $logFile = rtrim((string)$logDir, "/\\") . '/php-error.log';
 if (is_file($logFile)) {
