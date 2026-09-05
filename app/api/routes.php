@@ -58,8 +58,41 @@ $api->on('GET', '/health', static function () use ($app): void {
     // POS 不可达不算系统故障 —— 降级路径仍可用
     $posOk = true;
     $posMsg = null;
+    $posStale = null;
     try {
-        $app->posReader()->now();
+        $posNow = $app->posReader()->now();
+        /**
+         * ── 🔴 「连得上」不等于「有新单」──────────────────────
+         *
+         * 这个接口是 docs/08 §0.1 让人**第一个打开**的东西，而它原来只答
+         * 「连得上吗」。连得上就是绿的 —— 于是现场看到的是
+         * 「一切正常，但按桌号就是查不到刚买单的桌」，没有任何线索。
+         *
+         * 而按桌号定位要求 order_end_time 落在时间窗内（出厂 30 分钟）。
+         * 下面这四种局面都会让它恒为空，且在 Pad 上长得一模一样：
+         *   · POS 写 order_end_time 用的时钟与 NOW() 不是同一个（时区配错）
+         *     —— 此时 PHP 与 POS 的 NOW() 完全一致，时钟偏差告警一声不响；
+         *   · 配置指到了 POS 库的备份/旧副本，或指错了库；
+         *   · POS 那一侧停止写 history_order_head；
+         *   · 门店真的还没开始营业。
+         *
+         * 所以这里多答一句「POS 侧最新一张单是多久以前」。
+         * 它分得开「这一张单查不到」和「整个 POS 都没有新单」——
+         * 后者不是把时间窗调大能解决的。
+         *
+         * ★ 一行查询、命中 idx_order_end_time，不会给主库添负担。
+         * ★ 取不到就当没这回事：/health 的全部职责是「出问题时还能答话」，
+         *   不能为了一个诊断字段把唯一的诊断入口拖垮。
+         */
+        try {
+            $newest = $app->posReader()->newestOrderEndTime();
+            $posStale = [
+                'pos_now'            => $posNow,
+                'newest_order_at'    => $newest,
+                'newest_age_minutes' => $newest === null ? null
+                    : (int)floor((strtotime($posNow) - strtotime($newest)) / 60),
+            ];
+        } catch (\Throwable) { /* 诊断字段而已，取不到就算了 */ }
     } catch (\Throwable $e) {
         $posOk  = false;
         $posMsg = 'POS 主库暂时无法访问，收银流程可继续（手工录入）';
@@ -88,8 +121,31 @@ $api->on('GET', '/health', static function () use ($app): void {
         } catch (\Throwable) { /* 保持回落值 */ }
     }
 
+    /**
+     * ★ 只在「确实不新」时才多说一句，别给正常的店天天推噪音。
+     *   判据用【定位窗口的两倍】：一倍会在午市与晚市之间的空档误报，
+     *   而两倍还不够新，就真的该有人看一眼了。
+     */
+    $posStaleNote = null;
+    if ($posStale !== null) {
+        $win = max(1, $localOk ? $app->cfg()->int('order_lookup_window_min', 30) : 30);
+        $age = $posStale['newest_age_minutes'];
+        if ($age === null) {
+            $posStaleNote = 'POS 侧一张已结账的单都没有 —— 请确认连的是不是正确的库';
+        } elseif ($age > $win * 2) {
+            $posStaleNote = sprintf(
+                'POS 侧最新一张已结账的单是 %d 分钟前（%s），而按桌号只找最近 %d 分钟的单。'
+              . '如果店里刚刚还在买单，那多半不是「时间窗太窄」—— 而是'
+              . '① POS 写单的时钟与主库 NOW() 不是同一个（时区配错）'
+              . '② 连到了备份库或错的库 ③ POS 那边不再写 history_order_head。'
+              . '把窗口调大只会把陈年旧单放进来，把真正的问题盖住',
+                $age, (string)$posStale['newest_order_at'], $win);
+        }
+    }
+
     Api::ok([
         'local_db' => $localOk, 'pos_db' => $posOk, 'pos_note' => $posMsg,
+        'pos_data' => $posStale, 'pos_stale_note' => $posStaleNote,
         'default_lang' => $defaultLang,
         'app_version'  => vip_app_version([
             'index.php', 'assets/pad.js', 'assets/pad.css',

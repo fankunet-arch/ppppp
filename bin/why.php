@@ -203,8 +203,45 @@ if ($table !== '') {
         $tooOld = array_filter($rows, static fn($r) =>
             (strtotime($nowRow) - strtotime((string)$r['order_end_time'])) / 60 > $win);
         if (count($tooOld) === count($rows)) {
-            tip("全部超出时间窗。要么现在就发分，要么到后台把「订单查找 → 回溯时间窗」从 {$win} 分钟调大");
-            tip('也可以让收银员改用小票上的 Factura Simplificada 号查单 —— 那条路不受时间窗限制');
+            /**
+             * ── 🔴 先分清是「这张单旧」还是「整个 POS 都没有新单」──────
+             *
+             * 这两件事在 Pad 上长得一模一样（都是「未找到」），
+             * 而给出的建议正好相反：
+             *   · 这张单确实旧 → 调大时间窗，或改用小票号查，都对；
+             *   · 整个 POS 侧最近几小时一张新单都没有 → 调大窗口是【错的】，
+             *     只会把陈年旧单放进来，把真正的问题盖住。
+             *
+             * 后者的成因至少有四种，而它们都不是「窗口太窄」：
+             *   ① POS 写 order_end_time 用的时钟与主库 NOW() 不是同一个（时区配错）
+             *      —— 这一种最阴：PHP 与 POS 的 NOW() 会完全一致，
+             *      现有的 pos_clock_skew 告警（阈值一整天）一声不响；
+             *   ② 配置指到了 POS 库的备份/旧副本，或指错了库；
+             *   ③ POS 那一侧停止写 history_order_head（升级、换版、磁盘满）；
+             *   ④ 门店真的还没开始营业。
+             *
+             * 判据：拿【全表最新一张单】和 NOW() 比，而不是只看这张桌。
+             */
+            $newest = $db->select(
+                'SELECT MAX(order_end_time) AS t FROM history_order_head LIMIT 1'
+            )[0]['t'] ?? null;
+            $globalAge = $newest === null ? null
+                : (int)round((strtotime($nowRow) - strtotime((string)$newest)) / 60);
+
+            if ($globalAge !== null && $globalAge > $win * 2) {
+                no_(sprintf('POS 侧【全表】最新一张单也是 %d 分钟前（%s），主库 NOW() = %s',
+                    $globalAge, (string)$newest, $nowRow));
+                tip('这不是「时间窗太窄」—— 是整个 POS 侧就没有新单。把窗口调大只会把陈年旧单放进来');
+                tip('按可能性从高到低查：');
+                tip('  ① POS 写单的时钟与主库 NOW() 不是同一个（时区配错）——'
+                  . ' 拿一张刚打的小票，对照它上面的时间和上面这个 NOW()');
+                tip('  ② config.php 的 pos_db 指到了备份库或旧副本 —— 确认 host/database');
+                tip('  ③ POS 那一侧不再写 history_order_head（升级、换版本、磁盘满）');
+                tip('  ④ 店里现在确实还没有人买单');
+            } else {
+                tip("全部超出时间窗。要么现在就发分，要么到后台把「订单查找 → 回溯时间窗」从 {$win} 分钟调大");
+                tip('也可以让收银员改用小票上的 Factura Simplificada 号查单 —— 那条路不受时间窗限制');
+            }
         }
     }
 

@@ -67,6 +67,38 @@ GRANT ALL ON sim_coolroid.* TO 'sim_admin'@'127.0.0.1';
 >   `order_detail_id` 区间的 76%，因此少数订单缺行、
 >   `SUM(actual_price)` 对不上 `original_amount`（详见 `docs/01` §3.3.1）
 
+## 2.5 没有那份真实导出怎么办
+
+`inject_live.php` 是把**真实历史订单**克隆到当下，效果最好 —— 但它要求库里
+先有 `history_order_head` / `history_order_detail` 的导出，而**那份数据不在仓库里**
+（`pdb/` 只有 100 行明细样本）。没有它时 `inject_live.php` 一张单也造不出来，
+表现是 `e2e_pos.php` 报「模拟活单已过期：桌 30 未注入」。
+
+这时用 `pos_write.php` 造最小可用活单：
+
+```bash
+SIM_USER=sim_admin SIM_PASS=... php tests/sim/pos_write.php 30 3       # 桌 30，3 分钟前买单
+SIM_USER=... php tests/sim/pos_write.php Llevar 5 3                    # 外带（Pad 不该定位到）
+SIM_USER=... php tests/sim/pos_write.php 31 45                         # 45 分钟前 → 超出 30 分钟窗口
+```
+
+够跑通「按桌号查已买单的桌 → 记账 → 发券 → 核销」这条主链路，也够验证
+mysqli → PosDb → PosReader 的真实链路与只读权限。
+
+> ⚠️ 它**造不出**多 check 分单、订单级折扣、`-2` 核销伪行这几种脏数据。
+> `e2e_pos.php` 里依赖那些形状的断言（AA 分单聚合、核销额反推份数等）
+> 仍然需要真实导出 —— 没有导出时它们会红，那不是代码问题。
+
+### 索引断言要在接近真实规模的库上跑
+
+`e2e_pos.php` ② 那一节验的是「每条 POS 查询都命中索引」。
+**表太小时全表扫是优化器的正确选择**，不是缺陷 —— 实测模拟库只有 13 行时
+`findRecentByTable` 的计划是 `type=ALL`，而 88,616 行（真实规模）时它稳稳走
+`idx_order_end_time`（`type=range, rows=39`）。
+
+现在行数不足 5,000 时这条断言会**跳过并说明原因**，不再报一个不存在的性能问题。
+要真的验它，先把表灌到接近真实规模。
+
 ## 3. 注入活单
 
 真实数据最新到 2026-08-13，而 Pad 只找近 30 分钟的单，

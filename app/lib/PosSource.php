@@ -47,4 +47,11 @@ interface PosSource
 
     /** 某时间区间的订单数，数据完整性监控用 */
     public function countInRange(string $from, string $to): int;
+
+    /**
+     * 最新一张已结账单的时间；一张都没有时 null。
+     * 用来分辨「这张单查不到」与「整个 POS 都没有新单」——
+     * 详见 PosReader::newestOrderEndTime() 的说明。
+     */
+    public function newestOrderEndTime(): ?string;
 }

@@ -177,6 +177,18 @@ final class FakePosSource implements PosSource
         return $n;
     }
 
+    public function newestOrderEndTime(): ?string
+    {
+        $max = null;
+        foreach ($this->heads as $h) {
+            $t = (string)($h['order_end_time'] ?? '');
+            if ($t !== '' && ($max === null || $t > $max)) {
+                $max = $t;
+            }
+        }
+        return $max;
+    }
+
     // ── 构造夹具的便捷方法 ────────────────────────────────
 
     public function addHead(array $h): void

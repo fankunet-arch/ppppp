@@ -134,9 +134,30 @@ function withLock(array|string $names, callable $fn): mixed
     }
 }
 
+/**
+ * 把任务结果打成一行。
+ *
+ * ── 🔴 日志一行几千字就等于没有日志 ────────────────────────
+ *
+ * 原来是把整个返回值 json_encode 出来。而「规则表巡检」的返回里带着
+ * other_items —— 那是【只记录不告警】的酒水清单，实测这家店 32 瓶酒
+ * 全部高于价格线，于是每天夜里往 cron.log 里写一条三千多字符的行，
+ * 把它前后真正要看的东西全挤没了。
+ *
+ * 那份清单本来就是「不用处理」的东西（酒水永远不是餐费项），
+ * 留个数目就够；真要看明细，后台「套餐规则」页一直都在。
+ *
+ * ★ 判据：日志里留的应该是【要不要有人管】，不是【全部原始数据】。
+ */
 function out(string $title, array $r): void
 {
     $flag = ($r['ok'] ?? true) ? 'OK ' : '!! ';
+    // 明细类的大数组只留条数 —— 详情在后台页面里，不在夜间日志里
+    foreach (['other_items', 'new_items', 'findings', 'coupons'] as $k) {
+        if (isset($r[$k]) && is_array($r[$k]) && count($r[$k]) > 3) {
+            $r[$k] = count($r[$k]) . ' 项（详情见后台）';
+        }
+    }
     echo $flag . str_pad($title, 22) . json_encode($r, JSON_UNESCAPED_UNICODE) . "\n";
 }
 
