@@ -367,9 +367,15 @@ final class ConfigSchema
             'desc'  => '会附在确认码消息里。留空则不附 —— 但现场仍须口头告知',
         ],
         'consent_expire_days' => [
-            'group' => 'compliance', 'type' => 'int', 'unit' => '天',
+            // ★ positive_int：填 0 会把【所有尚未确认的会员】在下一次夜间任务里
+            //   当场假名化 —— 手机号、邮箱、生日一并抹掉，不可逆。
+            //   和 pii_retention_years 不同，这里没有「0 = 不启用」的语义
+            //   （那边的代码里有 if ($years <= 0) return; 这边没有）。
+            'group' => 'compliance', 'type' => 'positive_int', 'unit' => '天',
             'label' => '未确认会员的保留期',
-            'desc'  => '注册后多少天仍未完成双重确认，就冻结积分并把个人信息假名化',
+            'desc'  => '注册后多少天仍未完成双重确认，就冻结积分并把个人信息假名化。'
+                     . '★ 不能填 0 —— 那会在下一次夜间任务里把所有未确认会员的'
+                     . '个人信息当场抹掉，而且抹掉了就找不回来',
         ],
         'pii_retention_years' => [
             'group' => 'compliance', 'type' => 'int', 'unit' => '年',
@@ -401,14 +407,23 @@ final class ConfigSchema
             'desc'  => '★ 别调小。这是给 POS 喘气的时间',
         ],
         'sync_max_batches' => [
-            'group' => 'sync', 'type' => 'int', 'unit' => '批', 'advanced' => true,
+            // ★ positive_int：填 0 会让增量补抓与值比对的 while 循环
+            //   一轮都不跑（$batches < 0 恒假），两条夜间任务同时静默失效，
+            //   而它们都会正常回 {"ok":true}。实测同上。
+            'group' => 'sync', 'type' => 'positive_int', 'unit' => '批', 'advanced' => true,
             'label' => '单次最多跑几批',
-            'desc'  => '防止一次跑太久。触顶后水位线会推进，剩下的下次继续',
+            'desc'  => '防止一次跑太久。触顶后水位线会推进，剩下的下次继续。'
+                     . '★ 不能填 0 —— 那等于夜间任务一轮都不跑，而且它照样报成功',
         ],
         'verify_protect_days' => [
-            'group' => 'sync', 'type' => 'int', 'unit' => '天', 'advanced' => true,
+            // ★ positive_int：填 0 会让 pendingVerify 的时间窗退化成
+            //   「order_end_time >= 现在」—— 一张单都选不出来，值比对整条防线
+            //   静默关闭，而任务照样回 {"ok":true,"checked":0}。
+            //   实测：POS 把 50.00 改成 10.00，客人 50 分一分没退。
+            'group' => 'sync', 'type' => 'positive_int', 'unit' => '天', 'advanced' => true,
             'label' => '值比对保护期',
-            'desc'  => '发分后多少天内持续回读 POS 金额，发现改单就冲正',
+            'desc'  => '发分后多少天内持续回读 POS 金额，发现改单就冲正。'
+                     . '★ 不能填 0 —— 那等于把这条防线整个关掉，而且界面上看不出来',
         ],
         'verify_recheck_hours' => [
             'group' => 'sync', 'type' => 'positive_int', 'unit' => '小时', 'advanced' => true,
@@ -501,12 +516,23 @@ final class ConfigSchema
     }
 
     /** 校验一个值是否符合该项的类型 */
-    public static function validate(string $key, string $value): ?string
+    /**
+     * @param array<string,string> $current 库里现有的全部配置。
+     *        只有【要和别的项一起看才判得出来】的规则用得上它 ——
+     *        单项自己的格式校验一律不依赖它，缺了也照样能挡住乱填。
+     */
+    public static function validate(string $key, string $value, array $current = []): ?string
     {
         $meta = self::ITEMS[$key] ?? null;
         if ($meta === null) {
             return null;   // 未登记项不校验，交给调用方决定
         }
+
+        $cross = self::crossCheck($key, $value, $current);
+        if ($cross !== null) {
+            return $cross;
+        }
+
         return match ($meta['type']) {
             'bool'    => in_array($value, ['0', '1'], true) ? null : '只能是 0 或 1',
             'int'     => ctype_digit($value) ? null : '只能填非负整数',
@@ -569,6 +595,52 @@ final class ConfigSchema
      * 换成了 Dto. -15%）。真正兜底的是 SyncService::checkIntegrity() 里那条
      * 按比例的告警：核销占比异常高就报警，不依赖具体写了什么词。
      */
+    /**
+     * 要和【别的项】一起看才判得出来的规则。
+     *
+     * ── 🔴 值比对的复查间隔不能比保护期还长 ────────────────
+     *
+     *   F1 修的是「每张单一生只比一次」，修法是把复查间隔做成可配的
+     *   （verify_recheck_hours，出厂 168 小时 = 7 天）。但只校验了
+     *   「是个正整数」—— 填一个大于保护期（verify_protect_days，出厂 30 天）
+     *   的数，每张单在保护期内就又只会被比一次，**F1 原样回来**，
+     *   而且和当初一样静默：界面不报错、告警不响、值比对每晚照常「跑完」。
+     *
+     *   判据取【保护期的一半】而不是「小于保护期」：保护期内至少要能
+     *   完整地比到两次，这条防线才谈得上「反复回读」。
+     *
+     * ★ 两个方向都要拦：改复查间隔时看保护期，改保护期时也要看复查间隔，
+     *   否则把保护期从 30 天改成 3 天照样能绕过去 ——
+     *   「修了那一处没修那一类」（docs/13 §3.1）。
+     */
+    private static function crossCheck(string $key, string $value, array $current): ?string
+    {
+        if ($key !== 'verify_recheck_hours' && $key !== 'verify_protect_days') {
+            return null;
+        }
+        if (!ctype_digit($value)) {
+            return null;                    // 格式的事交给下面的类型校验说
+        }
+        $hours = $key === 'verify_recheck_hours'
+            ? (int)$value
+            : (int)($current['verify_recheck_hours'] ?? 168);
+        $days  = $key === 'verify_protect_days'
+            ? (int)$value
+            : (int)($current['verify_protect_days'] ?? 30);
+        if ($hours < 1 || $days < 1) {
+            return null;                    // 各自的类型校验会挡
+        }
+        if ($hours * 2 <= $days * 24) {
+            return null;
+        }
+        return sprintf(
+            '复查间隔（%d 小时）超过了保护期（%d 天）的一半 —— 那样每张单在保护期内'
+          . '最多只比得到一次，等于回到「一生只比一次」：POS 结账后才改的那 2.9%% 的单'
+          . '再也抓不到，积分与免费餐券都退不回来。'
+          . '请把复查间隔降到 %d 小时以内，或把保护期加长',
+            $hours, $days, intdiv($days * 24, 2));
+    }
+
     private static function checkRedeemPatterns(string $value): ?string
     {
         // 子串匹配、忽略大小写 —— 与 PointsEngine 判折扣行时的口径一致

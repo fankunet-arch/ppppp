@@ -1315,6 +1315,38 @@ async function loadRewardSlot(personIndex, memberId) {
   }
 }
 
+/**
+ * 核销成功之后，把这一屏的分摊【按新的份数重算一次】。
+ *
+ * ── 🔴 不做这件事会怎样（审计 F9）────────────────────────
+ *
+ *   ① locate      → 屏幕上「可分份数 4」，4 人各 1 份
+ *   ② 客人这时掏出券，收银员当场核销 → 订单净份数 4 → 3
+ *   ③ 照着屏幕上的数字提交 → exceeds_portions，整笔拒绝
+ *
+ * 补救办法一直存在（让页面重算一次），只是界面不会自己做 ——
+ * 于是一个完全可预期的状态变化，变成了柜台上的一次当面拒绝，
+ * 而客人就站在那里。错误提示也帮不上忙：它说的是「分配份数超过订单
+ * 套餐份数」，没人会从这句话想到「把用券那位从分摊里去掉」。
+ *
+ * ★ 用券那位的份数置 0 而不是把他整行删掉：他仍然在这一单上
+ *   （要给他记这一餐的消费额），只是那一份是免费的、不该再计次。
+ * ★ 新的份数从 /coupon/redeem 的响应里来，不再 locate 一次 ——
+ *   locate 会重写订单镜像的一整排列（docs/13 §3.0），
+ *   为了刷新一个数字去动那个，代价和风险都不对等。
+ */
+function applyRedeemToSplit(personIndex, after) {
+  if (!after || !S.order) return;
+  S.order.remaining_cents    = after.remaining_cents;
+  S.order.remaining_portions = after.remaining_portions;
+  renderSummary(S.order);
+
+  const p = S.people[personIndex];
+  if (p) { p.portions = 0; p.redeemed = true; }
+  renderPeople(true);
+  toast(T('reward.recalc', { portions: after.remaining_portions }), 'ok');
+}
+
 async function redeemCoupon(personIndex, memberId) {
   const slot = $(`[data-rw="${personIndex}"]`);
   const list = (slot && slot._coupons) || [];
@@ -1337,11 +1369,12 @@ async function redeemCoupon(personIndex, memberId) {
   if (pin === null) return offerForceRedeem(c, personIndex, memberId);
 
   try {
-    await api('/coupon/redeem', {
+    const r = await api('/coupon/redeem', {
       coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null, pin,
     });
     toast(T('reward.done', { code: c.code }), 'ok');
     loadRewardSlot(personIndex, memberId);
+    applyRedeemToSplit(personIndex, r && r.order);
   } catch (e) {
     toast(e.message, 'err');
     // PIN 这一类失败才提议强制核销；券本身的问题（过期、已用）提议也没用
@@ -1373,12 +1406,13 @@ async function offerForceRedeem(c, personIndex, memberId) {
   if (reason === null) return;
 
   try {
-    await api('/coupon/redeem', {
+    const r = await api('/coupon/redeem', {
       coupon_id: c.id, serial_id: S.order ? S.order.serial_id : null,
       force: true, reason,
     });
     toast(T('reward.forceDone', { code: c.code }), 'ok');
     loadRewardSlot(personIndex, memberId);
+    applyRedeemToSplit(personIndex, r && r.order);
   } catch (e) { toast(e.message, 'err'); }
 }
 

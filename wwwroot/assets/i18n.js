@@ -279,6 +279,8 @@
     'reward.redeem':      { zh: '核销',        es: 'Canjear' },
     'reward.done':        { zh: '券 {code} 已核销，请到 POS 打折',
                             es: 'Vale {code} canjeado, aplique el descuento en el TPV' },
+    'reward.recalc':      { zh: '这一位是用券免单的，已从分摊里去掉；本单还剩 {portions} 份可分',
+                            es: 'Esta persona come con vale: la hemos quitado del reparto; quedan {portions} raciones' },
     'reward.forceAsk':    { zh: '客人报不出 PIN？\n\n经理可以强制核销这张券。此操作会单独记入审计日志。',
                             es: '¿El cliente no sabe el PIN?\n\nUn encargado puede canjearlo igualmente. Queda registrado por separado.' },
     'reward.forceOk':     { zh: '强制核销',    es: 'Canjear igualmente' },

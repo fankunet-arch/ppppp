@@ -165,13 +165,38 @@ final class MemberRepo
      * 假名化 —— 删除请求的落地方式。
      * 抹除 PII，保留全部流水（会计/税务留存义务）。
      */
+    /**
+     * 假名化：抹掉个人信息，只留一个不可回推的卡号占位。
+     *
+     * ── 🔴 假名卡号必须塞得进 card_no ────────────────────────
+     *
+     * 原来写的是 CONCAT("ANON-", SHA1(...)) —— 'ANON-' 5 位 + SHA1 十六进制
+     * 40 位 = 【45 位】，而 member.card_no 是 VARCHAR(32)。
+     * MySQL 5.7 / MariaDB 10.2.4 起默认开 STRICT_TRANS_TABLES，
+     * 超长不是截断，是【报错 1406 整条 UPDATE 失败】。
+     *
+     * 后果不是「名字难看」：
+     *   · 夜间 compliance 任务抛异常 → cron 以非 0 退出；
+     *   · nightly 里它排在 purgeStalePii / purgeSessions 前面，
+     *     那两步跟着一起不跑；
+     *   · 也就是 LOPDGDD 的删除义务【一次都没执行过】，
+     *     而运维看到的只是一句 MySQL 报错，看不出和个人信息有关。
+     *
+     * 这条路整套测试一次都没走过（smoke 里搜不到 expireUnconfirmedMembers /
+     * purgeStalePii / pseudonymize），所以从 2026-08 一直躺到现在。
+     *
+     * ★ 截到 27 位十六进制（5 + 27 = 32，正好塞满）：
+     *   108 bit 的随机性，配上每次调用现取的 8 字节盐，撞不了 uk_card。
+     * ★ 不加宽列：card_no 是有格式约定的业务键（docs/11），
+     *   为了一个占位值去动它，代价和风险都不对等。
+     */
     public function pseudonymize(int $memberId): void
     {
         $this->db->exec(
             'UPDATE member
                 SET phone = NULL, email = NULL, birthday = NULL, consent_ip = NULL,
                     consent_token = NULL,
-                    card_no = CONCAT("ANON-", SHA1(CONCAT(card_no, ?))),
+                    card_no = CONCAT("ANON-", LEFT(SHA1(CONCAT(card_no, ?)), 27)),
                     pseudonymized = 1,
                     updated_at = ?
               WHERE store_code = ? AND id = ?',

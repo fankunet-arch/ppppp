@@ -90,7 +90,8 @@ final class MealPeriod
      * ★ 光比餐期 id 不够。周一中午和周二中午都是「白天」，
      *   但显然不是同一顿饭 —— 必须连营业日一起比。
      */
-    public function sameSitting(string $endA, string $endB, BusinessDay $bd): bool
+    public function sameSitting(string $endA, string $endB, BusinessDay $bd,
+                               int $spanMinutes = 0): bool
     {
         if ($bd->of($endA) !== $bd->of($endB)) {
             return false;   // 不同营业日一定不是同一顿，配没配餐期都成立
@@ -99,7 +100,42 @@ final class MealPeriod
             // 压根没配餐期：只剩营业日这一个口径
             return true;
         }
-        return $this->bucketOf($endA, $bd) === $this->bucketOf($endB, $bd);
+        if ($this->bucketOf($endA, $bd) === $this->bucketOf($endB, $bd)) {
+            return true;
+        }
+
+        /**
+         * ── 🔴 边界两侧不是两顿饭 ──────────────────────────────
+         *
+         * 只按格子判，会把【同一顿饭的两张单】判成两顿 ——
+         * 而「吃完再加点甜点酒水另开一单」是 docs/03 §3.7 专门写过的日常场景。
+         *
+         * 实测（出厂餐期 11:00–18:00 / 19:30–02:00）：
+         *   17:50 + 17:58  同在午市格   → 计 1 次  ✓
+         *   17:55 + 18:05  跨 18:00     → 计 2 次  🔴 同一顿算了两次
+         *   19:20 + 19:35  跨 19:30     → 计 2 次  🔴
+         *
+         * 方向和 F6 正好相反：F6 是客人少拿，这一条是【餐厅多送】——
+         * 客人攒「十送一」的速度变快，而且同样是静默的，账面上每一笔都对。
+         * 顺带还把 max_grants_per_period 那道闸门削弱了：
+         * 跨一次边界就等于把每餐期的记账次数上限重置一遍。
+         *
+         * ★ 判据用 merge_span_minutes（出厂 60 分钟）而不是另造一个参数：
+         *   那正是店家用来界定「这几张单是不是同一顿饭」的数，
+         *   checkMergeSpan() 已经拿它当承重墙。两处口径统一更好解释，
+         *   也免得店家改了合并跨度却发现计次口径没跟着动。
+         *
+         * ★ 只放宽、不收紧：同格仍然一律算同一顿（上面已经 return 了）。
+         *   这里补的只是「跨格但挨得很近」这一档。
+         */
+        if ($spanMinutes > 0) {
+            $ta = strtotime($endA);
+            $tb = strtotime($endB);
+            if ($ta !== false && $tb !== false && abs($ta - $tb) <= $spanMinutes * 60) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

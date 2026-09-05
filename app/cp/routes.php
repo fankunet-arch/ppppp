@@ -80,6 +80,13 @@ $warnings = static function () use ($app): array {
  * @return int|null 新增的待补发张数；没有变多就是 null
  */
 $guardRewardRun = static function (array $op, string $what, string $desc, callable $apply) use ($app): ?int {
+    /**
+     * ★ 这道护栏【故意与键无关】：保存前后各量一次待补发张数，变多就报警。
+     *   不要改成「只有名单里的键才量」—— 那正是它当初要解决的问题
+     *   （护栏钉在「改了哪个键」上，而换口径、改等级门槛都绕得过去）。
+     *   要省开销就去省 pendingAcrossMembers() 自己的开销（它已经改成
+     *   一条聚合 SQL 算完，不再把全店会员读进 PHP）。
+     */
     $before = $app->rewards()->pendingAcrossMembers();
     $apply();
     $after  = $app->rewards()->pendingAcrossMembers();
@@ -418,7 +425,9 @@ $api->on('POST', '/config/save', static function () use ($app, $requireAdmin, $w
             . (\Vip\ConfigSchema::ITEMS[$key]['label'] ?? $key)]);
     }
     // 按 schema 校验，别让「几次送一次」被填成负数或文字
-    $err = \Vip\ConfigSchema::validate($key, $val);
+    // ★ 第三个参数：有几条规则要和别的项一起看才判得出来
+    //   （比如复查间隔不能比保护期还长 —— 否则 F1 会静默回来）
+    $err = \Vip\ConfigSchema::validate($key, $val, $app->cfg()->all());
     if ($err !== null) {
         Api::fail('bad_request', 400, ['hint' => $err]);
     }

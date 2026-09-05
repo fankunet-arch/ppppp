@@ -744,13 +744,31 @@ final class PointsService
             $v = PE::validateAllocations($allocations, $total, $allocated, $totalPort, $allocPort,
                 Money::toCents($this->cfg->get('min_amount_per_visit', '0')));
             if (!$v['ok']) {
+                /**
+                 * ★ 份数也要带进 detail（审计 F9 的后半截）。
+                 *
+                 *   原来这里三个数全是【钱】（total / allocated / requested），
+                 *   而 exceeds_portions 说的是【份数】不够 ——
+                 *   前端就算想把话说清楚也没有材料，只能原样复读一句
+                 *   「分配份数超过订单套餐份数」。
+                 *
+                 *   最常见的触发就是「客人中途掏出券」：核销把订单净份数
+                 *   减了 1，而 Pad 上还是核销前算好的 4 人各 1 份。
+                 *   收银员需要知道的是「现在只剩 3 份、你提交了 4 份」，
+                 *   而不是一句抽象的话。
+                 */
                 return [
                     'ok'     => false,
                     'error'  => $v['error'],
                     'detail' => [
-                        'total'     => Money::toStr($total),
-                        'allocated' => Money::toStr($allocated),
-                        'requested' => Money::toStr($v['sum_amount']),
+                        'total'              => Money::toStr($total),
+                        'allocated'          => Money::toStr($allocated),
+                        'requested'          => Money::toStr($v['sum_amount']),
+                        'portions_total'     => $totalPort,
+                        'portions_allocated' => $allocPort,
+                        'portions_requested' => $v['sum_portions'],
+                        // 还能再分几份 —— 前端要的就是这个数
+                        'portions_left'      => max(0, $totalPort - $allocPort),
                     ],
                 ];
             }
@@ -1060,7 +1078,8 @@ final class PointsService
             if ((int)$r['counted_visit'] <= 0) {
                 continue;
             }
-            if ($this->periods->sameSitting((string)$r['order_end_time'], $refEndTime, $this->bizDay)) {
+            if ($this->periods->sameSitting((string)$r['order_end_time'], $refEndTime, $this->bizDay,
+                $this->cfg->int('merge_span_minutes', 60))) {
                 return true;
             }
         }
@@ -1184,7 +1203,8 @@ final class PointsService
         foreach ($rows as $r) {
             if (in_array((string)$r['serial_id'], $exclude, true)) { continue; }
             // 同一顿 = 同一营业日 + 同一餐期
-            if (!$this->periods->sameSitting((string)$r['order_end_time'], $refEndTime, $this->bizDay)) {
+            if (!$this->periods->sameSitting((string)$r['order_end_time'], $refEndTime, $this->bizDay,
+                $this->cfg->int('merge_span_minutes', 60))) {
                 continue;
             }
             $seen[(string)($r['grant_group'] ?? '') !== '' ? 'g:' . $r['grant_group'] : 's:' . $r['serial_id']] = true;

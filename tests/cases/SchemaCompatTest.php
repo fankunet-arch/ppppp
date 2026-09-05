@@ -622,6 +622,46 @@ T::true((bool)preg_match('/PHP_SAPI\s*!==\s*.cli./', $cronSrc), 'cron.php 拒绝
 T::true((bool)preg_match('/flock\(/', $cronSrc), 'cron 有并发锁');
 
 /**
+ * ── mbstring 一处都不能裸用（审计 F12 那一类）──────────────────
+ *
+ * 现场（Windows / 宝塔）实测踩过没装 mbstring：`PointsEngine` 里那句
+ * `mb_strtoupper` 让整条核销路径直接 500。当时改掉了那一处，
+ * 复审时又在 `bin/init.php` 和 `bin/cron.php` 各找出一处 ——
+ * 而 `bin/init.php` 那一处更刺眼：它在「本地库连不上」的分支里，
+ * 而扩展检查那一步只报一句不退出，于是两件事同时成立时
+ * **诊断工具在打印故障原因的那一行自己崩掉**，
+ * 它本来要说的正是「Windows 请到服务管理器启动 MySQL」。
+ *
+ * 所以这条断言不查某一处，查【这一类】：全仓库任何一次 mb_* 调用，
+ * 附近都必须有 function_exists 的兜底（`AlertRepo::raise()` 是范本）。
+ */
+$mbBad = [];
+foreach ([...glob(__DIR__ . '/../../app/lib/*.php'),
+          ...glob(__DIR__ . '/../../app/lib/*/*.php'),
+          ...glob(__DIR__ . '/../../app/lib/*/*/*.php'),
+          ...glob(__DIR__ . '/../../app/*/*.php'),
+          ...glob(__DIR__ . '/../../bin/*.php')] as $mbF) {
+    $mbSrc = (string)preg_replace('#/\*.*?\*/|//[^\n]*#s', '', (string)file_get_contents($mbF));
+    if (!preg_match_all('/\bmb_[a-z_]+\s*\(/', $mbSrc, $mm, PREG_OFFSET_CAPTURE)) {
+        continue;
+    }
+    foreach ($mm[0] as [$mbCall, $mbAt]) {
+        $mbName = rtrim(trim($mbCall), '(');
+        if ($mbName === 'mb_internal_encoding') {   // 设编码本身不会因缺扩展而炸得更糟
+            continue;
+        }
+        $mbNear = substr($mbSrc, max(0, $mbAt - 400), min(400, $mbAt));
+        if (!str_contains($mbNear, "function_exists('" . $mbName . "'")
+            && !str_contains($mbNear, 'function_exists("' . $mbName . '"')) {
+            $mbBad[] = basename($mbF) . '::' . $mbName;
+        }
+    }
+}
+T::eq([], $mbBad,
+    '★★ 全仓库没有裸用的 mb_* —— 现场缺 mbstring 时它会抛 Error 而不是少截几个字，'
+  . '而最需要它的恰恰是「现场出问题、拿诊断工具去看」的那一刻');
+
+/**
  * ── 全仓库统一的加锁顺序（docs/13 §3.4）─────────────────────
  *   pos_order → card → member → coupon → point_ledger
  *

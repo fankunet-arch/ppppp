@@ -4703,10 +4703,33 @@ ok(!$pxMp->sameSitting("{$pxD} 13:00:00", "{$pxD} 19:00:00", $pxBd),
  . '判成同一顿，客人傍晚这一趟一次都记不上，而 18:00–19:30 这个空档是店家自己配出来的');
 ok($pxMp->sameSitting("{$pxD} 18:10:00", "{$pxD} 19:20:00", $pxBd),
    '★★ 但同一个空档里的两单仍算同一顿 —— 一律判「不同顿」会开一个重复计次的口子');
-ok(!$pxMp->sameSitting("{$pxD} 19:00:00", "{$pxD} 20:00:00", $pxBd),
-   '  └ 空档与晚市也不是同一顿');
-ok($pxMp->sameSitting("{$pxD} 21:00:00", "{$pxD1} 00:30:00", $pxBd),
+// ★ 隔得远才算两顿：19:00（空档）与 21:00（晚市）差两小时
+ok(!$pxMp->sameSitting("{$pxD} 19:00:00", "{$pxD} 21:00:00", $pxBd, 60),
+   '  └ 空档与晚市隔了两小时 → 不是同一顿');
+ok($pxMp->sameSitting("{$pxD} 21:00:00", "{$pxD1} 00:30:00", $pxBd, 60),
    '  └ 晚市跨零点仍是同一顿（营业日 02:00 才翻页）');
+
+/**
+ * ── 🔴 N2：边界两侧不是两顿饭 ───────────────────────────────
+ *
+ * F6 给空档编格子之后，「跨格 = 两顿」把**边界两侧**也判成了两顿 ——
+ * 而「吃完再加点甜点酒水另开一单」正是 docs/03 §3.7 写过的日常场景。
+ * 方向和 F6 相反：F6 是客人少拿，这一条是【餐厅多送】，
+ * 客人攒「十送一」的速度变快，而且同样静默 —— 账面上每一笔都对。
+ * 顺带还把 max_grants_per_period 削弱了：跨一次边界就重置一遍上限。
+ *
+ * 判据用 merge_span_minutes（出厂 60 分钟）—— 那本来就是店家用来界定
+ * 「这几张单是不是同一顿饭」的数，checkMergeSpan() 已经拿它当承重墙。
+ */
+ok($pxMp->sameSitting("{$pxD} 17:55:00", "{$pxD} 18:05:00", $pxBd, 60),
+   '★★★ N2 跨 18:00 边界的两单（相差 10 分钟）算【同一顿】—— '
+ . '原来判成两顿，同一顿饭给客人记了两次「十送一」的进度，餐厅静默多送');
+ok($pxMp->sameSitting("{$pxD} 19:20:00", "{$pxD} 19:35:00", $pxBd, 60),
+   '  └ 跨 19:30 边界同理');
+ok(!$pxMp->sameSitting("{$pxD} 13:00:00", "{$pxD} 21:00:00", $pxBd, 60),
+   '  └ 但午市与晚市（隔 8 小时）仍是两顿 —— 放宽的只是「跨格且挨得很近」这一档');
+ok(!$pxMp->sameSitting("{$pxD} 17:55:00", "{$pxD} 18:05:00", $pxBd, 0),
+   '  └ 跨度传 0 时退回原样判（跨格即两顿）—— 放宽这件事是调用方明确要的，不是默认发生的');
 ok($pxMp->couldBeSameSitting("{$pxD} 19:29:00", "{$pxD} 19:31:00", $pxBd),
    '★★ 合并口径更宽：19:29 那桌（空档）与 19:31 那桌（晚市）放行 —— '
  . '按风控那个严口径会把同行分桌硬拆开，而挡「捡小票」的承重墙是 merge_span_minutes');
@@ -5866,6 +5889,164 @@ foreach (array_unique($rcSerials) as $rcS) {
     $rcDb2->exec('DELETE FROM point_ledger WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $rcS]);
     $rcDb2->exec('DELETE FROM pos_order    WHERE store_code=? AND serial_id=?', [SMOKE_STORE, $rcS]);
 }
+
+step('56 「待补发几张」的快算法必须和慢算法一模一样');
+
+/**
+ * pendingAcrossMembers() 从「SELECT 全表 + PHP 逐个算」改成了按等级分档的
+ * 聚合 SQL —— 后台每保存一次配置，这道护栏要在保存前后各量一次，
+ * 原来的写法等于「改一个开关扫两遍全表、还把每一行搬进 PHP」。
+ *
+ * ★ 但它算的是【这次改动会白送出去多少顿饭】，算错了没有任何地方会喊。
+ *   所以老写法留了一份（pendingAcrossMembersSlow），这里逐场景比对：
+ *   两个用完全不同方式算出来的数必须一模一样。
+ *   这正是「期望值要独立算出来、不能复用被测代码」（docs/13 §3.6）。
+ *
+ * ★ 场景要把分档都走到：按次数 / 按金额、有等级 / 无卡 /
+ *   卡上的等级码在等级表里已经不存在（那一档退回全局规则）。
+ */
+$paApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$paDb  = $paApp->localDb();
+$paOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 3, 'is_manager' => true];
+$paCfg0 = [];
+foreach (['reward_enabled' => '1', 'reward_mode' => 'visits',
+          'reward_threshold_visits' => '3', 'reward_threshold_amount' => '50.00',
+          'reward_auto_grant' => '0'] as $k => $v) {
+    $paCfg0[$k] = $paApp->cfg()->get($k, '');
+    $paApp->cfg()->set($k, $v);
+}
+
+// 造几位进度各异的会员：有卡有等级、有卡但等级码是野的、压根没卡
+$paMids = [];
+foreach ([[7, '35.00'], [0, '0.00'], [23, '410.55'], [2, '9.99'], [100, '1000.00']] as $i => [$v, $sp]) {
+    $mid = (int)$paApp->members()->create(sprintf('TK-00067%03d-PAA', $i), null, null, null)['id'];
+    $paDb->exec('UPDATE member SET visit_count=?, total_spent=?, rewards_issued=? 
+                  WHERE store_code=? AND id=?', [$v, $sp, $i % 3, SMOKE_STORE, $mid]);
+    $paMids[] = $mid;
+}
+// 第二位：卡上挂一个等级表里没有的码 —— 那一档要退回全局规则
+$paDb->exec("UPDATE card SET tier_code='NOSUCH' WHERE store_code=? AND member_id=?",
+            [SMOKE_STORE, $paMids[1]]);
+
+$paCase = static function (array $kv, string $lbl) use ($paApp, $paCfg0): void {
+    foreach ($kv as $k => $v) { $paApp->cfg()->set($k, $v); }
+    $fast = $paApp->rewards()->pendingAcrossMembers();
+    $slow = $paApp->rewards()->pendingAcrossMembersSlow();
+    eq($slow, $fast, "56 {$lbl}：聚合 SQL 与逐行 PHP 算出同一个数（{$fast}）");
+};
+$paCase(['reward_mode' => 'visits', 'reward_threshold_visits' => '3'],   '按次数、门槛 3');
+$paCase(['reward_mode' => 'visits', 'reward_threshold_visits' => '10'],  '按次数、门槛 10');
+$paCase(['reward_mode' => 'amount', 'reward_threshold_amount' => '50.00'],  '按金额、门槛 50.00');
+$paCase(['reward_mode' => 'amount', 'reward_threshold_amount' => '0.01'],
+        '按金额、门槛 0.01（分位取整对不上就会在这里露出来）');
+$paCase(['reward_enabled' => '0'], '总开关关掉 → 0 张');
+
+foreach ($paCfg0 as $k => $v) { $paApp->cfg()->set($k, $v); }
+$paIn = implode(',', array_map('intval', $paMids));
+$paDb->exec("UPDATE card SET tier_code=NULL WHERE store_code=? AND member_id IN ({$paIn})", [SMOKE_STORE]);
+$paDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$paIn})", [SMOKE_STORE]);
+$paDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$paIn})", [SMOKE_STORE]);
+$paDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$paIn})", [SMOKE_STORE]);
+
+step('57 合规删除：假名化必须真的写得进去（这条路整套测试从没走过）');
+
+/**
+ * ── 🔴 假名卡号 45 位，塞进 VARCHAR(32) ─────────────────────
+ *
+ * `pseudonymize()` 写的是 CONCAT("ANON-", SHA1(...)) ——
+ * 'ANON-' 5 位 + SHA1 十六进制 40 位 = 45 位，而 member.card_no 是 VARCHAR(32)。
+ * MySQL 5.7 / MariaDB 10.2.4 起默认开 STRICT_TRANS_TABLES，
+ * 超长【不是截断，是报错 1406 整条 UPDATE 失败】。
+ *
+ * 后果不是「名字难看」：
+ *   · 夜间 compliance 任务抛异常 → cron 非 0 退出；
+ *   · nightly 里它排在 purgeStalePii / purgeSessions 前面，那两步一起不跑；
+ *   · 也就是 LOPDGDD 的删除义务【一次都没执行过】，
+ *     而运维看到的只是一句 MySQL 报错，看不出和个人信息有关。
+ *
+ * ★ 它从 2026-08 一直躺到现在，原因很简单：**这条路整套测试一次都没走过**。
+ *   grep 整个 smoke 找不到 expireUnconfirmedMembers / purgeStalePii /
+ *   pseudonymize —— 没有断言，就没有人会发现。
+ *   所以这一档补的不只是那 13 个字符，是【这条路本身】。
+ */
+$pzApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$pzDb  = $pzApp->localDb();
+$pzOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 3, 'is_manager' => true];
+$pzCfg0 = [];
+foreach (['consent_expire_days' => '30', 'pii_retention_years' => '3'] as $k => $v) {
+    $pzCfg0[$k] = $pzApp->cfg()->get($k, '');
+    $pzApp->cfg()->set($k, $v);
+}
+
+// ① 一位超期未确认的会员 —— 手机号、邮箱都在
+$pzM = (int)$pzApp->members()->create('TK-00068001-PZA', '600111222', 'pz@example.com', null)['id'];
+$pzDb->exec("UPDATE member SET consent_status = 0, created_at = ?
+              WHERE store_code = ? AND id = ?",
+            [date('Y-m-d H:i:s', strtotime('-60 days')), SMOKE_STORE, $pzM]);
+// 给他记一笔消费流水 —— 假名化【不能】动流水（会计与税务留存义务）
+$pzLid = $pzApp->ledger()->insert([
+    'member_id' => $pzM, 'serial_id' => null, 'entry_type' => Vip\Repo\LedgerRepo::T_MANUAL,
+    'amount_cents' => 1000, 'points' => 10, 'counted_visit' => 0,
+    'source' => Vip\Repo\LedgerRepo::SRC_MANUAL, 'reason' => '冒烟：留存义务',
+]);
+
+$pzR = $pzApp->maintenance()->expireUnconfirmedMembers();
+eq(true, $pzR['ok'] ?? false,
+   '★★★ 57 合规到期任务跑得完 —— 原来假名卡号 45 位塞进 VARCHAR(32)，'
+ . 'STRICT 模式下整条 UPDATE 报 1406，夜间任务当场抛异常，'
+ . '排在它后面的 PII 留存清理与会话清理一起不跑，删除义务一次都没执行过');
+ok(($pzR['processed'] ?? 0) >= 1, "  └ 确实处理了（{$pzR['processed']} 位）");
+
+$pzRow = $pzDb->one('SELECT card_no, phone, email, pseudonymized, consent_status
+                       FROM member WHERE store_code = ? AND id = ?', [SMOKE_STORE, $pzM]);
+eq(1, (int)$pzRow['pseudonymized'], '  └ 标记成已假名化');
+eq(null, $pzRow['phone'], '  └ 手机号抹掉了');
+eq(null, $pzRow['email'], '  └ 邮箱抹掉了');
+ok(str_starts_with((string)$pzRow['card_no'], 'ANON-'),
+   "  └ 卡号换成不可回推的占位（{$pzRow['card_no']}）");
+ok(strlen((string)$pzRow['card_no']) <= 32,
+   '★★ 占位卡号长度 ' . strlen((string)$pzRow['card_no']) . ' ≤ 32 —— 这正是当初报 1406 的那 13 个字符');
+
+// ② 流水必须留着 —— 抹的是人，不是账
+eq(1, (int)$pzDb->value('SELECT COUNT(*) FROM point_ledger WHERE store_code = ? AND id = ?',
+                        [SMOKE_STORE, $pzLid]),
+   '★★ 消费流水原样留着 —— 抹掉的是个人信息，会计与税务的留存义务不受影响');
+
+// ③ 长期不消费的会员：另一条路，同一个 pseudonymize()
+$pzM2 = (int)$pzApp->members()->create('TK-00068002-PZB', '600333444', null, null)['id'];
+$pzDb->exec("UPDATE member SET consent_status = 1, created_at = ?, updated_at = ?
+              WHERE store_code = ? AND id = ?",
+            [date('Y-m-d H:i:s', strtotime('-5 years')),
+             date('Y-m-d H:i:s', strtotime('-5 years')), SMOKE_STORE, $pzM2]);
+$pzR2 = $pzApp->maintenance()->purgeStalePii();
+eq(true, $pzR2['ok'] ?? false, '  └ PII 留存清理也跑得完（同一个 pseudonymize）');
+eq(1, (int)$pzDb->value('SELECT pseudonymized FROM member WHERE store_code = ? AND id = ?',
+                        [SMOKE_STORE, $pzM2]),
+   '  └ 五年没消费的会员也被假名化了');
+
+// ④ 两位会员先后假名化，卡号不能撞（uk_card 是唯一键）
+ok((string)$pzRow['card_no']
+   !== (string)$pzDb->value('SELECT card_no FROM member WHERE store_code = ? AND id = ?',
+                            [SMOKE_STORE, $pzM2]),
+   '  └ 两位的占位卡号不一样（截短之后仍有 27 位十六进制 + 每次现取的盐）');
+
+/**
+ * ⑤ 这三个数填 0 都会静默关掉一条防线 —— 保存时必须拦住。
+ *   实测：verify_protect_days = 0 时值比对回 {"ok":true,"checked":0}，
+ *   POS 把 50.00 改成 10.00，客人 50 分一分没退。
+ */
+foreach ([['verify_protect_days', '值比对保护期'],
+          ['sync_max_batches',    '单次最多跑几批'],
+          ['consent_expire_days', '未确认会员的保留期']] as [$pzK, $pzL]) {
+    ok(Vip\ConfigSchema::validate($pzK, '0') !== null,
+       "★★ {$pzL}（{$pzK}）填 0 被拒 —— 填 0 会静默关掉一条防线，而任务照样报成功");
+    ok(Vip\ConfigSchema::validate($pzK, '30') === null, "  └ 正常值照旧放行");
+}
+
+foreach ($pzCfg0 as $k => $v) { $pzApp->cfg()->set($k, $v); }
+$pzIn = implode(',', [$pzM, $pzM2]);
+$pzDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$pzIn})", [SMOKE_STORE]);
+$pzDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pzIn})", [SMOKE_STORE]);
 
 step('⑬ 不变量总校验');
 

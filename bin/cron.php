@@ -204,7 +204,9 @@ try {
             foreach ($open as $a) {
                 printf("  [%s] %-18s %s\n",
                     ['1' => '提示', '2' => '警告', '3' => '严重'][(string)$a['severity']] ?? '?',
-                    $a['alert_type'], mb_substr((string)$a['message'], 0, 70));
+                    $a['alert_type'], function_exists('mb_substr')
+                        ? mb_substr((string)$a['message'], 0, 70)
+                        : substr((string)$a['message'], 0, 70));
             }
             break;
 

@@ -971,6 +971,8 @@ $api->on('POST', '/coupon/redeem', static function () use ($app, $requireOperato
         'code'         => $r['code'] ?? null,
         'forced'       => $r['forced'] ?? false,
         'locked_until' => $r['locked_until'] ?? null,
+        // ★ 核销之后这一单还剩多少可分 —— Pad 据此重算分摊（审计 F9）
+        'order'        => $r['order'] ?? null,
     ]);
 });
 

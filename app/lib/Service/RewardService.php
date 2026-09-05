@@ -730,8 +730,37 @@ final class RewardService
                           + ($forced ? ['forced' => true,
                                         'reason' => (string)$override['reason']] : []),
             ]);
+            /**
+             * ★ 把这一单【核销之后】的可分金额与份数一并回给 Pad（审计 F9）。
+             *
+             *   核销会把订单净份数减 1，而 Pad 上摆着的还是核销之前
+             *   locate 出来的那份分摊（4 人各 1 份）。收银员照着屏幕提交，
+             *   服务端拿现在的份数一算就是 exceeds_portions —— 整笔拒绝，
+             *   而客人正站在柜台前。
+             *
+             *   补救办法一直存在（让页面重算一次），只是界面不会自己做，
+             *   而且它手里【没有新的数】：/coupon/redeem 原来只回券码。
+             *   所以这里把材料给足，前端才谈得上把话说清楚。
+             */
+            $after = null;
+            if ($hasSerial) {
+                $o = $this->orders->findBySerial((string)$serialId);
+                if ($o !== null) {
+                    $left = \Vip\Money::toCents((string)$o['total_amount'])
+                          - \Vip\Money::toCents((string)$o['allocated_amount']);
+                    $after = [
+                        'serial_id'          => (string)$serialId,
+                        'remaining_cents'    => max(0, $left),
+                        'remaining_portions' => max(0, (int)$o['portions_counted']
+                                                      - (int)$o['allocated_portions']),
+                        'portions_counted'   => (int)$o['portions_counted'],
+                    ];
+                }
+            }
+
             return ['ok' => true, 'code' => $c['code'], 'member_id' => (int)$c['member_id'],
                     'visits_clawed_back' => $visitsBack,
+                    'order' => $after,
                     'forced' => $forced];
         });
     }
@@ -1385,6 +1414,88 @@ final class RewardService
             $tiers[(string)$t['code']] = $t;
         }
 
+        /**
+         * ── 🔴 别把全店会员读进 PHP 再逐个算 ────────────────────
+         *
+         * 这个数被调得不算少：后台「奖励券」页每次打开一遍，
+         * /config/save 与 /tiers/save 各【两遍】（护栏在保存前后各量一次）。
+         * 原来的写法是 SELECT 全表 + PHP 循环 —— 几千人时无所谓，
+         * 上万之后就是「改一个开关扫两遍全表、还要把每一行搬进 PHP」。
+         *
+         * 而这个式子本身是纯算术：⌊进度 ÷ 门槛⌋ − 已发。
+         * 门槛只按【等级】分档，而等级表很小，所以按等级分组、
+         * 每档一条聚合 SQL 就够了，一行都不用搬回 PHP。
+         *
+         * ★ 护栏那一侧【不要】改成「只有奖励相关的键才量」——
+         *   与键无关正是它的设计要点（换口径、改等级门槛都绕得过去）。
+         *   要省就省在这里。
+         *
+         * ★ total_spent 是 DECIMAL(11,2)，× 100 在 MySQL 里是定点乘法，
+         *   不走浮点，所以和 Money::toCents() 得到的是同一个整数。
+         *   （smoke 里有一条断言拿老写法当参照物盯着这件事。）
+         */
+        $known = array_keys($tiers);
+
+        /** @var list<array{0:string,1:list<mixed>}> $buckets 每一档：[等级条件, 参数] */
+        $buckets = [];
+        foreach ($known as $code) {
+            $buckets[$code] = ['c.tier_code = ?', [$code]];
+        }
+        // 没有卡、或卡上的等级码在等级表里已经不存在 → 退回全局规则
+        if ($known) {
+            $ph = implode(',', array_fill(0, count($known), '?'));
+            $buckets[''] = ["(c.tier_code IS NULL OR c.tier_code NOT IN ({$ph}))", $known];
+        } else {
+            $buckets[''] = ['1 = 1', []];
+        }
+
+        $pending = 0;
+        foreach ($buckets as $code => [$cond, $args]) {
+            $tier = ($code !== '' && isset($tiers[$code])) ? [
+                'code'             => $code,
+                'threshold_visits' => $tiers[$code]['threshold_visits'],
+                'threshold_amount' => $tiers[$code]['threshold_amount'],
+            ] : null;
+            $r = $this->rule($tier);
+            if (!$r['enabled']) {
+                continue;
+            }
+            $thr  = max(1, $r['mode'] === 'amount' ? $r['threshold_cents'] : $r['threshold_visits']);
+            $prog = $r['mode'] === 'amount' ? 'ROUND(m.total_spent * 100)' : 'm.visit_count';
+
+            $pending += (int)$this->db->value(
+                "SELECT COALESCE(SUM(GREATEST(0,
+                            FLOOR({$prog} / ?) - m.rewards_issued)), 0)
+                   FROM member m
+                   LEFT JOIN card c ON c.store_code = m.store_code AND c.member_id = m.id
+                  WHERE m.store_code = ? AND {$cond}",
+                array_merge([$thr, $this->storeCode], $args)
+            );
+        }
+        return $pending;
+    }
+
+    /**
+     * 老写法：把全店会员读进 PHP 逐个算。
+     *
+     * ★ 留着【只给测试当参照物】—— 上面那个聚合 SQL 是重写出来的，
+     *   而它算的是「这次配置改动会白送出去多少顿饭」，
+     *   算错了没有任何地方会喊。所以留一份用完全不同的方式算的版本，
+     *   由 smoke 逐场景比对两者是否一致（docs/13 §3.6
+     *   「期望值是独立算出来的，还是复用了被测代码」）。
+     *
+     * 生产代码不要调它。
+     */
+    public function pendingAcrossMembersSlow(): int
+    {
+        $global = $this->rule(null);
+        if (!$global['enabled']) {
+            return 0;
+        }
+        $tiers = [];
+        foreach ($this->tiers->all() as $t) {
+            $tiers[(string)$t['code']] = $t;
+        }
         $rows = $this->db->all(
             'SELECT m.visit_count, m.total_spent, m.rewards_issued, c.tier_code
                FROM member m
