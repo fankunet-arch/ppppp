@@ -400,7 +400,15 @@ function doRepair(App $app, array $config): void
                         ? 'pdo_mysql 扩展没装/没开' : '未知',
         };
         bad("连不上：{$why}");
-        echo '      原文：' . mb_substr($e->getMessage(), 0, 100) . "\n";
+        // ★ 不能直接用 mb_substr：这一支的前提就是「现场环境不对」，
+        //   而扩展检查那一步只 bad() 报一句、不退出。于是
+        //   「Windows 没装 mbstring」+「库还没起来」同时成立时，
+        //   这里会抛 Call to undefined function mb_substr() ——
+        //   而它本来要打印的正是下面那句「服务管理器里启动 MySQL」。
+        //   诊断工具在报告故障时自己崩掉，比不报还糟（审计 F12 同一类）。
+        echo '      原文：' . (function_exists('mb_substr')
+            ? mb_substr($e->getMessage(), 0, 100)
+            : substr($e->getMessage(), 0, 100)) . "\n";
         echo "\n\033[31m本地库连不上，后面几步没法做。先解决这一条。\033[0m\n";
         if ($drv === 2002 || $drv === 2003) {
             echo "  Windows：服务管理器里启动 MySQL/MariaDB，或在宝塔/XAMPP 面板里启动\n";

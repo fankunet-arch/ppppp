@@ -22,6 +22,16 @@ final class PosDb
     public const MAX_LIMIT = 100;
 
     private ?\mysqli $conn = null;
+    /**
+     * mysqli 里属于「主库连不上 / 断了 / 超时」的错误码。
+     *
+     * 2002 连不上（socket/端口）、2003 主机不可达、2006 服务器跑掉了、
+     * 2013 查询中途断线、1040 连接数打满、1045 口令错、1044 库没权限。
+     * 口令与权限也算在内：那同样是【这台机器现在用不了】，
+     * 收银员该做的事一样（走手工录入），而不是看一个内部错误码。
+     */
+    private const CONN_ERRNOS = [1040, 1044, 1045, 2002, 2003, 2006, 2013];
+
     private array $stats = ['queries' => 0, 'slow' => 0, 'ms_total' => 0.0];
 
     public function __construct(private array $cfg)
@@ -41,18 +51,52 @@ final class PosDb
         // ★ 关键：查询读取超时。MySQL 5.5 服务端无超时机制，全靠这里兜底。
         $m->options(MYSQLI_OPT_READ_TIMEOUT, (int)($this->cfg['read_timeout'] ?? 5));
 
-        $ok = @$m->real_connect(
-            $this->cfg['host'],
-            $this->cfg['user'],
-            $this->cfg['password'],
-            $this->cfg['database'],
-            (int)$this->cfg['port']
-        );
-        if (!$ok) {
-            throw new PosUnavailable('POS 主库连接失败: ' . $m->connect_error);
+        /**
+         * ── 🔴 mysqli 现在是【抛异常】的，不是返回 false ─────────────
+         *
+         * PHP 8.1 起 mysqli 的默认报错模式是
+         * MYSQLI_REPORT_ERROR|MYSQLI_REPORT_STRICT —— 连接失败、查询超时
+         * 一律抛 mysqli_sql_exception。而 @ 压得住 warning、压不住异常。
+         *
+         * 于是原来那句「返回 false 就 throw new PosUnavailable」是【死代码】，
+         * 一次都执行不到。后果是一整条链：
+         *
+         *   POS 断线
+         *    → locate() 的 catch (PosUnavailable) 抓不到
+         *    → 冒到 Api 顶层 → HTTP 500 server_error E209-xxxx
+         *    → Pad 只在 error === 'pos_unavailable' 时才显示手工录入入口
+         *    → 【收银员根本看不到那个按钮】
+         *
+         * 也就是说 POS 一断线，收银台不是「降级」，是整个不能用 ——
+         * 而手工录入这条降级通道正是为这一刻准备的（docs/03 §10）。
+         * 夜间两条 cron 同样中招：catch (PosUnavailable) 落空，
+         * pos_unreachable 告警不会挂、水位线不会 touch，整轮异常退出。
+         *
+         * ★ 修法选【接住异常】而不是 mysqli_report(MYSQLI_REPORT_OFF)：
+         *   关掉报错模式等于把防线钉死在「当前 PHP 的默认值」上，
+         *   下一次默认值再变，这条防线又会悄悄失效一次。
+         *   接异常则是无论默认值怎么变都成立的写法。
+         *
+         * ★ 连不上与查不动【都要归到 PosUnavailable】：上层靠它区分
+         *   「POS 的事，走降级」和「我们自己的 bug，报错误码」。
+         */
+        try {
+            $ok = @$m->real_connect(
+                $this->cfg['host'],
+                $this->cfg['user'],
+                $this->cfg['password'],
+                $this->cfg['database'],
+                (int)$this->cfg['port']
+            );
+            if (!$ok) {
+                // 报错模式被外部改成 OFF 时仍然走得到这里
+                throw new PosUnavailable('POS 主库连接失败: ' . $m->connect_error);
+            }
+            // 主库是 3 字节 utf8，不是 utf8mb4
+            $m->set_charset($this->cfg['charset'] ?? 'utf8');
+        } catch (\mysqli_sql_exception $e) {
+            throw new PosUnavailable('POS 主库连接失败: ' . $e->getMessage(), 0, $e);
         }
-        // 主库是 3 字节 utf8，不是 utf8mb4
-        $m->set_charset($this->cfg['charset'] ?? 'utf8');
         $this->conn = $m;
         return $m;
     }
@@ -72,22 +116,40 @@ final class PosDb
         $m  = $this->conn();
         $t0 = microtime(true);
 
-        $st = $m->prepare($sql);
-        if ($st === false) {
-            throw new \RuntimeException('POS 查询 prepare 失败: ' . $m->error);
-        }
-        if ($params) {
-            $st->bind_param($types !== '' ? $types : str_repeat('s', count($params)), ...$params);
-        }
-        if (!$st->execute()) {
-            $err = $st->error;
+        /**
+         * ★ 同 conn()：execute 的读超时在 PHP 8.1+ 是【抛异常】的，
+         *   原来那句 `if (!$st->execute())` 里的 throw 同样是死代码。
+         *
+         * ★ prepare 失败要和「主库不可用」分开：SQL 里引用了主库上
+         *   没有的列，那是我们自己的 bug（E202），不该让收银员看到
+         *   「POS 暂时连不上，请手工录入」——方向指反了比不给码更糟。
+         *   判据用 mysqli 的错误码：1044/1045/2002/2003/2006/2013
+         *   这一类是连接/权限/断线，其余归我们自己。
+         */
+        try {
+            $st = $m->prepare($sql);
+            if ($st === false) {
+                throw new \RuntimeException('POS 查询 prepare 失败: ' . $m->error);
+            }
+            if ($params) {
+                $st->bind_param($types !== '' ? $types : str_repeat('s', count($params)), ...$params);
+            }
+            if (!$st->execute()) {
+                $err = $st->error;
+                $st->close();
+                // 读超时会在这里抛出，视为主库暂不可用 → 走降级
+                throw new PosUnavailable('POS 查询失败/超时: ' . $err);
+            }
+            $res  = $st->get_result();
+            $rows = $res === false ? [] : $res->fetch_all(MYSQLI_ASSOC);
             $st->close();
-            // 读超时会在这里抛出，视为主库暂不可用 → 走降级
-            throw new PosUnavailable('POS 查询失败/超时: ' . $err);
+        } catch (\mysqli_sql_exception $e) {
+            if (in_array((int)$e->getCode(), self::CONN_ERRNOS, true)) {
+                throw new PosUnavailable('POS 查询失败/超时: ' . $e->getMessage(), 0, $e);
+            }
+            // 列不存在、语法错 —— 这是我们自己的 SQL 写坏了，别冒充 POS 断线
+            throw new \RuntimeException('POS 查询失败: ' . $e->getMessage(), 0, $e);
         }
-        $res  = $st->get_result();
-        $rows = $res === false ? [] : $res->fetch_all(MYSQLI_ASSOC);
-        $st->close();
 
         $ms = (microtime(true) - $t0) * 1000;
         $this->stats['queries']++;

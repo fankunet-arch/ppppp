@@ -501,12 +501,23 @@ final class ConfigSchema
     }
 
     /** 校验一个值是否符合该项的类型 */
-    public static function validate(string $key, string $value): ?string
+    /**
+     * @param array<string,string> $current 库里现有的全部配置。
+     *        只有【要和别的项一起看才判得出来】的规则用得上它 ——
+     *        单项自己的格式校验一律不依赖它，缺了也照样能挡住乱填。
+     */
+    public static function validate(string $key, string $value, array $current = []): ?string
     {
         $meta = self::ITEMS[$key] ?? null;
         if ($meta === null) {
             return null;   // 未登记项不校验，交给调用方决定
         }
+
+        $cross = self::crossCheck($key, $value, $current);
+        if ($cross !== null) {
+            return $cross;
+        }
+
         return match ($meta['type']) {
             'bool'    => in_array($value, ['0', '1'], true) ? null : '只能是 0 或 1',
             'int'     => ctype_digit($value) ? null : '只能填非负整数',
@@ -569,6 +580,52 @@ final class ConfigSchema
      * 换成了 Dto. -15%）。真正兜底的是 SyncService::checkIntegrity() 里那条
      * 按比例的告警：核销占比异常高就报警，不依赖具体写了什么词。
      */
+    /**
+     * 要和【别的项】一起看才判得出来的规则。
+     *
+     * ── 🔴 值比对的复查间隔不能比保护期还长 ────────────────
+     *
+     *   F1 修的是「每张单一生只比一次」，修法是把复查间隔做成可配的
+     *   （verify_recheck_hours，出厂 168 小时 = 7 天）。但只校验了
+     *   「是个正整数」—— 填一个大于保护期（verify_protect_days，出厂 30 天）
+     *   的数，每张单在保护期内就又只会被比一次，**F1 原样回来**，
+     *   而且和当初一样静默：界面不报错、告警不响、值比对每晚照常「跑完」。
+     *
+     *   判据取【保护期的一半】而不是「小于保护期」：保护期内至少要能
+     *   完整地比到两次，这条防线才谈得上「反复回读」。
+     *
+     * ★ 两个方向都要拦：改复查间隔时看保护期，改保护期时也要看复查间隔，
+     *   否则把保护期从 30 天改成 3 天照样能绕过去 ——
+     *   「修了那一处没修那一类」（docs/13 §3.1）。
+     */
+    private static function crossCheck(string $key, string $value, array $current): ?string
+    {
+        if ($key !== 'verify_recheck_hours' && $key !== 'verify_protect_days') {
+            return null;
+        }
+        if (!ctype_digit($value)) {
+            return null;                    // 格式的事交给下面的类型校验说
+        }
+        $hours = $key === 'verify_recheck_hours'
+            ? (int)$value
+            : (int)($current['verify_recheck_hours'] ?? 168);
+        $days  = $key === 'verify_protect_days'
+            ? (int)$value
+            : (int)($current['verify_protect_days'] ?? 30);
+        if ($hours < 1 || $days < 1) {
+            return null;                    // 各自的类型校验会挡
+        }
+        if ($hours * 2 <= $days * 24) {
+            return null;
+        }
+        return sprintf(
+            '复查间隔（%d 小时）超过了保护期（%d 天）的一半 —— 那样每张单在保护期内'
+          . '最多只比得到一次，等于回到「一生只比一次」：POS 结账后才改的那 2.9%% 的单'
+          . '再也抓不到，积分与免费餐券都退不回来。'
+          . '请把复查间隔降到 %d 小时以内，或把保护期加长',
+            $hours, $days, intdiv($days * 24, 2));
+    }
+
     private static function checkRedeemPatterns(string $value): ?string
     {
         // 子串匹配、忽略大小写 —— 与 PointsEngine 判折扣行时的口径一致
