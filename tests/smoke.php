@@ -5948,6 +5948,106 @@ $paDb->exec("DELETE FROM coupon       WHERE store_code=? AND member_id IN ({$paI
 $paDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$paIn})", [SMOKE_STORE]);
 $paDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$paIn})", [SMOKE_STORE]);
 
+step('57 合规删除：假名化必须真的写得进去（这条路整套测试从没走过）');
+
+/**
+ * ── 🔴 假名卡号 45 位，塞进 VARCHAR(32) ─────────────────────
+ *
+ * `pseudonymize()` 写的是 CONCAT("ANON-", SHA1(...)) ——
+ * 'ANON-' 5 位 + SHA1 十六进制 40 位 = 45 位，而 member.card_no 是 VARCHAR(32)。
+ * MySQL 5.7 / MariaDB 10.2.4 起默认开 STRICT_TRANS_TABLES，
+ * 超长【不是截断，是报错 1406 整条 UPDATE 失败】。
+ *
+ * 后果不是「名字难看」：
+ *   · 夜间 compliance 任务抛异常 → cron 非 0 退出；
+ *   · nightly 里它排在 purgeStalePii / purgeSessions 前面，那两步一起不跑；
+ *   · 也就是 LOPDGDD 的删除义务【一次都没执行过】，
+ *     而运维看到的只是一句 MySQL 报错，看不出和个人信息有关。
+ *
+ * ★ 它从 2026-08 一直躺到现在，原因很简单：**这条路整套测试一次都没走过**。
+ *   grep 整个 smoke 找不到 expireUnconfirmedMembers / purgeStalePii /
+ *   pseudonymize —— 没有断言，就没有人会发现。
+ *   所以这一档补的不只是那 13 个字符，是【这条路本身】。
+ */
+$pzApp = new App(['store_code' => SMOKE_STORE, 'local_db' => $dbCfg, 'pos_db' => []]);
+$pzDb  = $pzApp->localDb();
+$pzOp  = ['id' => 1, 'name' => '冒烟', 'device' => 'SMOKE', 'role' => 3, 'is_manager' => true];
+$pzCfg0 = [];
+foreach (['consent_expire_days' => '30', 'pii_retention_years' => '3'] as $k => $v) {
+    $pzCfg0[$k] = $pzApp->cfg()->get($k, '');
+    $pzApp->cfg()->set($k, $v);
+}
+
+// ① 一位超期未确认的会员 —— 手机号、邮箱都在
+$pzM = (int)$pzApp->members()->create('TK-00068001-PZA', '600111222', 'pz@example.com', null)['id'];
+$pzDb->exec("UPDATE member SET consent_status = 0, created_at = ?
+              WHERE store_code = ? AND id = ?",
+            [date('Y-m-d H:i:s', strtotime('-60 days')), SMOKE_STORE, $pzM]);
+// 给他记一笔消费流水 —— 假名化【不能】动流水（会计与税务留存义务）
+$pzLid = $pzApp->ledger()->insert([
+    'member_id' => $pzM, 'serial_id' => null, 'entry_type' => Vip\Repo\LedgerRepo::T_MANUAL,
+    'amount_cents' => 1000, 'points' => 10, 'counted_visit' => 0,
+    'source' => Vip\Repo\LedgerRepo::SRC_MANUAL, 'reason' => '冒烟：留存义务',
+]);
+
+$pzR = $pzApp->maintenance()->expireUnconfirmedMembers();
+eq(true, $pzR['ok'] ?? false,
+   '★★★ 57 合规到期任务跑得完 —— 原来假名卡号 45 位塞进 VARCHAR(32)，'
+ . 'STRICT 模式下整条 UPDATE 报 1406，夜间任务当场抛异常，'
+ . '排在它后面的 PII 留存清理与会话清理一起不跑，删除义务一次都没执行过');
+ok(($pzR['processed'] ?? 0) >= 1, "  └ 确实处理了（{$pzR['processed']} 位）");
+
+$pzRow = $pzDb->one('SELECT card_no, phone, email, pseudonymized, consent_status
+                       FROM member WHERE store_code = ? AND id = ?', [SMOKE_STORE, $pzM]);
+eq(1, (int)$pzRow['pseudonymized'], '  └ 标记成已假名化');
+eq(null, $pzRow['phone'], '  └ 手机号抹掉了');
+eq(null, $pzRow['email'], '  └ 邮箱抹掉了');
+ok(str_starts_with((string)$pzRow['card_no'], 'ANON-'),
+   "  └ 卡号换成不可回推的占位（{$pzRow['card_no']}）");
+ok(strlen((string)$pzRow['card_no']) <= 32,
+   '★★ 占位卡号长度 ' . strlen((string)$pzRow['card_no']) . ' ≤ 32 —— 这正是当初报 1406 的那 13 个字符');
+
+// ② 流水必须留着 —— 抹的是人，不是账
+eq(1, (int)$pzDb->value('SELECT COUNT(*) FROM point_ledger WHERE store_code = ? AND id = ?',
+                        [SMOKE_STORE, $pzLid]),
+   '★★ 消费流水原样留着 —— 抹掉的是个人信息，会计与税务的留存义务不受影响');
+
+// ③ 长期不消费的会员：另一条路，同一个 pseudonymize()
+$pzM2 = (int)$pzApp->members()->create('TK-00068002-PZB', '600333444', null, null)['id'];
+$pzDb->exec("UPDATE member SET consent_status = 1, created_at = ?, updated_at = ?
+              WHERE store_code = ? AND id = ?",
+            [date('Y-m-d H:i:s', strtotime('-5 years')),
+             date('Y-m-d H:i:s', strtotime('-5 years')), SMOKE_STORE, $pzM2]);
+$pzR2 = $pzApp->maintenance()->purgeStalePii();
+eq(true, $pzR2['ok'] ?? false, '  └ PII 留存清理也跑得完（同一个 pseudonymize）');
+eq(1, (int)$pzDb->value('SELECT pseudonymized FROM member WHERE store_code = ? AND id = ?',
+                        [SMOKE_STORE, $pzM2]),
+   '  └ 五年没消费的会员也被假名化了');
+
+// ④ 两位会员先后假名化，卡号不能撞（uk_card 是唯一键）
+ok((string)$pzRow['card_no']
+   !== (string)$pzDb->value('SELECT card_no FROM member WHERE store_code = ? AND id = ?',
+                            [SMOKE_STORE, $pzM2]),
+   '  └ 两位的占位卡号不一样（截短之后仍有 27 位十六进制 + 每次现取的盐）');
+
+/**
+ * ⑤ 这三个数填 0 都会静默关掉一条防线 —— 保存时必须拦住。
+ *   实测：verify_protect_days = 0 时值比对回 {"ok":true,"checked":0}，
+ *   POS 把 50.00 改成 10.00，客人 50 分一分没退。
+ */
+foreach ([['verify_protect_days', '值比对保护期'],
+          ['sync_max_batches',    '单次最多跑几批'],
+          ['consent_expire_days', '未确认会员的保留期']] as [$pzK, $pzL]) {
+    ok(Vip\ConfigSchema::validate($pzK, '0') !== null,
+       "★★ {$pzL}（{$pzK}）填 0 被拒 —— 填 0 会静默关掉一条防线，而任务照样报成功");
+    ok(Vip\ConfigSchema::validate($pzK, '30') === null, "  └ 正常值照旧放行");
+}
+
+foreach ($pzCfg0 as $k => $v) { $pzApp->cfg()->set($k, $v); }
+$pzIn = implode(',', [$pzM, $pzM2]);
+$pzDb->exec("DELETE FROM point_ledger WHERE store_code=? AND member_id IN ({$pzIn})", [SMOKE_STORE]);
+$pzDb->exec("DELETE FROM member       WHERE store_code=? AND id        IN ({$pzIn})", [SMOKE_STORE]);
+
 step('⑬ 不变量总校验');
 
 $bad = $db->all(

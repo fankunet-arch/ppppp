@@ -367,9 +367,15 @@ final class ConfigSchema
             'desc'  => '会附在确认码消息里。留空则不附 —— 但现场仍须口头告知',
         ],
         'consent_expire_days' => [
-            'group' => 'compliance', 'type' => 'int', 'unit' => '天',
+            // ★ positive_int：填 0 会把【所有尚未确认的会员】在下一次夜间任务里
+            //   当场假名化 —— 手机号、邮箱、生日一并抹掉，不可逆。
+            //   和 pii_retention_years 不同，这里没有「0 = 不启用」的语义
+            //   （那边的代码里有 if ($years <= 0) return; 这边没有）。
+            'group' => 'compliance', 'type' => 'positive_int', 'unit' => '天',
             'label' => '未确认会员的保留期',
-            'desc'  => '注册后多少天仍未完成双重确认，就冻结积分并把个人信息假名化',
+            'desc'  => '注册后多少天仍未完成双重确认，就冻结积分并把个人信息假名化。'
+                     . '★ 不能填 0 —— 那会在下一次夜间任务里把所有未确认会员的'
+                     . '个人信息当场抹掉，而且抹掉了就找不回来',
         ],
         'pii_retention_years' => [
             'group' => 'compliance', 'type' => 'int', 'unit' => '年',
@@ -401,14 +407,23 @@ final class ConfigSchema
             'desc'  => '★ 别调小。这是给 POS 喘气的时间',
         ],
         'sync_max_batches' => [
-            'group' => 'sync', 'type' => 'int', 'unit' => '批', 'advanced' => true,
+            // ★ positive_int：填 0 会让增量补抓与值比对的 while 循环
+            //   一轮都不跑（$batches < 0 恒假），两条夜间任务同时静默失效，
+            //   而它们都会正常回 {"ok":true}。实测同上。
+            'group' => 'sync', 'type' => 'positive_int', 'unit' => '批', 'advanced' => true,
             'label' => '单次最多跑几批',
-            'desc'  => '防止一次跑太久。触顶后水位线会推进，剩下的下次继续',
+            'desc'  => '防止一次跑太久。触顶后水位线会推进，剩下的下次继续。'
+                     . '★ 不能填 0 —— 那等于夜间任务一轮都不跑，而且它照样报成功',
         ],
         'verify_protect_days' => [
-            'group' => 'sync', 'type' => 'int', 'unit' => '天', 'advanced' => true,
+            // ★ positive_int：填 0 会让 pendingVerify 的时间窗退化成
+            //   「order_end_time >= 现在」—— 一张单都选不出来，值比对整条防线
+            //   静默关闭，而任务照样回 {"ok":true,"checked":0}。
+            //   实测：POS 把 50.00 改成 10.00，客人 50 分一分没退。
+            'group' => 'sync', 'type' => 'positive_int', 'unit' => '天', 'advanced' => true,
             'label' => '值比对保护期',
-            'desc'  => '发分后多少天内持续回读 POS 金额，发现改单就冲正',
+            'desc'  => '发分后多少天内持续回读 POS 金额，发现改单就冲正。'
+                     . '★ 不能填 0 —— 那等于把这条防线整个关掉，而且界面上看不出来',
         ],
         'verify_recheck_hours' => [
             'group' => 'sync', 'type' => 'positive_int', 'unit' => '小时', 'advanced' => true,
